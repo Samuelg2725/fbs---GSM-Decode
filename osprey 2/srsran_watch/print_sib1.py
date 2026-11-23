@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""Make stock pdsch_ue print the 28-bit cell identity from a passing SIB1 block.
+
+This file is not a decoder. It copies sib1_print.cc into the srsRAN examples
+directory and adds one call in lib/examples/pdsch_ue.c. srsRAN still does the
+receive, the CRC check, and the ASN.1 parse. A block is printed only after
+that CRC has passed.
+"""
+
+from pathlib import Path
+import shutil
+import sys
+
+EXAMPLES = Path("/home/revector/srsRAN_4G/lib/examples")
+SOURCE = Path(__file__).resolve().parent / "sib1_print.cc"
+
+CALL = """nof_detected++;
+        if (prog_args.rnti == SRSRAN_SIRNTI) {
+          for (uint32_t sib_tb = 0; sib_tb < SRSRAN_MAX_CODEWORDS; sib_tb++) {
+            if (acks[sib_tb]) {
+              srsran_sib1_print(data[sib_tb], pdsch_cfg.grant.tb[sib_tb].tbs);
+            }
+          }
+        }"""
+
+PROTO = "void srsran_sib1_print(const uint8_t* payload, uint32_t nbits);\n"
+
+
+def main():
+    if not SOURCE.is_file():
+        sys.exit("sib1_print.cc was not found next to this script")
+    if not EXAMPLES.is_dir():
+        sys.exit("srsRAN examples were not found at %s" % EXAMPLES)
+    shutil.copy(SOURCE, EXAMPLES / "sib1_print.cc")
+
+    pdsch = EXAMPLES / "pdsch_ue.c"
+    text = pdsch.read_text()
+    if "srsran_sib1_print" not in text:
+        anchor = "nof_detected++;"
+        if anchor not in text:
+            sys.exit("pdsch_ue.c has no decode-success point to hook")
+        text = text.replace(anchor, CALL, 1)
+        main_at = text.find("int main(")
+        if main_at < 0:
+            sys.exit("pdsch_ue.c has no main")
+        text = text[:main_at] + PROTO + "\n" + text[main_at:]
+        pdsch.write_text(text)
+        print("patched %s" % pdsch)
+    else:
+        print("pdsch_ue.c already prints SIB1")
+
+    cmake = EXAMPLES / "CMakeLists.txt"
+    cmake_text = cmake.read_text()
+    changed = False
+    old_exe = "add_executable(pdsch_ue pdsch_ue.c)"
+    new_exe = "add_executable(pdsch_ue pdsch_ue.c sib1_print.cc)"
+    if old_exe in cmake_text:
+        cmake_text = cmake_text.replace(old_exe, new_exe)
+        changed = True
+    # A previous edit left "rrc_asn1" after the closing parenthesis, which
+    # CMake rejects. Put it back inside the link command.
+    if ") rrc_asn1" in cmake_text:
+        cmake_text = cmake_text.replace(") rrc_asn1", " rrc_asn1)")
+        changed = True
+    for line in (
+        "target_link_libraries(pdsch_ue srsran_phy srsran_common srsran_rf pthread)",
+        "target_link_libraries(pdsch_ue srsran_common srsran_phy pthread)",
+    ):
+        if line in cmake_text:
+            cmake_text = cmake_text.replace(line, line[:-1] + " rrc_asn1)")
+            changed = True
+    if changed:
+        cmake.write_text(cmake_text)
+        print("patched %s" % cmake)
+    else:
+        print("CMakeLists.txt already builds the SIB1 print")
+
+
+if __name__ == "__main__":
+    main()
