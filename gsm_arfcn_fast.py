@@ -279,6 +279,10 @@ def main():
                         help="lime (default, Owen's rig) or bladerf")
     parser.add_argument("--gain", type=float, default=None,
                         help="default 50 for lime, 40 for bladerf")
+    parser.add_argument("--dwell", type=float, default=1.5,
+                        help="multi-channel: seconds to wait for a cell ID per channel (default 1.5)")
+    parser.add_argument("--passes", type=int, default=0,
+                        help="multi-channel: stop after this many rounds (default 0 = forever)")
     args = parser.parse_args()
     if args.gain is None:
         args.gain = 40.0 if args.radio == "bladerf" else 50.0
@@ -316,6 +320,7 @@ def main():
         if not kraken_sync():
             print("kraken clock not read", flush=True)
     last_print = {a: time.time() for a in arfcns}
+    found_cells = {}
     try:
         if len(arfcns) == 1:
             arfcn, freq = arfcns[0], freqs[0]
@@ -362,7 +367,9 @@ def main():
                 time.sleep(0.02)
         else:
             seen = 0
-            while True:
+            done_passes = 0
+            pass_start = time.time()
+            while args.passes == 0 or done_passes < args.passes:
                 for arfcn, freq in zip(arfcns, freqs):
                     print("tune %d" % arfcn, flush=True)
                     tb.retune(freq)
@@ -373,7 +380,7 @@ def main():
                         pass
                     t0 = time.time()
                     text = None
-                    while time.time() - t0 < 1.5:
+                    while time.time() - t0 < args.dwell:
                         try:
                             n = tb.dbg.num_messages()
                         except Exception:
@@ -392,8 +399,13 @@ def main():
                     last_print[arfcn] = now
                     if text:
                         print("%s  %6.1fs  %s" % (clean.now_stamp(), took, text), flush=True)
+                        found_cells[arfcn] = __import__("re").sub("\x1b\\[[0-9;]*m", "", text).split(", Pwr")[0]
                     else:
                         print("%s  %6.1fs  ARFCN %d  no cell" % (clean.now_stamp(), took, arfcn), flush=True)
+                done_passes += 1
+                print("pass %d done in %.1fs, %d cell(s) so far"
+                      % (done_passes, time.time() - pass_start, len(found_cells)), flush=True)
+                pass_start = time.time()
     except KeyboardInterrupt:
         print("")
     finally:
@@ -402,6 +414,11 @@ def main():
                 tb.stop()
             except Exception:
                 pass
+    if len(arfcns) > 1:
+        print("")
+        print("===== %d unique cell(s) =====" % len(found_cells))
+        for a in sorted(found_cells, key=lambda k: (k < 900 and k > 500, k < 900, k)):
+            print("  " + found_cells[a])
     return 0
 
 if __name__ == "__main__":
