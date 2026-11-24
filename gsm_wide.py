@@ -6,6 +6,7 @@ import struct
 import subprocess
 import sys
 import time
+import re
 import pmt
 from gnuradio import blocks, filter, gr, gsm
 from gnuradio.filter import firdes
@@ -230,6 +231,8 @@ def decode(n_in, arfcn, freq):
 def main():
     global PATH, RADIO, FMT, RATE, CENTER, SECS, GAIN
     import argparse
+    t_start = time.time()
+    cap_secs = None
     ap = argparse.ArgumentParser(description="Wideband GSM: one capture, decode every channel in it.")
     ap.add_argument("file", nargs="?", help="decode this existing capture instead of recording")
     ap.add_argument("--radio", choices=["lime", "bladerf"], default="lime",
@@ -262,22 +265,44 @@ def main():
         print("using %s (%s) samples %d = %.2fs at %.1f MS/s, centre %.1f MHz"
               % (PATH, FMT, n_in, n_in / RATE, RATE / 1e6, CENTER / 1e6), flush=True)
     else:
+        t_cap = time.time()
         n_in = capture()
+        cap_secs = time.time() - t_cap
         if not n_in:
             return 1
     chans = channels()
     print("%d channels in the %.0f MS/s capture, one after another on this Pi" % (len(chans), RATE / 1e6), flush=True)
     cells = 0
+    unique = {}
+    t_dec = time.time()
     for index, (arfcn, freq) in enumerate(chans, 1):
         print("%d/%d  ARFCN %d  %.1f MHz" % (index, len(chans), arfcn, freq / 1e6), flush=True)
+        t0 = time.time()
         lines = decode(n_in, arfcn, freq)
+        took = time.time() - t0
         if not lines:
-            print("  nothing on this channel", flush=True)
+            print("  nothing on this channel  (%.1fs)" % took, flush=True)
             continue
         for text in lines:
             cells += 1
             print(text, flush=True)
+            plain = re.sub("\x1b\\[[0-9;]*m", "", text)
+            cid = plain.split("CID:")[1].split(",")[0].strip() if "CID:" in plain else "?"
+            unique.setdefault((arfcn, cid), plain.split(", Pwr")[0])
+        print("  (%.1fs)" % took, flush=True)
+    dec_secs = time.time() - t_dec
     print("cells", cells, flush=True)
+    print("")
+    print("===== %d unique cell(s) =====" % len(unique), flush=True)
+    for key in sorted(unique, key=lambda k: (k[0] < 900, k[0])):
+        print("  " + unique[key], flush=True)
+    print("")
+    print("----- timing -----", flush=True)
+    if cap_secs is not None:
+        print("  capture  %7.1fs" % cap_secs, flush=True)
+    print("  decode   %7.1fs  (%d channels, avg %.2fs each)"
+          % (dec_secs, len(chans), dec_secs / max(1, len(chans))), flush=True)
+    print("  total    %7.1fs" % (time.time() - t_start), flush=True)
     return 0
 
 if __name__ == "__main__":

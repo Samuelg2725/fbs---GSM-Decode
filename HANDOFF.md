@@ -127,7 +127,10 @@ Why the first wide version was SLOWER than narrow (fixed):
 4. Make libbladeRF 2.6.1 permanent (no LD_LIBRARY_PATH); rebuild SoapyBladeRF against it for live path.
 5. Test BladeRF LIVE decode (gsm_arfcn_fast.py via osmosdr bladerf=0 + new lib). If clean, use like Lime.
 6. Wire BladeRF into Owen's --df / Kraken DF system.
-7. RX2 (2nd receiver): two bands at once (speed) OR antenna diversity (sensitivity). Doubles USB/CPU load.
+7. RX2 (2nd receiver): NOT two bands at once - the AD9361 has ONE shared RX LO, both RX channels
+   tune to the same centre. Use it for antenna DIVERSITY (2nd antenna >=16 cm away, decode both,
+   merge cells) or 2-element DF. Costs: 2x USB data (40 Msps x2 too much; 15.36 x2 fine),
+   2x /dev/shm, 2x decode time. Try --secs 4 first (free) for weak cells.
 
 ## SETUP FROM SCRATCH
 apt: gnuradio gr-osmosdr gr-gsm soapysdr-tools soapysdr-module-bladerf python3-numpy
