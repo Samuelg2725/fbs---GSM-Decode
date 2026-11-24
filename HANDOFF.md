@@ -99,6 +99,17 @@ Why the first wide version was SLOWER than narrow (fixed):
   - channels decoded one after another -> now --jobs parallel (default = CPU cores).
   - numpy int16->complex64 conversion wrote a ~1 GB file to /dev/shm -> now reads sc16 directly.
 
+## RESULTS 2026-11-24 - DECISION: use Owen's code (gsm_arfcn_fast.py, gsm_wide.py) with --radio bladerf
+- gsm_arfcn_fast.py --arfcn 13 --radio bladerf: identical to the old BladeRF copy, every SI3 (~0.94 s).
+- gsm_arfcn_fast.py --arfcn 4 9 13 22 117 --radio bladerf: all 5 decode every cycle, ~1.1 s per
+  channel, ~5.6 s per full cycle.
+- gsm_wide.py --radio bladerf --rate 15.36e6 (2 s, 935.2-949.8 MHz): 16 unique cells
+  (ARFCN 4,6,7,8,9,10,13,14,15,16,17,18,19,20,21,22), down to -61 dBm. Trying EVERY channel
+  finds far more than FFT-detect-then-decode (bandscan.py found 4-8): weak cells sit under the
+  FFT threshold but still decode. 940-950 MHz: nothing decodes (likely 3G/4G, not GSM).
+- A 15.36 Msps file decoded with --rate 40e6 gives 0 cells: --rate MUST match the capture.
+- 40 Msps BladeRF capture: NOT yet tested.
+
 ## PENDING / PLANNED (for the next AI)
 0. First Pi results (gain 40, E-GSM900): wide found 4 cells in 28.6 s; old-style narrow found
    ARFCN 4,9,10,13,18,22,113,117 before ssh dropped. Wide at gain 40 MISSED 13/18/22 in FFT
