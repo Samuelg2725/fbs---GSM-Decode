@@ -108,7 +108,13 @@ Why the first wide version was SLOWER than narrow (fixed):
   finds far more than FFT-detect-then-decode (bandscan.py found 4-8): weak cells sit under the
   FFT threshold but still decode. 940-950 MHz: nothing decodes (likely 3G/4G, not GSM).
 - A 15.36 Msps file decoded with --rate 40e6 gives 0 cells: --rate MUST match the capture.
-- 40 Msps BladeRF capture: NOT yet tested.
+- 40 Msps BladeRF capture WORKS: 320,000,000 bytes in 3.4 s (no drops). 16 cells in one capture.
+- Full band = 24 unique cells (union of all runs): Vodafone 234-15 ARFCN 2,4,5,6,7,8,9,10,13,14,
+  15,16,17,18,19,20,21,22; O2 234-10 ARFCN 113,115,117,119,120,124. Nothing at 925-935 or 940-957.
+- 3 x 15.36 Msps (centres 930.9 / 942.5 / 954.1) found all 24; 1 x 40 Msps found 16. The 40 Msps
+  run missed weak cells and O2 113/115/119/120 at 957-959 MHz, 15-17 MHz off centre where the
+  analog filter rolls off. Channels in the outer ~1 MHz of ANY capture get lost (e.g. ARFCN 15/16
+  missed at centre 930.9, ARFCN 2/5 missed at 942.5) -> overlapping captures are more complete.
 
 ## PENDING / PLANNED (for the next AI)
 0. First Pi results (gain 40, E-GSM900): wide found 4 cells in 28.6 s; old-style narrow found
