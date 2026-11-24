@@ -111,10 +111,28 @@ Why the first wide version was SLOWER than narrow (fixed):
 - 40 Msps BladeRF capture WORKS: 320,000,000 bytes in 3.4 s (no drops). 16 cells in one capture.
 - Full band = 24 unique cells (union of all runs): Vodafone 234-15 ARFCN 2,4,5,6,7,8,9,10,13,14,
   15,16,17,18,19,20,21,22; O2 234-10 ARFCN 113,115,117,119,120,124. Nothing at 925-935 or 940-957.
+- gsm_wide.py timings (single process, Pi 5, gain 40):
+    40 Msps  2 s : capture 3.4 s, decode 244 s (173 ch, 1.0->1.6 s each, rising = heat throttling?) 17 cells
+    15.36    2 s : capture 3.9 s, decode  95 s ( 74 ch, avg 1.28 s)                                  13 cells
+    15.36    4 s : capture 5.9 s, decode 184 s ( 74 ch, avg 2.49 s)                                  14 cells
+  Per-channel cost scales with capture SECONDS, barely with sample rate -> the gr-gsm chain on each
+  channel dominates, not the wide filter. Empty channels (~85%) cost as much as live ones.
+  4 s found ARFCN 12 (CID 3010, new), 15, 16 but lost 2, 20, 21 -> weak cells (-55..-61) are
+  hit-or-miss run to run (fading), not just capture length. Total seen so far: 25 cells.
 - 3 x 15.36 Msps (centres 930.9 / 942.5 / 954.1) found all 24; 1 x 40 Msps found 16. The 40 Msps
   run missed weak cells and O2 113/115/119/120 at 957-959 MHz, 15-17 MHz off centre where the
   analog filter rolls off. Channels in the outer ~1 MHz of ANY capture get lost (e.g. ARFCN 15/16
   missed at centre 930.9, ARFCN 2/5 missed at 942.5) -> overlapping captures are more complete.
+
+## UPGRADE PLAN (agreed order - accuracy first, then speed)
+1. gsm_wide.py: skip empty channels via a short sync check + stop each channel at first SI3.
+   VALIDATE on a saved capture: full decode vs fast decode must list identical cells.
+2. Cooling (Pi 5 Active Cooler); then 2 decodes in parallel.
+3. Repeat-and-merge: N captures, union of cells with seen-count (confidence).
+4. Longer captures (cheap once 1 is in: only live channels pay for the extra seconds).
+5. RX2 diversity (same centre, 2nd antenna >=16 cm away), merge both.
+6. gsm_wide prints a ready gsm_arfcn_fast.py --arfcn ... command for found cells (discover -> track/DF).
+7. Later: polyphase channelizer (one pass for all channels) if still too slow.
 
 ## PENDING / PLANNED (for the next AI)
 0. First Pi results (gain 40, E-GSM900): wide found 4 cells in 28.6 s; old-style narrow found
