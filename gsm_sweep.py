@@ -169,6 +169,13 @@ def tune(tb, freq):
             item.set_fc(freq)
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Sweep every UK GSM channel (900 + 1800), loop until Ctrl-C")
+    parser.add_argument("--radio", choices=["lime", "bladerf"], default="lime",
+                        help="lime (default, Owen's rig) or bladerf")
+    parser.add_argument("--gain", type=float, default=None, help="default 50 lime / 40 bladerf")
+    args = parser.parse_args()
+    gain = args.gain if args.gain is not None else (40.0 if args.radio == "bladerf" else 50.0)
     cleared = kill_other_scanners()
     if cleared:
         print("cleared leftover scan %s" % " ".join(str(pid) for pid in cleared), flush=True)
@@ -177,8 +184,17 @@ def main():
     channels_num = int(samp_rate / 0.2e6)
     offsets = freq_offsets(channels_num)
     first = gsm.arfcn.arfcn2downlink(plan[0][1])
-    print("opening sweep, %d steps" % len(plan), flush=True)
+    print("opening sweep, %d steps  radio %s  gain %g" % (len(plan), args.radio, gain), flush=True)
     mod = clean.load_scanner()
+    real_source = None
+    if args.radio == "bladerf":
+        # grgsm_scanner builds osmosdr.source("numchan=1 " + args); numchan BREAKS the BladeRF,
+        # so hand it a plain bladerf=0 source instead
+        real_source = mod.osmosdr.source
+
+        def blade_source(*a, **k):
+            return real_source(args="bladerf=0")
+        mod.osmosdr.source = blade_source
     muted = clean.silence()
     tb = None
     try:
@@ -187,13 +203,19 @@ def main():
             sample_rate=samp_rate,
             carrier_frequency=first,
             ppm=0,
-            gain=50,
+            gain=gain,
             args="driver=lime,soapy=0,nchan=1",
         )
+        if args.radio == "bladerf":
+            # grgsm_scanner turns AGC on; the BladeRF works with manual gain (40 clean)
+            tb.rtlsdr_source.set_gain_mode(False, 0)
+            tb.rtlsdr_source.set_gain(gain, 0)
         tb.dbg = blocks.message_debug()
         tb.msg_connect(tb.wideband_receiver, "msgs", tb.dbg, "store")
     finally:
         clean.restore(*muted)
+        if real_source is not None:
+            mod.osmosdr.source = real_source
     found = {}
     seen = 0
     label_freq = None
