@@ -208,8 +208,10 @@ def main():
         )
         if args.radio == "bladerf":
             # grgsm_scanner turns AGC on; the BladeRF works with manual gain (40 clean)
-            tb.rtlsdr_source.set_gain_mode(False, 0)
-            tb.rtlsdr_source.set_gain(gain, 0)
+            src = getattr(tb, "rtlsdr_source", None) or getattr(tb, "sdr_source", None)
+            if src is not None:
+                src.set_gain_mode(False, 0)
+                src.set_gain(gain, 0)
         tb.dbg = blocks.message_debug()
         tb.msg_connect(tb.wideband_receiver, "msgs", tb.dbg, "store")
     finally:
