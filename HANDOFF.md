@@ -76,8 +76,14 @@ Other flags: --gain-sweep / --gains, --secs, --rate, --jobs, --pipeline, --detec
 --snr, --log, -v. Defaults to /usr/local/lib for bladeRF-cli (--lib '' to disable).
 Wide mode: band split into equal chunks (usable = rate*0.8), each captured once, FFT finds live
 channels, each decoded from the raw sc16 file in parallel worker processes, stops at first SI3.
-Narrow mode: 0.5 s wide FFT survey per chunk, then ONE bladeRF-cli process tunes to every live
-channel in turn (2 s @ 2 Msps each), decoded in parallel.
+Narrow mode: 0.5 s wide FFT survey per chunk, then ONE live osmosdr stream (bladerf=0, same as
+gsm_arfcn_fast.py) retunes to each live channel and prints the cell when its SI3 arrives.
+NOTE: SI3 is broadcast every ~0.94 s, so ~0.9 s between lines in gsm_arfcn_fast.py is the
+network's repeat rate, NOT slow decoding. A first decode in 0.5-1 s per channel is the floor.
+Live BladeRF decode via osmosdr bladerf=0 CONFIRMED working (ARFCN 13, every SI3, 2026-11-24).
+SSH DROPPED on the Pi every time 4 parallel decoders ran (12:13, 12:15) -> default --jobs 2,
+workers niced. Suspect power/undervoltage: check `vcgencmd get_throttled` + dmesg. Run long
+scans inside tmux so a dropped ssh doesn't kill them.
 Why the first wide version was SLOWER than narrow (fixed):
   - channel filter low_pass(100k cutoff, 30k transition) at 15.36 Msps = ~1700 taps per channel.
     gsm_input already does the final channel filter, so the channelizer only has to stop
@@ -87,6 +93,10 @@ Why the first wide version was SLOWER than narrow (fixed):
   - numpy int16->complex64 conversion wrote a ~1 GB file to /dev/shm -> now reads sc16 directly.
 
 ## PENDING / PLANNED (for the next AI)
+0. First Pi results (gain 40, E-GSM900): wide found 4 cells in 28.6 s; old-style narrow found
+   ARFCN 4,9,10,13,18,22,113,117 before ssh dropped. Wide at gain 40 MISSED 13/18/22 in FFT
+   detection (median noise floor too high) -> now 25th percentile (--noise-pct). Re-test.
+   Many +6..+11 dB clusters (ARFCN 977-983, 62-67) never decode: probably 3G/4G, not GSM.
 1. Run `bandscan.py --compare --timing-csv` on the Pi and record real numbers here.
 2. If parallel decodes cause capture overflows with --pipeline, leave pipeline off.
 3. DF (Kraken) as an opt-in flag on the scanner.

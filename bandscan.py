@@ -4,8 +4,9 @@
 MODES (pick one per run)
   --mode wide     one wide capture per chunk (default 15.36 Msps), FFT finds the live
                   channels, each one is filtered out digitally and decoded (in parallel).
-  --mode narrow   quick FFT survey, then tune the radio to each live channel at 2 Msps
-                  and decode it - the classic one-channel-at-a-time way.
+  --mode narrow   quick FFT survey, then ONE live radio stream (osmosdr, same as
+                  gsm_arfcn_fast.py) tunes to each live channel, prints its cell as soon as
+                  the SI3 arrives (~0.5-1 s per channel), then moves on.
   --compare       run wide then narrow on the same band and print a timing table.
 
 BANDS (--band, comma list or repeat the flag)
@@ -248,6 +249,17 @@ def si3(raw):
 
 # ----------------------------------------------------------------------------- decode worker
 
+def _worker_init():
+    """Pool workers: leave Ctrl-C to the main process and run at low priority so the
+    Pi (ssh, USB) stays responsive while decoding."""
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        os.nice(10)
+    except OSError:
+        pass
+
+
 def _warm(_):
     """Import GNU Radio in a pool worker up front so its start-up cost is timed separately."""
     from gnuradio import blocks, gr, gsm  # noqa: F401
@@ -342,7 +354,9 @@ class Timer(object):
 STAGE_HELP = {
     "startup": "start decoder worker processes",
     "survey": "short wide captures to find live channels (narrow mode)",
-    "capture": "radio capture time (bladeRF-cli)",
+    "capture": "wide radio captures (bladeRF-cli, ~2 s of it is device start-up)",
+    "open": "narrow: open the live osmosdr stream",
+    "live": "narrow: tune + wait for SI3, per channel (live osmosdr stream)",
     "detect": "FFT channel detection",
     "decode": "per-channel decode work (sum over all jobs, overlaps in parallel)",
     "wait": "time spent blocked waiting for decodes to finish",
@@ -403,36 +417,13 @@ class Scanner(object):
             self.say("  capture failed (rc %s): %s" % (rc, tail))
         return ok, dt
 
-    def capture_batch(self, chans, gain, rate, secs, paths):
-        """Tune to each channel in turn inside ONE bladeRF-cli process (saves device open time).
-        Any channel that comes back short is retried on its own. Returns (ok_flags, seconds)."""
-        nsamp = int(rate * secs)
-        for p in paths:
-            if os.path.exists(p):
-                os.remove(p)
-        t0 = time.time()
-        cmd = self._radio_setup(rate, gain)
-        for c, p in zip(chans, paths):
-            cmd += self._rx(c.freq - self.a.narrow_offset * 1e3, p, nsamp, secs)
-        self._run_cli(cmd, timeout=len(chans) * (secs * 5 + 10) + 60)
-        oks = []
-        for c, p in zip(chans, paths):
-            ok = self._good(p, nsamp)
-            if not ok:
-                rc, err = self._run_cli(self._radio_setup(rate, gain)
-                                        + self._rx(c.freq - self.a.narrow_offset * 1e3, p, nsamp, secs),
-                                        timeout=secs * 5 + 60)
-                ok = self._good(p, nsamp)
-            oks.append(ok)
-        return oks, time.time() - t0
-
     # -- detection ----------------------------------------------------------------------------
     def detect(self, path, rate, centre, members):
         """FFT the start of a raw sc16 capture and return [(chan, snr_dB)] above --snr."""
         nfft = 4096
         raw = np.memmap(path, dtype=np.int16, mode="r")
         nsamp = raw.size // 2
-        skip = min(int(0.01 * rate), max(0, nsamp - nfft))
+        skip = min(int(0.25 * rate), max(0, nsamp - nfft))   # skip tuning/settling transient
         nblk = min((nsamp - skip) // nfft, max(1, int(self.a.detect_secs * rate) // nfft))
         if nblk < 1:
             return []
@@ -449,7 +440,9 @@ class Scanner(object):
         axis = centre + (np.arange(nfft) - nfft / 2) * binhz
         half = usable_half(rate, self.a.edge)
         inband = np.abs(axis - centre) <= half
-        noise = np.median(psd[inband]) if inband.any() else np.median(psd)
+        # lower quartile, not median: 3G/4G carriers in the band pushed the median up and
+        # real GSM cells (ARFCN 13/18/22) fell under the threshold at gain 40
+        noise = np.percentile(psd[inband] if inband.any() else psd, self.a.noise_pct)
         w = max(1, int(100e3 / binhz))
         out = []
         for c in members:
@@ -485,21 +478,27 @@ class Scanner(object):
                 pass
 
     def _drain(self, block):
+        """Print results in the order they FINISH (not the order submitted)."""
         t0 = time.time()
-        still = []
-        for ar in self.pending:
-            if block or ar.ready():
-                self._handle(ar.get())
-            else:
-                still.append(ar)
-        self.pending = still
+        while True:
+            still = []
+            for ar in self.pending:
+                if ar.ready():
+                    self._handle(ar.get())
+                else:
+                    still.append(ar)
+            self.pending = still
+            if not block or not self.pending:
+                break
+            time.sleep(0.05)
         if block and self.pool is not None:
             self.timer.add("wait", time.time() - t0, 0)
 
     def _handle(self, r):
         c = r["chan"]
-        self.timer.add("decode", r["secs"])
-        self._release(r["path"])
+        if r.get("path"):
+            self.timer.add("decode", r["secs"])
+            self._release(r["path"])
         snr = r.get("snr")
         snr_txt = ("%+.0f dB" % snr) if snr is not None else "  -   "
         if r["err"]:
@@ -516,7 +515,7 @@ class Scanner(object):
         if new:
             self.found[c.freq] = dict(chan=c, cid=cid, lac=lac, mcc=mcc, mnc=mnc, op=op, snr=snr,
                                       gain=r["gain"], secs=r["secs"], t=time.time() - self.t_start)
-        self.say("  %s %-18s %9.1f MHz  CID %-6d LAC %-5d PLMN %d-%02d [%s]  %s  decode %.1fs  @%.0fs"
+        self.say("  %s %-18s %9.1f MHz  CID %-6d LAC %-5d PLMN %d-%02d [%s]  %s  took %.1fs  (%.0fs into run)"
                  % ("DECODED" if new else "again  ", chan_name(c), c.freq / 1e6, cid, lac, mcc, mnc, op,
                     snr_txt, r["secs"], time.time() - self.t_start))
 
@@ -605,23 +604,86 @@ class Scanner(object):
             live = [(c, s) for c, s in live if c.freq not in self.found]
             if not live:
                 continue
-            self.say("=== narrow: %d channel(s) at gain %g ===" % (len(live), gain))
-            step = max(1, a.jobs) if a.pipeline else len(live)
-            for b0 in range(0, len(live), step):
-                batch = live[b0:b0 + step]
-                paths = ["%s/_bs_nb_%d.sc16" % (SHM, c.freq) for c, _ in batch]
-                oks, dt = self.capture_batch([c for c, _ in batch], gain, a.narrow_rate,
-                                             a.narrow_secs, paths)
-                self.timer.add("capture", dt, len(batch))
-                self.say("  captured %d/%d channel(s) in %.1fs (%.2fs each)"
-                         % (sum(oks), len(batch), dt, dt / len(batch)))
-                for (c, s), p, ok in zip(batch, paths, oks):
-                    if ok:
-                        centre = c.freq - a.narrow_offset * 1e3
-                        self._submit([self._job(c, p, a.narrow_rate, centre, 1, gain, s)], p)
-                    elif os.path.exists(p) and not a.keep:
-                        os.remove(p)
-                self._drain(not a.pipeline)
+            self.say("=== narrow (live stream): %d channel(s) at gain %g ===" % (len(live), gain))
+            self._live_decode(live, gain)
+
+    def _live_decode(self, live, gain):
+        """One osmosdr stream, retuned channel to channel - the gsm_arfcn_fast.py way."""
+        a = self.a
+        from gnuradio import blocks, gr, gsm
+        import osmosdr
+        rate = a.narrow_rate
+        first = float(live[0][0].freq)
+
+        class LiveRx(gr.top_block):
+            def __init__(self):
+                gr.top_block.__init__(self, "bandscan_live")
+                self.src = osmosdr.source(args=a.osmo_args)
+                self.src.set_sample_rate(rate)
+                self.src.set_center_freq(first, 0)
+                self.src.set_freq_corr(0, 0)
+                self.src.set_gain_mode(False, 0)
+                self.src.set_gain(gain, 0)
+                self.src.set_bandwidth(rate, 0)
+                self.gi = gsm.gsm_input(ppm=0, osr=4, fc=first, samp_rate_in=rate)
+                self.rcv = gsm.receiver(4, ([0]), ([]))
+                self.clk = gsm.clock_offset_control(first, rate, osr=4)
+                self.dem = gsm.gsm_bcch_ccch_demapper(0)
+                self.dcd = gsm.control_channels_decoder()
+                self.dbg = blocks.message_debug()
+                self.connect(self.src, self.gi, self.rcv)
+                self.msg_connect(self.clk, "ctrl", self.gi, "ctrl_in")
+                self.msg_connect(self.rcv, "C0", self.dem, "bursts")
+                self.msg_connect(self.rcv, "measurements", self.clk, "measurements")
+                self.msg_connect(self.dem, "bursts", self.dcd, "bursts")
+                self.msg_connect(self.dcd, "msgs", self.dbg, "store")
+
+            def tune(self, f):
+                self.stop()
+                self.wait()
+                self.src.set_center_freq(f, 0)
+                try:
+                    self.gi.set_fc(f)
+                except Exception:
+                    pass
+                try:
+                    self.clk.set_fc(f)
+                except Exception:
+                    pass
+                self.start()
+
+        t_open = time.time()
+        tb = LiveRx()
+        tb.start()
+        self.timer.add("open", time.time() - t_open)
+        try:
+            for i, (c, snr) in enumerate(live):
+                t0 = time.time()
+                if i:
+                    tb.tune(float(c.freq))
+                seen = tb.dbg.num_messages()
+                info, nmsg = None, 0
+                settle = t0 + 0.1          # ignore anything left over from the last channel
+                while time.time() - t0 < a.narrow_secs:
+                    n = tb.dbg.num_messages()
+                    while seen < n and info is None:
+                        msg = tb.dbg.get_message(seen)
+                        seen += 1
+                        nmsg += 1
+                        if time.time() >= settle:
+                            info = si3(blob_of(msg))
+                    if info is not None:
+                        break
+                    time.sleep(0.02)
+                dt = time.time() - t0
+                self.timer.add("live", dt)
+                self._handle(dict(chan=c, info=info, nmsg=nmsg, err=None, secs=dt, gain=gain,
+                                  snr=snr, path=None))
+        finally:
+            tb.stop()
+            tb.wait()
+            del tb
+            time.sleep(0.5)        # let osmosdr release the BladeRF before the next bladeRF-cli
 
 
 # ----------------------------------------------------------------------------- reporting
@@ -642,7 +704,7 @@ def print_timing(say, title, timer, wall, ncells, startup):
     say("----- timing: %s -----" % title)
     if startup:
         say("  %-8s %32s %8.1fs   %s" % ("startup", "", startup, STAGE_HELP["startup"]))
-    for st in ["survey", "capture", "detect", "decode", "wait"]:
+    for st in ["survey", "open", "capture", "detect", "live", "decode", "wait"]:
         n, s = timer.get(st)
         if s == 0 and n == 0:
             continue
@@ -657,7 +719,7 @@ def print_compare(say, runs):
     say("================ WIDE vs NARROW ================")
     names = [r[0] for r in runs]
     say("  %-22s %12s %12s" % ("", names[0], names[1]))
-    for st in ["survey", "capture", "detect", "decode", "wait"]:
+    for st in ["survey", "open", "capture", "detect", "live", "decode", "wait"]:
         vals = [r[2].get(st)[1] for r in runs]
         if any(vals):
             say("  %-22s %11.1fs %11.1fs" % (st, vals[0], vals[1]))
@@ -681,13 +743,13 @@ def write_csv(path, mode, args, timer, wall, ncells, startup):
         w = csv.writer(fh)
         if new:
             w.writerow(["when", "mode", "bands", "gains", "rate_msps", "secs", "jobs", "pipeline",
-                        "startup_s", "survey_s", "capture_s", "detect_s", "decode_s", "wait_s",
+                        "startup_s", "survey_s", "open_s", "capture_s", "detect_s", "live_s", "decode_s", "wait_s",
                         "total_s", "cells"])
         w.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), mode, args.band_desc,
                     "/".join("%g" % g for g in args.gain_list), "%.2f" % (args.rate / 1e6),
                     args.secs if mode == "wide" else args.narrow_secs, args.jobs, int(args.pipeline),
                     "%.2f" % startup] +
-                   ["%.2f" % timer.get(s)[1] for s in ("survey", "capture", "detect", "decode", "wait")] +
+                   ["%.2f" % timer.get(s)[1] for s in ("survey", "open", "capture", "detect", "live", "decode", "wait")] +
                    ["%.2f" % wall, ncells])
 
 
@@ -717,20 +779,22 @@ def main():
     r.add_argument("--secs", type=float, default=4.0, help="wide capture length per chunk (default 4)")
     r.add_argument("--edge", type=float, default=0.1,
                    help="fraction of rate ignored at each capture edge (default 0.1)")
-    r.add_argument("--narrow-rate", type=float, default=2e6, help="narrow capture rate (default 2e6)")
-    r.add_argument("--narrow-secs", type=float, default=2.0, help="narrow capture per channel (default 2)")
-    r.add_argument("--narrow-offset", type=float, default=0.0,
-                   help="narrow: tune this many kHz below the channel to dodge DC (default 0)")
+    r.add_argument("--narrow-rate", type=float, default=2e6, help="narrow stream rate (default 2e6)")
+    r.add_argument("--narrow-secs", type=float, default=2.0,
+                   help="narrow: max wait for SI3 per channel; SI3 repeats every ~0.94 s (default 2)")
+    r.add_argument("--osmo-args", default="bladerf=0", help="narrow: osmosdr device args (default bladerf=0)")
     r.add_argument("--survey-secs", type=float, default=0.5,
                    help="narrow: length of the wide FFT survey per chunk (default 0.5)")
     r.add_argument("--lib", default="/usr/local/lib", help="LD_LIBRARY_PATH for bladeRF-cli ('' = none)")
     d = ap.add_argument_group("detection / decoding")
     d.add_argument("--snr", type=float, default=6.0, help="FFT detection threshold dB (default 6)")
+    d.add_argument("--noise-pct", type=float, default=25.0,
+                   help="percentile of the spectrum used as noise floor (default 25; old = 50)")
     d.add_argument("--detect-secs", type=float, default=1.0, help="seconds of capture to FFT (default 1)")
-    d.add_argument("--decode-secs", type=float, default=3.0,
-                   help="max seconds of samples to decode per channel, 0 = whole capture (default 3)")
-    d.add_argument("--jobs", type=int, default=os.cpu_count() or 1,
-                   help="parallel decoders (default = CPU cores; 1 = no worker processes)")
+    d.add_argument("--decode-secs", type=float, default=2.0,
+                   help="wide: max seconds of samples to decode per channel, 0 = all (default 2)")
+    d.add_argument("--jobs", type=int, default=2,
+                   help="wide: parallel decoders (default 2; 4 dropped ssh on the Pi; 1 = none)")
     d.add_argument("--pipeline", action="store_true",
                    help="capture the next chunk while the previous one decodes (watch for overflows)")
     d.add_argument("--chan-cutoff", type=float, default=250.0,
@@ -775,8 +839,8 @@ def main():
         say("  chunk %d: centre %8.2f MHz  covers %8.1f-%8.1f  (%d ch)"
             % (i + 1, centre / 1e6, members[0].freq / 1e6, members[-1].freq / 1e6, len(members)))
     wide_mb = args.rate * args.secs * 4 / 1e6
-    say("  wide: %d capture(s) x %.1fs @ %.2f Msps (%.0f MB each)  |  narrow: %d survey(s) x %.1fs + "
-        "%.1fs per live channel @ %.1f Msps"
+    say("  wide: %d capture(s) x %.1fs @ %.2f Msps (%.0f MB each)  |  narrow: %d survey(s) x %.1fs, then "
+        "live stream <=%.1fs per live channel @ %.1f Msps"
         % (len(plan) * len(args.gain_list), args.secs, args.rate / 1e6, wide_mb,
            len(plan) * len(args.gain_list), args.survey_secs, args.narrow_secs, args.narrow_rate / 1e6))
     if args.dry_run:
@@ -791,9 +855,9 @@ def main():
         pass
 
     pool, startup = None, 0.0
-    if args.jobs > 1:
+    if args.jobs > 1 and "wide" in modes:
         t0 = time.time()
-        pool = mp.get_context("spawn").Pool(args.jobs)
+        pool = mp.get_context("spawn").Pool(args.jobs, initializer=_worker_init)
         pool.map(_warm, range(args.jobs))
         startup = time.time() - t0
         say("  %d decoder workers ready in %.1fs" % (args.jobs, startup))
