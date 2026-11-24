@@ -53,6 +53,11 @@ Wideband (ONE capture -> many channels):
 Lime (live, Owen's rig): python3 gsm_arfcn_fast.py --arfcn 13 --df   (osmosdr driver=lime + Kraken bearing)
 
 ## Files
+- scan_uk.sh         field scan: ./scan_uk.sh [900|1800|uk] [label]. 900 = 3 x 15.36 Msps
+                     (930.9/942.5/954.1), 1800 = 7 x 15.36 Msps (1810.5..1874.5), 4 s each, --fast.
+                     Logs + merged unique-cell summary in ~/field/<date>_<label>_<band>/.
+                     Env: GAIN, SECS, EXTRA (decode flags), KEEP=1 (keep captures).
+- gsm_wide.py channels() now = E-GSM900 + DCS1800 inside the capture span (UK 2G bands).
 - gsm_arfcn_fast.py  (repo root) Owen's live narrow decoder incl. --df Kraken, now with
                      --radio lime|bladerf (default lime = Owen's exact behaviour) and --gain.
                      bladerf: args bladerf=0 (no numchan), manual gain 40.

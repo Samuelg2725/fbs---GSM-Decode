@@ -32,9 +32,9 @@ RETRIES = 0              # --retries: re-decode channels that synced but gave no
 HAVE_PROGRESS = True     # set False if this GNU Radio can't report samples processed
 
 def channels():
-    """Every E-GSM900 channel inside the capture (Owen's list, clipped to what was recorded)."""
-    lo = max(925e6, CENTER - RATE / 2 + 0.3e6)
-    hi = min(960e6, CENTER + RATE / 2 - 0.3e6)
+    """Every UK GSM downlink channel inside the capture: E-GSM900 (Owen's list) + DCS1800."""
+    lo = CENTER - RATE / 2 + 0.3e6
+    hi = CENTER + RATE / 2 - 0.3e6
     found = []
     for n in range(975, 1024):
         freq = 935e6 + 0.2e6 * (n - 1024)
@@ -42,6 +42,10 @@ def channels():
             found.append((n, freq))
     for n in range(1, 125):
         freq = 935e6 + 0.2e6 * n
+        if lo <= freq <= hi:
+            found.append((n, freq))
+    for n in range(512, 886):                     # DCS1800: 1805.2-1879.8 MHz
+        freq = 1805.2e6 + 0.2e6 * (n - 512)
         if lo <= freq <= hi:
             found.append((n, freq))
     return found
