@@ -125,8 +125,12 @@ Why the first wide version was SLOWER than narrow (fixed):
   missed at centre 930.9, ARFCN 2/5 missed at 942.5) -> overlapping captures are more complete.
 
 ## UPGRADE PLAN (agreed order - accuracy first, then speed)
-1. gsm_wide.py: skip empty channels via a short sync check + stop each channel at first SI3.
-   VALIDATE on a saved capture: full decode vs fast decode must list identical cells.
+1. DONE (needs Pi validation): gsm_wide.py --skip-empty / --stop-early / --fast / --probe-secs.
+   Probe = decode first PROBE_SECS; receiver C0 bursts only appear after FCCH+SCH lock, so 0 bursts
+   = no GSM carrier -> skip. Also reports "SYNCED but no cell ID" channels (carrier there, ID not
+   decoded = candidates for longer capture). Default is still Owen's full decode.
+   VALIDATE on ~/test_942_15M_2s.sc16 (actually 4 s @15.36, centre 942.5): full vs --fast cell
+   lists must match.
 2. Cooling (Pi 5 Active Cooler); then 2 decodes in parallel.
 3. Repeat-and-merge: N captures, union of cells with seen-count (confidence).
 4. Longer captures (cheap once 1 is in: only live channels pay for the extra seconds).
