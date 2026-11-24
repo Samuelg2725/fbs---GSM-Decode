@@ -79,3 +79,5 @@ udev: plugdev rule for BladeRF if "insufficient permissions".
 Build libbladeRF 2.6.1 (deps: build-essential cmake git libusb-1.0-0-dev pkg-config
      libcurl4-openssl-dev libncurses-dev) -> cmake -DCMAKE_INSTALL_PREFIX=/usr/local .. ; make ; make install.
 Flash firmware v2.6.0. Copy gsm_arfcn_clean.py to /home/<user>/.
+
+- bandscan.py  full 925-960 scan: wide chunks x optional gain sweep, merged cell report. Flags: --gain-sweep --gains --chunks --secs --snr --log.
