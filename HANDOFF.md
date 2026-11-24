@@ -140,6 +140,14 @@ Why the first wide version was SLOWER than narrow (fixed):
    v2: single-pass probe (abort only if no sync within --probe-secs, default 2.0; needs
    head.nitems_written, falls back to two-pass), --retries N (default 1 with --fast) for carriers
    that synced without an SI3.
+   RESULT v2 (--fast, same file): 77.5 s / 14 cells (full: 160.8 s / 14). Union over all runs of
+   this file = 15 (full missed 12, fast missed 5) -> --fast is as accurate as full at ~2x speed.
+   Time now: 58 empty channels = 64 s (83%); 14 cells = 5.9 s total. Empty-channel cost rose
+   0.8->1.2 s over the run = heat throttling again.
+   Probe only saves time when the capture is LONGER than --probe-secs: use --secs 4 with --fast.
+   Hard channels (5 no-sync; 7, 21 synced-no-ID) all sit next to much stronger cells (ARFCN 4 is
+   -30, 21 dB above 5) -> adjacent-channel interference suspected; Owen's 2nd filter passes to
+   150 kHz. Test a tighter channel filter as an option.
 2. Cooling (Pi 5 Active Cooler); then 2 decodes in parallel.
 3. Repeat-and-merge: N captures, union of cells with seen-count (confidence).
 4. Longer captures (cheap once 1 is in: only live channels pay for the extra seconds).
