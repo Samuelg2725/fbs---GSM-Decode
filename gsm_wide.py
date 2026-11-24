@@ -3,6 +3,7 @@ import gc
 import importlib.util
 import os
 import struct
+import subprocess
 import sys
 import time
 import pmt
@@ -19,16 +20,22 @@ CENTER = 942.5e6
 SECS = 2.0
 GAIN = 50.0
 PATH = os.path.expanduser("~/gsm_wide.cfile")
+RADIO = "lime"
+FMT = "cfile"            # cfile = complex float32 (Lime/osmosdr), sc16 = int16 I/Q (bladeRF-cli)
+BLADE_LIBS = "/usr/local/lib"
 
 def channels():
+    """Every E-GSM900 channel inside the capture (Owen's list, clipped to what was recorded)."""
+    lo = max(925e6, CENTER - RATE / 2 + 0.3e6)
+    hi = min(960e6, CENTER + RATE / 2 - 0.3e6)
     found = []
     for n in range(975, 1024):
         freq = 935e6 + 0.2e6 * (n - 1024)
-        if 925e6 <= freq <= 960e6:
+        if lo <= freq <= hi:
             found.append((n, freq))
     for n in range(1, 125):
         freq = 935e6 + 0.2e6 * n
-        if 925e6 <= freq <= 960e6:
+        if lo <= freq <= hi:
             found.append((n, freq))
     return found
 
@@ -105,7 +112,37 @@ def si3_text(raw, arfcn, freq):
         pwr = 0
     return clean.cell_text(arfcn, freq, cid, lac, mcc, mnc, pwr)
 
+def capture_bladerf():
+    """BladeRF: capture natively with bladeRF-cli (osmosdr drops samples at high rates).
+    Writes int16 I/Q (sc16) - to /dev/shm by default, the SD card is too slow."""
+    n = int(RATE * SECS)
+    if os.path.exists(PATH):
+        os.remove(PATH)
+    cmd = ["bladeRF-cli", "-e", "set agc rx off",
+           "-e", "set frequency rx %d" % int(CENTER),
+           "-e", "set samplerate rx %d" % int(RATE),
+           "-e", "set bandwidth rx %d" % int(min(RATE * 0.9, 56e6)),
+           "-e", "set gain rx %d" % int(GAIN),
+           "-e", "rx config file=%s format=bin n=%d samples=16384 buffers=64 xfers=16 timeout=20000" % (PATH, n),
+           "-e", "rx start", "-e", "rx wait %d" % int(SECS * 3000 + 15000)]
+    env = dict(os.environ)
+    env["LD_LIBRARY_PATH"] = BLADE_LIBS + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+    print("capturing %.1fs at %.1f MS/s, centre %.1f MHz, gain %g (bladeRF-cli)"
+          % (SECS, RATE / 1e6, CENTER / 1e6, GAIN), flush=True)
+    started = time.time()
+    p = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    elapsed = time.time() - started
+    size = os.path.getsize(PATH) if os.path.exists(PATH) else 0
+    print("wrote %d bytes in %.1fs" % (size, elapsed), flush=True)
+    if size < n * 4 * 0.9:
+        print("capture is short - bladeRF-cli said:", flush=True)
+        print(p.stdout.decode(errors="replace")[-800:], flush=True)
+        return 0
+    return size // 4
+
 def capture():
+    if RADIO == "bladerf":
+        return capture_bladerf()
     src = osmosdr.source(args="numchan=1 driver=lime,soapy=0,nchan=1")
     src.set_sample_rate(RATE)
     got = float(src.get_sample_rate())
@@ -142,19 +179,30 @@ def capture():
 class one(gr.top_block):
     def __init__(self, n_in, offset, fc):
         gr.top_block.__init__(self, "wide")
-        src = blocks.file_source(gr.sizeof_gr_complex, PATH, False)
-        head = blocks.head(gr.sizeof_gr_complex, int(n_in))
+        if FMT == "sc16":
+            src = blocks.file_source(gr.sizeof_short, PATH, False)
+            head = blocks.head(gr.sizeof_short, 2 * int(n_in))
+            to_c = blocks.interleaved_short_to_complex(False, False)
+            scale = blocks.multiply_const_cc(complex(1.0 / 2048.0, 0.0))
+            front = [src, head, to_c, scale]
+        else:
+            src = blocks.file_source(gr.sizeof_gr_complex, PATH, False)
+            head = blocks.head(gr.sizeof_gr_complex, int(n_in))
+            front = [src, head]
+        # Owen's two stages: /10 then /2 (40 MS/s -> 2 MS/s). Other rates scale stage 1.
+        d1 = 10 if abs(RATE - 40e6) < 1 else max(1, int(RATE // 4e6))
         taps = firdes.low_pass(1.0, RATE, 500e3, 700e3)
-        xlate = filter.freq_xlating_fir_filter_ccc(10, taps, offset, RATE)
-        taps2 = firdes.low_pass(1.0, RATE / 10.0, 100e3, 50e3)
+        xlate = filter.freq_xlating_fir_filter_ccc(d1, taps, offset, RATE)
+        taps2 = firdes.low_pass(1.0, RATE / d1, 100e3, 50e3)
         low = filter.fir_filter_ccc(2, taps2)
-        self.gsm_input = gsm.gsm_input(ppm=0, osr=4, fc=fc, samp_rate_in=RATE / 20.0)
+        out_rate = RATE / d1 / 2.0
+        self.gsm_input = gsm.gsm_input(ppm=0, osr=4, fc=fc, samp_rate_in=out_rate)
         self.gsm_receiver = gsm.receiver(4, ([0]), ([]))
-        self.gsm_clock = gsm.clock_offset_control(fc, RATE / 20.0, osr=4)
+        self.gsm_clock = gsm.clock_offset_control(fc, out_rate, osr=4)
         self.demapper = gsm.gsm_bcch_ccch_demapper(0)
         self.decoder = gsm.control_channels_decoder()
         self.dbg = blocks.message_debug()
-        self.connect(src, head, xlate, low, self.gsm_input, self.gsm_receiver)
+        self.connect(*(front + [xlate, low, self.gsm_input, self.gsm_receiver]))
         self.msg_connect(self.gsm_clock, "ctrl", self.gsm_input, "ctrl_in")
         self.msg_connect(self.gsm_receiver, "C0", self.demapper, "bursts")
         self.msg_connect(self.gsm_receiver, "measurements", self.gsm_clock, "measurements")
@@ -180,14 +228,39 @@ def decode(n_in, arfcn, freq):
     return lines
 
 def main():
-    global PATH
-    if len(sys.argv) > 1:
-        PATH = os.path.abspath(os.path.expanduser(sys.argv[1]))
+    global PATH, RADIO, FMT, RATE, CENTER, SECS, GAIN
+    import argparse
+    ap = argparse.ArgumentParser(description="Wideband GSM: one capture, decode every channel in it.")
+    ap.add_argument("file", nargs="?", help="decode this existing capture instead of recording")
+    ap.add_argument("--radio", choices=["lime", "bladerf"], default="lime",
+                    help="radio to record with (default lime, Owen's rig)")
+    ap.add_argument("--rate", type=float, default=None, help="sample rate (default 40e6)")
+    ap.add_argument("--center", type=float, default=None, help="centre MHz (default 942.5)")
+    ap.add_argument("--secs", type=float, default=None, help="capture seconds (default 2)")
+    ap.add_argument("--gain", type=float, default=None, help="default 50 lime / 40 bladerf")
+    ap.add_argument("--format", choices=["auto", "cfile", "sc16"], default="auto",
+                    help="file format; auto = .sc16 extension -> sc16, else cfile")
+    args = ap.parse_args()
+    RADIO = args.radio
+    if args.rate is not None:
+        RATE = args.rate
+    if args.center is not None:
+        CENTER = args.center * 1e6
+    if args.secs is not None:
+        SECS = args.secs
+    GAIN = args.gain if args.gain is not None else (40.0 if RADIO == "bladerf" else 50.0)
+    if args.file:
+        PATH = os.path.abspath(os.path.expanduser(args.file))
+    elif RADIO == "bladerf":
+        PATH = "/dev/shm/gsm_wide.sc16"
+    FMT = args.format if args.format != "auto" else ("sc16" if PATH.endswith(".sc16") else "cfile")
+    if args.file:
         if not os.path.isfile(PATH):
             print("no file", PATH)
             return 1
-        n_in = os.path.getsize(PATH) // 8
-        print("using", PATH, "samples", n_in, flush=True)
+        n_in = os.path.getsize(PATH) // (4 if FMT == "sc16" else 8)
+        print("using %s (%s) samples %d = %.2fs at %.1f MS/s, centre %.1f MHz"
+              % (PATH, FMT, n_in, n_in / RATE, RATE / 1e6, CENTER / 1e6), flush=True)
     else:
         n_in = capture()
         if not n_in:

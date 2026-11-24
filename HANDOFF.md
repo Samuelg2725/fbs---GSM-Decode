@@ -53,6 +53,13 @@ Wideband (ONE capture -> many channels):
 Lime (live, Owen's rig): python3 gsm_arfcn_fast.py --arfcn 13 --df   (osmosdr driver=lime + Kraken bearing)
 
 ## Files
+- gsm_arfcn_fast.py  (repo root) Owen's live narrow decoder incl. --df Kraken, now with
+                     --radio lime|bladerf (default lime = Owen's exact behaviour) and --gain.
+                     bladerf: args bladerf=0 (no numchan), manual gain 40.
+- gsm_wide.py        (repo root) Owen's wideband: capture once, decode every channel in it.
+                     --radio bladerf records with bladeRF-cli to /dev/shm/gsm_wide.sc16 and
+                     decodes sc16 directly. Also decodes an existing file: gsm_wide.py FILE
+                     [--rate --center --format]. Lime path unchanged.
 - gsm_arfcn_fast.py  live single/multi-ARFCN decoder (osmosdr). Owen's copy has --df (Kraken) + colour.
                      BladeRF copy: bladerf=0, manual gain, no numchan.
 - gsm_arfcn_clean.py helper (cell_text/now_stamp/silence); scripts import it from /home/revector/.

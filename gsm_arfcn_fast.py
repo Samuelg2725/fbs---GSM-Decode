@@ -51,7 +51,7 @@ def kill_other_scanners():
         except OSError:
             continue
         try:
-            os.kill(pid, signal.SIGKIL)
+            os.kill(pid, signal.SIGKILL)
         except OSError:
             pass
     time.sleep(1)
@@ -130,19 +130,26 @@ def si3_text(raw, arfcn, freq):
         pwr = 0
     return clean.cell_text(arfcn, freq, cid, lac, mcc, mnc, pwr)
 
+def radio_args(radio):
+    """osmosdr device string. BladeRF: plain bladerf=0 - numchan/nchan BREAK it."""
+    if radio == "bladerf":
+        return "bladerf=0"
+    try:
+        dev_args = str(gsm.device.get_default_args("driver=lime,soapy=0,nchan=1"))
+    except Exception:
+        dev_args = "driver=lime,soapy=0,nchan=1"
+    return "numchan=1 " + dev_args
+
 class top(gr.top_block):
-    def __init__(self, freq, gain=50):
+    def __init__(self, freq, gain=50, radio="lime"):
         gr.top_block.__init__(self, "fast")
         samp_rate = 2e6
-        try:
-            dev_args = str(gsm.device.get_default_args("driver=lime,soapy=0,nchan=1"))
-        except Exception:
-            dev_args = "driver=lime,soapy=0,nchan=1"
-        self.src = osmosdr.source(args="numchan=1 " + dev_args)
+        self.src = osmosdr.source(args=radio_args(radio))
         self.src.set_sample_rate(samp_rate)
         self.src.set_center_freq(freq, 0)
         self.src.set_freq_corr(0, 0)
-        self.src.set_gain_mode(True, 0)
+        # Lime: AGC on (Owen's setting). BladeRF: manual gain (40 clean, ~45+ clips).
+        self.src.set_gain_mode(radio != "bladerf", 0)
         self.src.set_gain(gain, 0)
         self.src.set_bandwidth(samp_rate, 0)
         self.gsm_input = gsm.gsm_input(ppm=0, osr=4, fc=freq, samp_rate_in=samp_rate)
@@ -268,7 +275,13 @@ def main():
     parser.add_argument("--arfcn", type=int, nargs="+", required=True)
     parser.add_argument("--cellid", type=int)
     parser.add_argument("--df", action="store_true")
+    parser.add_argument("--radio", choices=["lime", "bladerf"], default="lime",
+                        help="lime (default, Owen's rig) or bladerf")
+    parser.add_argument("--gain", type=float, default=None,
+                        help="default 50 for lime, 40 for bladerf")
     args = parser.parse_args()
+    if args.gain is None:
+        args.gain = 40.0 if args.radio == "bladerf" else 50.0
     if args.df and len(args.arfcn) != 1:
         print("df uses one channel")
         return 1
@@ -289,11 +302,11 @@ def main():
             print("ARFCN %d is not a downlink channel" % arfcn)
             return 1
         freqs.append(freq)
-    print("opening ARFCN %s" % " ".join(str(a) for a in arfcns), flush=True)
+    print("opening ARFCN %s  radio %s  gain %g" % (" ".join(str(a) for a in arfcns), args.radio, args.gain), flush=True)
     muted = clean.silence()
     tb = None
     try:
-        tb = top(freqs[0])
+        tb = top(freqs[0], args.gain, args.radio)
         tb.start()
     finally:
         clean.restore(*muted)
