@@ -58,15 +58,38 @@ Lime (live, Owen's rig): python3 gsm_arfcn_fast.py --arfcn 13 --df   (osmosdr dr
 - gsm_arfcn_clean.py helper (cell_text/now_stamp/silence); scripts import it from /home/revector/.
 - filedec.py         decode one complex-float32 .cfile offline. Reliable workhorse.
 - widescan.py        wideband scanner: one wide capture -> find live channels -> decode all.
+- bandscan.py        MAIN SCANNER. Any GSM band or custom MHz range, wide OR narrow mode, timings.
+                     See "bandscan.py" section below.
 - blade_capture.py / capture_ram.py   Soapy IQ capture (superseded by native bladeRF-cli capture).
 - iqview.py          ASCII spectrum of a capture.  compare.py  diff two captures (offset/inversion).
 - srsran_watch/      older separate LTE cell-ID work.
 
+## bandscan.py (main scanner)
+  python3 bandscan.py                         # E-GSM900 925-960, wide mode
+  python3 bandscan.py --band all              # gsm450/480/850/R-GSM900/DCS1800/PCS1900
+  python3 bandscan.py --band uk               # E-GSM900 + DCS1800
+  python3 bandscan.py --range 1805-1830       # any MHz span (repeatable); 200 kHz raster
+  python3 bandscan.py --mode narrow           # tune each live channel at 2 Msps instead
+  python3 bandscan.py --compare --timing-csv ~/timings.csv   # wide vs narrow timing table
+  python3 bandscan.py --band all --dry-run    # print the chunk plan only
+Other flags: --gain-sweep / --gains, --secs, --rate, --jobs, --pipeline, --detect all, --decode-secs,
+--snr, --log, -v. Defaults to /usr/local/lib for bladeRF-cli (--lib '' to disable).
+Wide mode: band split into equal chunks (usable = rate*0.8), each captured once, FFT finds live
+channels, each decoded from the raw sc16 file in parallel worker processes, stops at first SI3.
+Narrow mode: 0.5 s wide FFT survey per chunk, then ONE bladeRF-cli process tunes to every live
+channel in turn (2 s @ 2 Msps each), decoded in parallel.
+Why the first wide version was SLOWER than narrow (fixed):
+  - channel filter low_pass(100k cutoff, 30k transition) at 15.36 Msps = ~1700 taps per channel.
+    gsm_input already does the final channel filter, so the channelizer only has to stop
+    aliasing: now 250k/500k = ~100 taps (--chan-cutoff/--chan-tw to change; 100/30 = old).
+  - it decoded the WHOLE 8 s file per channel even after SI3 was found -> now early exit + 3 s cap.
+  - channels decoded one after another -> now --jobs parallel (default = CPU cores).
+  - numpy int16->complex64 conversion wrote a ~1 GB file to /dev/shm -> now reads sc16 directly.
+
 ## PENDING / PLANNED (for the next AI)
-1. Optional CLI flags so features (wideband, gain-sweep, DF) are opt-in per run.
-2. Full 925-960 scan: 3 wide chunks (~930 / 942.5 / 955 MHz) x gain sweep [35,40,45], merged report.
-   widescan.py already does ONE chunk; wrap it in a loop over chunks+gains and dedupe cells.
-3. Dynamic gain sweep (Chris's idea): capture each chunk at several gains, merge, to catch strong+weak.
+1. Run `bandscan.py --compare --timing-csv` on the Pi and record real numbers here.
+2. If parallel decodes cause capture overflows with --pipeline, leave pipeline off.
+3. DF (Kraken) as an opt-in flag on the scanner.
 4. Make libbladeRF 2.6.1 permanent (no LD_LIBRARY_PATH); rebuild SoapyBladeRF against it for live path.
 5. Test BladeRF LIVE decode (gsm_arfcn_fast.py via osmosdr bladerf=0 + new lib). If clean, use like Lime.
 6. Wire BladeRF into Owen's --df / Kraken DF system.
@@ -80,4 +103,3 @@ Build libbladeRF 2.6.1 (deps: build-essential cmake git libusb-1.0-0-dev pkg-con
      libcurl4-openssl-dev libncurses-dev) -> cmake -DCMAKE_INSTALL_PREFIX=/usr/local .. ; make ; make install.
 Flash firmware v2.6.0. Copy gsm_arfcn_clean.py to /home/<user>/.
 
-- bandscan.py  full 925-960 scan: wide chunks x optional gain sweep, merged cell report. Flags: --gain-sweep --gains --chunks --secs --snr --log.
