@@ -27,7 +27,9 @@ FMT = "cfile"            # cfile = complex float32 (Lime/osmosdr), sc16 = int16 
 BLADE_LIBS = "/usr/local/lib"
 SKIP_EMPTY = False       # --skip-empty: short sync probe first, skip channels with no GSM sync
 STOP_EARLY = False       # --stop-early: stop a channel as soon as its cell ID (SI3) is decoded
-PROBE_SECS = 1.0         # --probe-secs: how much of the capture the probe looks at
+PROBE_SECS = 2.0         # --probe-secs: give up on a channel if no sync within this much capture
+RETRIES = 0              # --retries: re-decode channels that synced but gave no cell ID
+HAVE_PROGRESS = True     # set False if this GNU Radio can't report samples processed
 
 def channels():
     """Every E-GSM900 channel inside the capture (Owen's list, clipped to what was recorded)."""
@@ -187,13 +189,16 @@ class one(gr.top_block):
         if FMT == "sc16":
             src = blocks.file_source(gr.sizeof_short, PATH, False)
             head = blocks.head(gr.sizeof_short, 2 * int(n_in))
+            self.items_per_sample = 2
             to_c = blocks.interleaved_short_to_complex(False, False)
             scale = blocks.multiply_const_cc(complex(1.0 / 2048.0, 0.0))
             front = [src, head, to_c, scale]
         else:
             src = blocks.file_source(gr.sizeof_gr_complex, PATH, False)
             head = blocks.head(gr.sizeof_gr_complex, int(n_in))
+            self.items_per_sample = 1
             front = [src, head]
+        self.head = head
         # Owen's two stages: /10 then /2 (40 MS/s -> 2 MS/s). Other rates scale stage 1.
         d1 = 10 if abs(RATE - 40e6) < 1 else max(1, int(RATE // 4e6))
         taps = firdes.low_pass(1.0, RATE, 500e3, 700e3)
@@ -219,9 +224,12 @@ class one(gr.top_block):
             self.bursts = blocks.message_debug()
             self.msg_connect(self.gsm_receiver, "C0", self.bursts, "store")
 
-def run_one(n_use, arfcn, freq, stop_early, count_bursts):
-    """Run Owen's decoder over the first n_use samples. Returns (si3 lines, bursts or None, stopped)."""
-    tb = one(n_use, freq - CENTER, freq, count_bursts)
+def run_one(n_use, arfcn, freq, stop_early, probe=None):
+    """Run Owen's decoder over the first n_use samples.
+    probe = N samples: give up (no sync) if the receiver has not locked after N samples.
+    Returns (si3 lines, synced or None, status)."""
+    global HAVE_PROGRESS
+    tb = one(n_use, freq - CENTER, freq, count_bursts=probe is not None)
     done = threading.Event()
 
     def waiter():
@@ -231,7 +239,9 @@ def run_one(n_use, arfcn, freq, stop_early, count_bursts):
     tb.start()
     th = threading.Thread(target=waiter, daemon=True)
     th.start()
-    lines, shown, seen, stopped = [], set(), 0, False
+    lines, shown, seen = [], set(), 0
+    synced = None if probe is None else False
+    status = None
 
     def drain():
         nonlocal seen
@@ -246,36 +256,68 @@ def run_one(n_use, arfcn, freq, stop_early, count_bursts):
     while True:
         finished = done.is_set()
         drain()
+        if probe is not None and not synced:
+            # the receiver only emits C0 bursts after locking to FCCH+SCH = real GSM carrier
+            if tb.bursts.num_messages() > 0 or lines:
+                synced = True
+            elif not finished:
+                try:
+                    done_samples = tb.head.nitems_written(0) / tb.items_per_sample
+                except Exception:
+                    HAVE_PROGRESS = False
+                    done_samples = 0
+                if done_samples >= probe:
+                    status = "no sync"
+                    tb.stop()
+                    th.join(10)
+                    break
         if stop_early and lines and not finished:
             tb.stop()
             th.join(10)
-            stopped = True
             break
         if finished:
             time.sleep(0.1)          # Owen's settle time for the last messages
             drain()
+            if probe is not None and not synced and tb.bursts.num_messages() > 0:
+                synced = True
             break
         done.wait(0.02)
-    bursts = tb.bursts.num_messages() if count_bursts else None
     del tb
     gc.collect()
-    return lines, bursts, stopped
+    if status is None:
+        if lines:
+            status = "decoded"
+        elif probe is not None:
+            status = "synced, no cell ID" if synced else "no sync"
+        else:
+            status = "nothing"
+    return lines, synced, status
 
 def decode(n_in, arfcn, freq):
-    """Returns (lines, status). status: decoded / no sync / synced, no cell ID / nothing."""
+    """Returns (lines, status). status: decoded / decoded on retry / no sync /
+    synced, no cell ID / nothing."""
     if SKIP_EMPTY:
-        n_probe = min(n_in, int(RATE * PROBE_SECS))
-        lines, bursts, _ = run_one(n_probe, arfcn, freq, STOP_EARLY, True)
-        if lines and (STOP_EARLY or n_probe >= n_in):
-            return lines, "decoded in probe"
-        if not lines and not bursts:
-            return [], "no sync"
-        if n_probe >= n_in:
-            return lines, "synced, no cell ID"
-        lines, _, stopped = run_one(n_in, arfcn, freq, STOP_EARLY, False)
-        return lines, ("decoded" if lines else "synced, no cell ID")
-    lines, _, stopped = run_one(n_in, arfcn, freq, STOP_EARLY, False)
-    return lines, ("decoded" if lines else "nothing")
+        probe = min(n_in, int(RATE * PROBE_SECS))
+        if HAVE_PROGRESS:
+            # single pass: abort only if no sync within the first PROBE_SECS of capture
+            lines, synced, status = run_one(n_in, arfcn, freq, STOP_EARLY, probe=probe)
+        else:
+            # fallback (no sample counter): short probe pass, then a full pass if it synced
+            lines, synced, status = run_one(probe, arfcn, freq, STOP_EARLY, probe=probe + 1)
+            if synced and not (lines and STOP_EARLY) and probe < n_in:
+                lines, _, status = run_one(n_in, arfcn, freq, STOP_EARLY)
+                status = "decoded" if lines else "synced, no cell ID"
+    else:
+        lines, synced, status = run_one(n_in, arfcn, freq, STOP_EARLY)
+    # gr-gsm's clock correction runs asynchronously, so the same file can decode differently
+    # from run to run - retry carriers that synced (or anything, without --skip-empty)
+    tries = 0
+    while not lines and tries < RETRIES and status in ("synced, no cell ID", "nothing"):
+        tries += 1
+        lines, _, _ = run_one(n_in, arfcn, freq, STOP_EARLY)
+        if lines:
+            status = "decoded on retry"
+    return lines, status
 
 def main():
     global PATH, RADIO, FMT, RATE, CENTER, SECS, GAIN
@@ -296,14 +338,17 @@ def main():
                     help="probe each channel first; skip it if the receiver never syncs")
     ap.add_argument("--stop-early", action="store_true",
                     help="stop each channel at its first decoded cell ID")
-    ap.add_argument("--fast", action="store_true", help="= --skip-empty --stop-early")
-    ap.add_argument("--probe-secs", type=float, default=1.0,
-                    help="seconds of capture the --skip-empty probe uses (default 1.0)")
+    ap.add_argument("--retries", type=int, default=None,
+                    help="re-decode channels that synced but gave no cell ID (default 0, --fast 1)")
+    ap.add_argument("--fast", action="store_true", help="= --skip-empty --stop-early --retries 1")
+    ap.add_argument("--probe-secs", type=float, default=2.0,
+                    help="--skip-empty gives up if no sync within this much capture (default 2.0)")
     args = ap.parse_args()
-    global SKIP_EMPTY, STOP_EARLY, PROBE_SECS
+    global SKIP_EMPTY, STOP_EARLY, PROBE_SECS, RETRIES
     SKIP_EMPTY = args.skip_empty or args.fast
     STOP_EARLY = args.stop_early or args.fast
     PROBE_SECS = args.probe_secs
+    RETRIES = args.retries if args.retries is not None else (1 if args.fast else 0)
     RADIO = args.radio
     if args.rate is not None:
         RATE = args.rate
@@ -336,6 +381,8 @@ def main():
         mode.append("skip-empty (probe %.1fs)" % PROBE_SECS)
     if STOP_EARLY:
         mode.append("stop-early")
+    if RETRIES:
+        mode.append("retries %d" % RETRIES)
     print("decode mode: %s" % (" + ".join(mode) if mode else "full (Owen's original)"), flush=True)
     print("%d channels in the %.0f MS/s capture, one after another on this Pi" % (len(chans), RATE / 1e6), flush=True)
     cells = 0
@@ -384,6 +431,8 @@ def main():
     for st in sorted(status_count):
         print("    %-22s %3d ch  %7.1fs" % (st, status_count[st], status_time[st]), flush=True)
     print("  total    %7.1fs" % (time.time() - t_start), flush=True)
+    if SKIP_EMPTY and not HAVE_PROGRESS:
+        print("  note: no sample counter in this GNU Radio - used two-pass probe instead", flush=True)
     return 0
 
 if __name__ == "__main__":

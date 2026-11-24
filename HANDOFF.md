@@ -131,6 +131,15 @@ Why the first wide version was SLOWER than narrow (fixed):
    decoded = candidates for longer capture). Default is still Owen's full decode.
    VALIDATE on ~/test_942_15M_2s.sc16 (actually 4 s @15.36, centre 942.5): full vs --fast cell
    lists must match.
+   RESULT v1 (same file): full 160.8 s / 14 cells; --skip-empty(1 s) 87.1 s / 12 (+19,21 synced);
+   --fast 50.5 s / 13. KEY FINDINGS: (a) the SAME file decodes differently run to run (19 decoded in
+   full + fast, not in skip-empty; 12 only in skip/fast) -> gr-gsm clock_offset_control feedback is
+   asynchronous, so results depend on CPU timing. Part of the 'weak cells come and go' is the
+   decoder, not the radio. (b) 1 s probe missed ARFCN 5 and 15 (late lock). (c) full-run per-channel
+   time rose 1.6->2.5 s for identical work = thermal throttling.
+   v2: single-pass probe (abort only if no sync within --probe-secs, default 2.0; needs
+   head.nitems_written, falls back to two-pass), --retries N (default 1 with --fast) for carriers
+   that synced without an SI3.
 2. Cooling (Pi 5 Active Cooler); then 2 decodes in parallel.
 3. Repeat-and-merge: N captures, union of cells with seen-count (confidence).
 4. Longer captures (cheap once 1 is in: only live channels pay for the extra seconds).
