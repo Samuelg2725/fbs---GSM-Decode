@@ -33,6 +33,8 @@ else:
     sys.exit("can't find the 'osprey 2' folder with lte_cellid.py - run this from the repo folder")
 
 from lte_cellid import decode_cell_identity, format_result   # noqa: E402
+sys.path.insert(0, HERE)
+import lte_fastsync                                            # noqa: E402  (faster, identical cell search)
 from lte_pci_search import search_samples                     # noqa: E402
 
 BLADE_LIBS = "/usr/local/lib"
@@ -823,6 +825,8 @@ def main():
                     help="record RX1 + RX2 together (both antennas, same gain); search both, decode each cell from "
                          "the two antennas combined with that cell's own weights (up to ~3 dB, more when one "
                          "antenna sits in a weak spot). Needs --all-pci")
+    ap.add_argument("--slow-search", action="store_true",
+                    help="use the original (slower) sync-search code instead of lte_fastsync (identical results)")
     ap.add_argument("--fast-srsran", action="store_true",
                     help="srsran engine: stop pdsch_ue as soon as the cell identity is printed instead of also "
                          "running the other 3 bandwidth attempts (default = old behaviour)")
@@ -840,6 +844,8 @@ def main():
 
     if args.srsran_verbose:
         SRS_EXTRA[:] = ["-v"]
+    if not args.slow_search:
+        lte_fastsync.install()        # same answers as the original search, ~4x faster (python3 lte_fastsync.py)
     if args.self_test:
         return self_test()
     if args.survey:

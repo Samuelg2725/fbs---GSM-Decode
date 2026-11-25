@@ -377,6 +377,13 @@ finds can be decoded. New options:
   --dual: capture_dual() (bladeRF-cli channel=1,2, n=2N, gains after rx config, 'set agc off'), search on
   both antennas (union), per-cell MRC weights from that cell's PSS on its 5 ms comb (cell_weights), decode
   w1*x1+w2*x2. Synthetic: equal antennas +3 dB; always >= best single antenna; naive sum is worse.
+  PI 17:0x --dual: 816 PCI 1 + 0 both decoded (RX2 = 88% of that cell); 793.5 PCI 216 (Three, phone -93)
+  DETECTED on RX2 only (MIB failed; next run 5.7x < 6, i.e. right on threshold); 2144.7 MIB still fails;
+  EE 1846.7 / Three 2117.6 nothing on either antenna at g52-54. Score 7/13 decoded + 1 detected.
+  SPEED: lte_fastsync.py (DEFAULT in lte_decode, --slow-search = original): _confirm_sss vectorised (refs
+  built once per PSS group, 336 hypotheses per matrix product; the original rebuilt sss_freq ~20k times),
+  _correlate_mag on scipy.fft all cores + cached template FFTs. 'python3 lte_fastsync.py' = self-check:
+  identical hits/ratios/scores on 5 synthetic cases, 2.9x overall, ~4x per search once cached.
 
 ## LTE srsRAN (for lte_decode.py --engine srsran)
 *** LTE DECODE CONFIRMED 2026-11-25 10:57 (home): BladeRF capture at 806 MHz (15.36 Msps, low-IF 0.6)
