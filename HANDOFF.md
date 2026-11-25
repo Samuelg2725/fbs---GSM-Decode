@@ -329,6 +329,12 @@ finds can be decoded. New options:
   Synthetic: stock finds only strongest; --weak-search finds -10 dB cells; + --pss-min 4 finds -16 dB;
   -20 dB not. Detected != decoded: a weak co-channel cell's SIB1 overlaps the strong cell (may need
   interference cancellation later). Phone references: O2 816 PCI 0+1, O2 952.5 PCI 0+1, EE 1846.7 389+461.
+  PI 15:1x: all three options -> 816 still only PCI 1 (phone: PCI 0 -64, PCI 1 -62 = NOT weak); search took
+  12-19 s (whole 0.2 s capture). Added: capture level/clipping print (LTE default gain 40 = GSM overload
+  setting!), --search-secs 0.08, --debug-search (every sync peak per PSS group + accept/reject reason),
+  align_narrow(): weak cell 'frame start not found' because H._align correlates PSS over the full 10 MHz
+  where the strong cell drowns it -> fallback aligns at 1.92 Msps, SSS averaged over all repeats; exact on
+  synthetic (-10 dB where stock fails). Full phone LTE list 15:14 saved in the conversation (13 cells).
 
 ## LTE srsRAN (for lte_decode.py --engine srsran)
 *** LTE DECODE CONFIRMED 2026-11-25 10:57 (home): BladeRF capture at 806 MHz (15.36 Msps, low-IF 0.6)

@@ -74,6 +74,10 @@ def capture(freq_hz, rate, secs, gain, low_if_hz=0.0):
     raw = np.fromfile(SC16, np.int16).astype(np.float32) / 2048.0
     iq = (raw[0::2] + 1j * raw[1::2]).astype(np.complex64)
     iq = iq[int(rate * 0.01):]                     # drop the first 10 ms (tuning transient)
+    pk = float(np.max(np.abs(raw))) if raw.size else 0.0
+    lvl = 10 * np.log10(float(np.mean(np.abs(iq) ** 2)) + 1e-20)
+    print("  capture level %.1f dBFS, peak %.2f of full scale%s (gain %g)" % (
+        lvl, pk, "  CLIPPING - use a lower --gain" if pk >= 0.99 else "", gain), flush=True)
     return condition(iq, rate, low_if_hz), took
 
 
@@ -215,6 +219,74 @@ def run_pdsch(exe, path, pci, n_prb, n_sf, timeout, early):
     return buf.decode(errors="replace")
 
 
+def align_narrow(samples, rate, pci, cfo_hz):
+    """Subframe-0 alignment for a WEAK cell. The stock alignment correlates the PSS across the full
+    bandwidth, where a stronger cell's whole transmission drowns it. Here: resample to 1.92 Msps (only the
+    centre 1.08 MHz, where PSS/SSS live), find this PCI's PSS comb (every 5 ms), decide which PSS is in
+    subframe 0 by AVERAGING the SSS over every repeat, then map the time back to the full-rate capture."""
+    import lte_sync as S
+    from lte_pci_search import resample_to_lte
+    from lte_cellid import _derotate, _useful_wide, _subframe_wide, _refine_wide, symbol_useful_offset
+    from lte_sync import _pss_freq, sss_freq
+    wide = _derotate(np.asarray(samples), cfo_hz, rate)
+    x = np.asarray(resample_to_lte(wide, rate), dtype=np.complex128)
+    nid2, nid1 = pci % 3, pci // 3
+    tpl = S.pss_time(nid2)
+    tpl = tpl / np.linalg.norm(tpl)
+    n = len(x) + len(tpl) - 1
+    nf = 1 << (n - 1).bit_length()
+    mag = np.abs(np.fft.ifft(np.fft.fft(x, nf) * np.conj(np.fft.fft(tpl, nf)))[:len(x)])
+    # strongest 5 ms comb phase: fold the correlation over 9600 samples
+    period = S._PERIOD
+    folded = np.zeros(period)
+    for k in range(len(mag) // period):
+        folded += mag[k * period:(k + 1) * period]
+    phase = int(np.argmax(folded))
+    times = [phase + k * period for k in range(len(mag) // period + 1)
+             if S.SYMBOL <= phase + k * period and phase + k * period + S.FFT_SIZE <= len(x)]
+    if len(times) < 2:
+        return None
+    groups = ([], [])
+    for i, t in enumerate(times):
+        seq = S._extract_seq(x, t - S.SYMBOL, 0.0)
+        if seq is not None:
+            groups[i % 2].append(seq)
+    best = None
+    for swap in (False, True):                          # which group is subframe 0
+        sc = []
+        for g in (0, 1):
+            if groups[g]:
+                sub5 = (g == 1) != swap
+                sc.append(S._mean_match(groups[g], sss_freq(nid1, nid2, sub5)))
+        score = sum(sc) / max(1, len(sc))
+        if best is None or score > best[0]:
+            best = (score, swap)
+    score, swap = best
+    if score < 0.3:
+        return None
+    t0 = times[1] if swap else times[0]                 # a PSS that sits in subframe 0
+    start_n = t0 - symbol_useful_offset(6)
+    nfft = int(round(rate / 15000.0))
+    pss_at = _useful_wide(6, nfft)
+    sub = _subframe_wide(nfft)
+    frame = 10 * sub
+    guess = int(round(start_n * rate / 1.92e6)) + pss_at
+    try:
+        peak = _refine_wide(wide, guess, _pss_freq(nid2), nfft)
+    except Exception:
+        peak = guess
+    if abs(peak - guess) > nfft // 4:
+        peak = guess
+    start = peak - pss_at
+    while start >= frame:
+        start -= frame
+    while start < 0:
+        start += frame
+    if start + sub > len(wide):
+        return None
+    return np.asarray(wide[start:], dtype=np.complex64)
+
+
 def srsran_cell(samples, rate, hit, args):
     """srsRAN MIB + SIB1 for ONE PCI (any PCI the search found, not only the strongest)."""
     import tempfile
@@ -224,6 +296,10 @@ def srsran_cell(samples, rate, hit, args):
     out = {"pci": pci, "strength": hit.get("pss_ratio", 0.0), "sss": hit.get("sss_score", 0.0),
            "status": "", "mib": None, "ident": None}
     aligned = H._align(samples, rate, pci, float(hit.get("offset_hz", 0.0)))
+    if aligned is None:
+        # weak cell: the full-band alignment is drowned by the strong cell; align on the narrow centre instead
+        aligned = align_narrow(samples, rate, pci, float(hit.get("offset_hz", 0.0)))
+        out["narrow_align"] = aligned is not None
     if aligned is None:
         out["status"] = "frame start not found"
         return out
@@ -252,7 +328,7 @@ def srsran_cell(samples, rate, hit, args):
     return out
 
 
-def search_all_cells(samples, rate, pss_min=None):
+def search_all_cells(samples, rate, pss_min=None, debug=False):
     """Owen's sync search, plus a second pass for WEAKER cells on the same carrier.
 
     The stock search picks one frequency offset per PSS group (the highest correlation anywhere). A strong
@@ -264,8 +340,15 @@ def search_all_cells(samples, rate, pss_min=None):
     report = search_samples(samples, rate)
     hits = list(report["hits"])
     if not hits:
+        if debug:
+            print("  [debug] stock search found nothing (best PSS %.1fx at %+.1f kHz)" % (
+                report["best_ratio"], report["best_offset_hz"] / 1e3), flush=True)
         return report
     pmin = S.PSS_MIN_RATIO if pss_min is None else float(pss_min)
+    if debug:
+        print("  [debug] stock search: %s; carrier offset %+.1f kHz; second pass threshold %.1f, SSS needs %.2f" % (
+            ", ".join("PCI %d %.1fx sss %.2f" % (h["pci"], h["pss_ratio"], h["sss_score"]) for h in hits),
+            hits[0]["offset_hz"] / 1e3, pmin, S.SSS_MIN_SCORE), flush=True)
     x = np.asarray(resample_to_lte(np.asarray(samples), rate), dtype=np.complex128)
     length = int(x.size)
     scale = float(np.sqrt(np.mean(np.abs(x) ** 2) + 1e-12))
@@ -291,9 +374,15 @@ def search_all_cells(samples, rate, pss_min=None):
             at, peak = usable
             ratio = peak / scale
             if ratio < pmin:
+                if debug:
+                    print("  [debug] group %d: next peak %.1fx < %.1f - stop" % (nid2, ratio, pmin), flush=True)
                 break
             nid1, score, pss_seq = S._confirm_sss(x, work, at, offset, nid2)
             S._blank_comb(work, at)
+            if debug:
+                ok = score >= S.SSS_MIN_SCORE and pss_seq >= S.SSS_MIN_SCORE
+                print("  [debug] group %d: peak %.1fx at %d -> PCI %d  sss %.2f pss-seq %.2f  %s" % (
+                    nid2, ratio, at, 3 * nid1 + nid2, score, pss_seq, "ACCEPT" if ok else "reject"), flush=True)
             if score < S.SSS_MIN_SCORE or pss_seq < S.SSS_MIN_SCORE:
                 continue
             pci = 3 * nid1 + nid2
@@ -328,7 +417,11 @@ def srsran_all(samples, rate, freq_mhz, args):
         print("  srsRAN pdsch_ue not found at %s - see HANDOFF 'LTE srsRAN' to build it" % H._pdsch(), flush=True)
         return None
     t0 = time.time()
-    report = search_all_cells(samples, rate, args.pss_min) if args.weak_search else search_samples(samples, rate)
+    s_in = samples[:int(rate * args.search_secs)] if args.search_secs else samples
+    report = search_all_cells(s_in, rate, args.pss_min, args.debug_search) if args.weak_search \
+        else search_samples(s_in, rate)
+    if args.debug_search and not args.weak_search:
+        search_all_cells(s_in, rate, args.pss_min, True)
     hits = report["hits"]
     print("  sync search %.1fs: %d cell(s) heard on %.1f MHz: %s" % (
         time.time() - t0, len(hits), freq_mhz,
@@ -476,6 +569,11 @@ def main():
                          "cells on the same carrier (the stock search can lock onto a false peak and miss them)")
     ap.add_argument("--pss-min", type=float, default=None,
                     help="--weak-search: sync threshold (default 6.0 = stock); lower (e.g. 4) to try weaker cells")
+    ap.add_argument("--search-secs", type=float, default=None,
+                    help="run the sync search on only the first N s of the capture (e.g. 0.08 = 80 ms, as Owen's "
+                         "cell search; default = whole capture). srsRAN still gets the whole capture")
+    ap.add_argument("--debug-search", action="store_true",
+                    help="print every sync peak per PSS group and why it was accepted / rejected")
     ap.add_argument("--fast-srsran", action="store_true",
                     help="srsran engine: stop pdsch_ue as soon as the cell identity is printed instead of also "
                          "running the other 3 bandwidth attempts (default = old behaviour)")
