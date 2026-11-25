@@ -51,6 +51,7 @@ SIB1_RE = re.compile(
     r"SIB1 cell identity (\d+)\s+eNB (\d+)\s+sector (\d+)\s+TAC (\d+)((?:[ \t]+PLMN \d+-\d+)*)[ \t]*\r?\n")
 MIB_PRB_RE = re.compile(r"PRB:\s+(\d+)")
 LAST_PEAK = [0.0]
+PPM = []                 # frequency error of the radio (offset / carrier) measured on decoded cells
 UK_BANDS = (20, 8, 3, 1, 7, 28, 32, 38, 40)
 
 
@@ -613,6 +614,7 @@ def auto_gain(args, freq_mhz, rate, x1, x2, rounds=3):
 def decode_carrier(args, freq_mhz):
     """Everything for one carrier. Returns a list of result rows (decoded and not decoded)."""
     earfcn, band = mhz_to_earfcn(freq_mhz)
+    args._targets_now = list(getattr(args, "targets", {}).get(earfcn, []))
     C.heading("%.1f MHz   EARFCN %s   band %s" % (freq_mhz, earfcn if earfcn is not None else "?", band or "?"))
     t0 = time.time()
     rate = 15.36e6
@@ -679,7 +681,32 @@ def _decode_capture(args, freq_mhz, rate, x1, x2):
         else:
             r = decode_cell(x1, rate, h, args, freq_mhz)
         r["how"] = "weak-cell search" if h.get("weak") else ("RX2 only" if h.get("rx2_only") else "cell search")
+        if r["ident"]:
+            PPM.append(float(h.get("offset_hz", 0.0)) / (freq_mhz * 1e6))
         tried.add(r["pci"])
+        results.append(r)
+        show(r)
+    # PCIs given with --cells (e.g. from a phone's cell list) that the search did not find: look for each one
+    # directly. Knowing the PCI, its sync signal can be found by adding up every 5 ms repeat over the whole
+    # recording, which works for cells too weak for the blind search.
+    for pci in getattr(args, "_targets_now", []):
+        if pci in tried:
+            continue
+        tried.add(pci)
+        if hits:
+            off = float(hits[0].get("offset_hz", 0.0))
+        else:                                    # no cell here to measure it: use the radio's error seen so far
+            off = float(np.median(PPM)) * freq_mhz * 1e6 if PPM else 0.0
+        h = {"pci": pci, "offset_hz": off, "pss_ratio": 0.0}
+        if x2 is not None:
+            w1, w2, share = cell_weights(x1, x2, rate, pci, off)
+            r = decode_cell((w1 * x1 + w2 * x2).astype(np.complex64), rate, h, args, freq_mhz)
+            r["rx"] = "RX1 %.0f%% / RX2 %.0f%%" % (100 * share, 100 * (1 - share))
+        else:
+            r = decode_cell(x1, rate, h, args, freq_mhz)
+        r["how"] = "looked for (--cells)"
+        if r["status"] == "frame timing not found":
+            r["status"] = "not found"
         results.append(r)
         show(r)
     if not args.no_siblings:
@@ -723,6 +750,28 @@ def summary(rows, t_all):
         f.show("Not decoded")
 
 
+def phone_check(args, rows):
+    """Table of the cells given with --cells: decoded, found but not decoded, or not found."""
+    t = C.Table(["EARFCN", "PCI", "Result", "Operator", "Cell ID", "How"],
+                align={"EARFCN": "right", "PCI": "right", "Cell ID": "right"})
+    ok = total = 0
+    for earfcn in args.targets:
+        for pci in args.targets[earfcn]:
+            total += 1
+            r = next((x for x in rows if x.get("earfcn") == earfcn and x.get("pci") == pci and x.get("ident")),
+                     None) or next((x for x in rows if x.get("earfcn") == earfcn and x.get("pci") == pci), None)
+            if r and r.get("ident"):
+                ok += 1
+                x = r["ident"]
+                t.add([earfcn, pci, ("decoded", "green"), C.op_cell(x["operator"]),
+                       (x["cell_id"], "green+bold"), r["how"]])
+            elif r:
+                t.add([earfcn, pci, (r["status"], "yellow" if "MIB" in r["status"] else "red"), "-", "-", r["how"]])
+            else:
+                t.add([earfcn, pci, ("not tried", "red"), "-", "-", "-"])
+    t.show("Cell list check: %d of %d decoded" % (ok, total))
+
+
 def write_csv(path, rows):
     path = os.path.expanduser(path)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -747,6 +796,10 @@ def main():
     what = ap.add_mutually_exclusive_group(required=True)
     what.add_argument("--freq-mhz", type=float, nargs="+", help="carrier centre frequency/frequencies in MHz")
     what.add_argument("--earfcn", type=int, nargs="+", help="carrier channel number(s) (EARFCN)")
+    what.add_argument("--cells", nargs="+", metavar="EARFCN:PCI,PCI",
+                      help="look for these cells, e.g. from a phone's list: 6175:216,272 1617:389,461 - every "
+                           "PCI is looked for directly even when the search does not find it, and a check table "
+                           "is printed at the end")
     ap.add_argument("--gain", type=float, default=20.0,
                     help="starting receive gain in dB (default 20; adjusted automatically unless --no-auto-gain)")
     ap.add_argument("--no-auto-gain", action="store_true", help="keep --gain fixed")
@@ -776,6 +829,14 @@ def main():
         sys.exit("srsRAN pdsch_ue was not found at %s - build it first (see README)." % pdsch_ue())
     lte_fastsync.install()
     freqs = list(args.freq_mhz or [])
+    args.targets = {}
+    for item in args.cells or []:
+        try:
+            e, pcis = item.split(":")
+            args.targets.setdefault(int(e), []).extend(int(p) for p in pcis.split(",") if p.strip())
+        except ValueError:
+            sys.exit("--cells takes EARFCN:PCI,PCI (e.g. 6175:216,272), not '%s'" % item)
+    args.earfcn = list(args.earfcn or []) + [e for e in args.targets if e not in (args.earfcn or [])]
     for e in args.earfcn or []:
         f = earfcn_to_mhz(e)
         if f is None:
@@ -792,6 +853,8 @@ def main():
     finally:
         C.ignore_ctrl_c()
     summary(rows, t_all)
+    if args.targets:
+        phone_check(args, rows)
     if args.csv and rows:
         write_csv(args.csv, rows)
     return 0

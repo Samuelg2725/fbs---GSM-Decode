@@ -30,6 +30,7 @@ export LD_LIBRARY_PATH=/usr/local/lib
 | Decode LTE carriers by frequency | `python3 lte_decode.py --freq-mhz 806 816 952.5` |
 | Decode LTE carriers by channel number | `python3 lte_decode.py --earfcn 6300 6400 3725 223` |
 | Decode LTE with both antennas | `python3 lte_decode.py --freq-mhz 816 --dual` |
+| Look for the cells a phone lists (EARFCN:PCI,PCI) | `python3 lte_decode.py --cells 6175:216,272 1617:389,461` |
 | Watch every LTE cell on one carrier, saving raw IQ | `python3 lte_track.py --earfcn 6400` |
 | …the same with both antennas (for direction finding) | `python3 lte_track.py --earfcn 6400 --dual` |
 
@@ -80,6 +81,11 @@ It automatically:
 - tries the other sectors of every mast it decodes (they share the mast's timing, so they can be decoded
   even when their own sync signal is too weak to detect);
 - records again at a higher sample rate for 15 MHz and 20 MHz wide cells.
+
+With `--cells EARFCN:PCI,PCI …` (for example copied from a phone's network-monitor app) every listed PCI is
+looked for directly, even when the search does not find it: knowing the PCI, its sync signal is added up over
+the whole recording, which finds cells several dB weaker than the blind search. A "Cell list check" table at
+the end shows which of the listed cells were decoded.
 
 Results go to `~/field/lte_cells.csv`. Useful options: `--dual` (both antennas), `--secs 2` (longer recording
 for weak sectors), `--no-auto-gain --gain N`.
