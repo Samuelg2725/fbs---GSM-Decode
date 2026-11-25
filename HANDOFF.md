@@ -142,6 +142,11 @@ User found the wideband approaches less accurate. Improvements now focus on this
 MEASURE EVERY CHANGE: --label NAME [--log FILE] -> live stats every 60 s and on Ctrl-C a row in
 ~/field/track_summary.csv: decoded / expected (SI3 every 0.9415 s from first decode), rate %, missed,
 longest gap, restarts, time to first decode, pwr avg/min/max, CIDs seen. Goal = rate % up.
+SWEEP BUG SUSPECT (2026-11-25): long multi-ARFCN sweeps starting on empty channels decoded NOTHING,
+yet single-channel ARFCN 8 decoded instantly 1 min after the 15:12 field sweep called it "no cell".
+Short lists starting on a real cell work. Hypothesis: clock_offset_control learns a bogus correction
+on empty channels and retune() keeps it. Test: --fresh (rebuilds decoder per channel) vs default.
+Also LTE: O2 816 MHz decoded = eNB 541524 sector 120 TAC 50496 PLMN 234-10 (matches phone).
 Next decode-rate candidates: restart threshold (2 s fixed now), fixed --ppm, gain/overload,
 unbounded message_debug memory on long runs.
 

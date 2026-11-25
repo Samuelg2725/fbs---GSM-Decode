@@ -392,6 +392,9 @@ def main():
                         help="multi-channel: seconds to wait for a cell ID per channel (default 1.5)")
     parser.add_argument("--passes", type=int, default=0,
                         help="multi-channel: stop after this many rounds (default 0 = forever)")
+    parser.add_argument("--fresh", action="store_true",
+                        help="rebuild the decoder on every retune/restart (no carried-over frequency "
+                             "correction); test against the default when long sweeps miss cells")
     parser.add_argument("--label", default=None,
                         help="single channel: name this run; prints decode-rate stats and adds a row to "
                              "--summary-csv on Ctrl-C (e.g. --label gain40_roof)")
@@ -439,6 +442,27 @@ def main():
             print("kraken clock not read", flush=True)
     last_print = {a: time.time() for a in arfcns}
     found_cells = {}
+
+    def reopen(tb, freq):
+        """--fresh: throw the whole decoder away and build a new one for this channel, so no
+        frequency/clock correction learned on the previous (possibly empty) channel carries over.
+        Default: Owen's retune (same decoder, new frequency)."""
+        if not args.fresh:
+            tb.retune(freq)
+            return tb
+        try:
+            tb.stop()
+            tb.wait()
+        except Exception:
+            pass
+        del tb
+        muted = clean.silence()
+        try:
+            new = top(freq, args.gain, args.radio)
+            new.start()
+        finally:
+            clean.restore(*muted)
+        return new
     try:
         if len(arfcns) == 1:
             arfcn, freq = arfcns[0], freqs[0]
@@ -487,7 +511,7 @@ def main():
                         stats.restarts += 1
                     if args.cellid is None:
                         print("%s  restarting radio" % clean.now_stamp(), flush=True)
-                    tb.retune(freq)
+                    tb = reopen(tb, freq)
                     last_msg = time.time()
                     try:
                         seen = tb.dbg.num_messages()
@@ -501,7 +525,7 @@ def main():
             while args.passes == 0 or done_passes < args.passes:
                 for arfcn, freq in zip(arfcns, freqs):
                     print("tune %d" % arfcn, flush=True)
-                    tb.retune(freq)
+                    tb = reopen(tb, freq)
                     time.sleep(0.1)
                     try:
                         seen = tb.dbg.num_messages()
