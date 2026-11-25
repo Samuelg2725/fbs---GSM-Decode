@@ -34,6 +34,28 @@ BAND900 = list(range(975, 1024)) + list(range(1, 125))
 _PREV = [None]
 
 
+def quietly(fn):
+    """Run fn() with the radio driver's console chatter hidden. Ctrl-C is held back while output is
+    redirected, so it can never leave the terminal silenced; it is delivered right after."""
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+    try:
+        muted = F.clean.silence()
+        try:
+            return fn()
+        finally:
+            F.clean.restore(*muted)
+    finally:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
+
+
+def stop_tb(tb):
+    try:
+        tb.stop()
+        tb.wait()
+    except Exception:
+        pass
+
+
 def visit(args, arfcn):
     """Tune, decode. Returns dict(cell=text or None, si2={name: arfcns}, synced=bool, secs)."""
     freq = gsm.arfcn.arfcn2downlink(arfcn)
@@ -41,13 +63,12 @@ def visit(args, arfcn):
            "si2quater": False}
     if freq is None or freq < 100e6:
         return out
-    muted = F.clean.silence()
-    try:
-        tb = F.top(freq, args.gain, "bladerf", False, None)
-        tb.start()
-    finally:
-        F.clean.restore(*muted)
-    _PREV[0] = None                      # new radio flowgraph is up: the old one can go now
+    def open_new():
+        new = F.top(freq, args.gain, "bladerf", False, None)
+        new.start()
+        return new
+    tb = quietly(open_new)
+    quietly(lambda: _PREV.__setitem__(0, None))   # new radio flowgraph is up: the old one can go now
     t0 = time.time()
     seen = 0
     want_ext = False
@@ -82,11 +103,7 @@ def visit(args, arfcn):
             time.sleep(0.02)
     finally:
         out["secs"] = time.time() - t0
-        try:
-            tb.stop()
-            tb.wait()
-        except Exception:
-            pass
+        quietly(lambda: stop_tb(tb))
         _PREV[0] = tb
     return out
 
@@ -123,6 +140,9 @@ def main():
             for a in BAND900:
                 r = visit(args, a)
                 done[a] = r
+                if not r["cell"]:
+                    print("%s  %4.1fs  ARFCN %d  %s" % (F.clean.now_stamp(), r["secs"], a,
+                          "synced, no cell ID" if r["synced"] else "no GSM sync"), flush=True)
                 if r["cell"]:
                     print("  first cell after %.0fs: %s" % (time.time() - t_all, r["cell"]), flush=True)
                     queue = [a]
@@ -166,6 +186,7 @@ def main():
             signal.signal(signal.SIGINT, signal.SIG_IGN)
         except KeyboardInterrupt:
             pass
+    quietly(lambda: _PREV.__setitem__(0, None))
     el = time.time() - t_all
     print("\n===== %d cell(s) in %.0fs, %d channel(s) visited =====" % (len(cells), el, len(done)))
     for a in sorted(cells, key=lambda k: (k < 900 and k > 500, k < 900, k)):
