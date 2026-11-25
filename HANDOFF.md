@@ -70,6 +70,12 @@ Lime (live, Owen's rig): python3 gsm_arfcn_fast.py --arfcn 13 --df   (osmosdr dr
                      osmosdr via soapy, osmosdr numchan=2, bladerf nchan=2 until both channels stream.
                      --levels = only print both levels (gain proof). Merge logic tested here with stubs;
                      radio path untested (needs Pi). Pi has SoapySDR + bladerf driver (SoapySDRUtil --find).
+- gsm_neigh.py       NEIGHBOUR-GUIDED GSM SEARCH (2026-11-25): per channel (fresh decoder, g20, sync-skip)
+                     decodes SI3 (cell ID) + SI2/SI2bis/SI2ter neighbour lists (gsm_freqlist.py: bitmap0,
+                     range 1024/512/256/128, variable bitmap; range decoder checked against libosmocore's
+                     explicit formulas). --follow visits neighbours of neighbours; --seed-sweep finds a first
+                     cell itself. Flags SI2quater (3G/LTE neighbours) as present - decoding it = next step.
+                     Untested on air. Sanity check: Vodafone cells should list 1/6/13/22.
 - lte_track.py       LTE TRACKING. Default = CAPTURE MODE: lock once (probe PCI/CFO, MIB -> RB), then loop
                      0.1 s capture -> align (first 30 ms only) -> pdsch_ue stopped at first SIB1; re-lock
                      after 3 misses. --live = srsRAN live receiver: FAILED at home 12:5x (endless cell search,
@@ -242,6 +248,8 @@ WIDEBAND --best RESULT 2026-11-25 13:32-13:42: decode itself found 6,13,22 (942.
   Decoder carry-over IS real. Now: gsm_dual --quick = fresh radio+decoders per channel + sync skip
   (--keep-open = the unreliable retune). gsm_arfcn_fast --fresh --sync-secs 1.2 = single-antenna sweep with
   fresh decoders (~0.3 s rebuild) + sync skip. Phone at 14:07: 1(-97) 6 13 22 114(-90) 116 119 + EE 649.
+  RESULT 13:57 gsm_arfcn_fast --fresh --sync-secs 1.2 --gain 20, full 900: 7/7 phone cells in 257 s incl.
+  weak 114 (-90) and 1 (-97), CIDs match. 649 (EE 1800, -92): no sync at g20/g40/dual - antenna? parked.
 Also LTE: O2 816 MHz decoded = eNB 541524 sector 120 TAC 50496 PLMN 234-10 (matches phone).
 Next decode-rate candidates: restart threshold (2 s fixed now), fixed --ppm, gain/overload,
 unbounded message_debug memory on long runs.
