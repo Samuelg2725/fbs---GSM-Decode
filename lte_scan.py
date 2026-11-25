@@ -47,6 +47,19 @@ KNOWN_EARFCN = {
     1: [223, 347],                    # Vodafone 2132.3, O2 2144.7
     7: [],
 }
+# why each known channel is on the list (shown before the scan)
+WHY = {
+    6175: "EE 800 MHz - phone scanner saw it (weak, -92)",
+    6225: "EE 800 MHz - phone scanner saw it (weak, -92)",
+    6300: "Vodafone 800 MHz - phone scanner, decoded before",
+    6400: "O2 800 MHz - phone scanner, decoded before",
+    3501: "Vodafone 900 MHz - phone scanner",
+    3725: "O2 900 MHz - phone scanner",
+    1363: "Three 1800 MHz - phone scanner",
+    1617: "EE 1800 MHz - phone scanner",
+    223: "Vodafone 2100 MHz - phone scanner",
+    347: "O2 2100 MHz - phone scanner",
+}
 OPERATOR = {"234-10": "O2", "234-15": "Vodafone", "234-20": "Three", "234-30": "EE", "234-33": "EE",
             "234-31": "EE", "234-32": "EE", "234-58": "Manx", "234-50": "JT"}
 RATE_FOR_RB = [(50, 15.36e6), (75, 23.04e6), (100, 30.72e6)]
@@ -352,18 +365,18 @@ def decode_carrier(mhz, args):
 
 
 # ---------------------------------------------------------------- output
-HEAD = "%-5s %-8s %-6s %-4s %-4s %-14s %-7s %-6s %-8s %-6s %-10s %s" % (
-    "Band", "MHz", "EARFCN", "PCI", "BW", "Operator", "PLMN", "TAC", "eNB", "Sector", "CellID", "time")
+HEAD = "%-5s %-8s %-6s %-4s %-4s %-14s %-7s %-6s %-8s %-6s %s" % (
+    "Band", "MHz", "EARFCN", "PCI", "BW", "Operator", "PLMN", "TAC", "eNB", "Sector", "CellID")
 
 
 def row(r):
     if r.get("status") != "OK":
-        return "%-5s %-8.1f %-6s %-4s %-4s %s  (%.1fs)" % (
-            "B%s" % r["band"], r["mhz"], r["earfcn"], r.get("pci", "-"), r.get("bw") or "-", r["status"], r["t"])
-    return "%-5s %-8.1f %-6s %-4s %-4s %-14s %-7s %-6s %-8s %-6s %-10s %.1fs" % (
+        return "%-5s %-8.1f %-6s %-4s %-4s %s" % (
+            "B%s" % r["band"], r["mhz"], r["earfcn"], r.get("pci", "-"), r.get("bw") or "-", r["status"])
+    return "%-5s %-8.1f %-6s %-4s %-4s %-14s %-7s %-6s %-8s %-6s %s" % (
         "B%s" % r["band"], r["mhz"], r["earfcn"], r["pci"], r.get("bw") or "-",
         (r.get("operator") or "?")[:14], "%s-%s" % (r["mcc"], r["mnc_digits"]), r["tac"], r["enb_id"],
-        r["sector_id"], r["cell_id"], r["t"])
+        r["sector_id"], r["cell_id"])
 
 
 def log_csv(path, r, label):
@@ -453,7 +466,14 @@ def main():
             if cands is None or (args.rediscover and passes > 1 and (passes - 1) % args.rediscover == 0
                                  and not args.freqs):
                 cands = sorted(set(discover(args)))
-            print("\n--- pass %d: %d carrier(s) to decode ---" % (passes, len(cands)), flush=True)
+            if passes == 1:
+                print("\nScanning %d channel(s):" % len(cands), flush=True)
+                for c in cands:
+                    e = earfcn_of(c)
+                    print("  B%-3s %7.1f MHz  EARFCN %-5s  %s" % (
+                        band_of(c), c, e, WHY.get(e, "you asked for it" if args.freqs else "found by --discover survey")),
+                        flush=True)
+            print("\n--- pass %d: %d channel(s) ---" % (passes, len(cands)), flush=True)
             print(HEAD, flush=True)
             got = []
             for c in cands:
@@ -474,20 +494,21 @@ def main():
                 live = sorted({round(r["mhz"], 1) for r in got})
                 if live:
                     cands = live
-            print("pass %d done in %.1fs: %d cell(s) decoded" % (passes, time.time() - t_pass, len(got)),
+            print("pass %d done: %d cell(s) decoded" % (passes, len(got)),
                   flush=True)
             if not args.loop:
                 break
     except KeyboardInterrupt:
         print("")
     el = time.time() - t_all
-    print("\n===== %d unique LTE cell(s), %d pass(es), %.0fs =====" % (len(cells), passes, el))
-    print("time split: " + "  ".join("%s %.1fs" % kv for kv in T.items())
-          + "  other %.1fs" % max(0.0, el - sum(T.values())))
+    print("\n===== %d unique LTE cell(s) =====" % len(cells))
+    if args.timing:
+        print("time split: " + "  ".join("%s %.1fs" % kv for kv in T.items())
+              + "  other %.1fs" % max(0.0, el - sum(T.values())))
     if cells:
-        print(HEAD.rsplit(" ", 1)[0])
+        print(HEAD)
         for k in sorted(cells):
-            print(row(cells[k]).rsplit(" ", 1)[0])
+            print(row(cells[k]))
     return 0
 
 
