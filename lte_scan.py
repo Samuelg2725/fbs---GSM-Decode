@@ -153,6 +153,7 @@ def probe(samples, rate, nudges_mhz, full_retry=True):
 
 
 EARLY = [True]
+ALIGN_WINDOW = [True]
 DEBUG = [None]
 T = {"capture": 0.0, "probe": 0.0, "align": 0.0, "srsran": 0.0}
 
@@ -246,7 +247,11 @@ def srsran_read(samples, rate, pci, cfo_hz, n_prb, timeout):
     from lte_cellid import _derotate, _locate_wide
     t_al = time.time()
     corrected = _derotate(np.asarray(samples), cfo_hz, rate)
-    start = _locate_wide(corrected, pci, int(round(rate / 15000.0)))     # FFT size for this rate
+    # frame start: searching the first 30 ms (3 frames) is enough and ~8x cheaper than the whole capture
+    win = corrected[:int(rate * 0.03)] if ALIGN_WINDOW[0] else corrected
+    start = _locate_wide(win, pci, int(round(rate / 15000.0)))          # FFT size for this rate
+    if start is None and ALIGN_WINDOW[0]:
+        start = _locate_wide(corrected, pci, int(round(rate / 15000.0)))
     aligned = None if start is None else np.asarray(corrected[start:], dtype=np.complex64)
     if aligned is None:
         T["align"] += time.time() - t_al
@@ -418,6 +423,8 @@ def main():
                     help="centre corrections (MHz) tried by the sync probe")
     ap.add_argument("--no-early-stop", action="store_true",
                     help="let pdsch_ue read the whole capture even after SIB1 decoded (old behaviour, slower)")
+    ap.add_argument("--full-align", action="store_true",
+                    help="search the whole capture for the frame start (old, slower) instead of the first 30 ms")
     ap.add_argument("--timing", action="store_true", help="print where the time goes for every carrier")
     ap.add_argument("--debug-dir", help="save every pdsch_ue output here (for failed MIB/SIB1 rows)")
     ap.add_argument("--srsran-timeout", type=int, default=20, help="seconds per pdsch_ue attempt")
@@ -428,6 +435,7 @@ def main():
     args = ap.parse_args()
 
     EARLY[0] = not args.no_early_stop
+    ALIGN_WINDOW[0] = not args.full_align
     DEBUG[0] = args.debug_dir
     if not H._pdsch().is_file():
         sys.exit("srsRAN pdsch_ue not found at %s - build it first (HANDOFF 'LTE srsRAN')" % H._pdsch())

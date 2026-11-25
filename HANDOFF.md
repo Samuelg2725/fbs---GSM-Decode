@@ -63,7 +63,11 @@ Lime (live, Owen's rig): python3 gsm_arfcn_fast.py --arfcn 13 --df   (osmosdr dr
                      instead of saving sib1_bits.bin -> now parsed from the text. Survey centres were 1-2 MHz
                      off -> default is now the phone's carrier list (B20 6175/6225/6300/6400, B8 3501/3725,
                      B3 1363/1617, B1 223/347); --discover adds the survey. All PCIs per carrier decoded.
-- lte_track.py       LIVE LTE TRACKING (2026-11-25): wraps live pdsch_ue (-f, -g) on one carrier, parses the
+- lte_track.py       LTE TRACKING. Default = CAPTURE MODE: lock once (probe PCI/CFO, MIB -> RB), then loop
+                     0.1 s capture -> align (first 30 ms only) -> pdsch_ue stopped at first SIB1; re-lock
+                     after 3 misses. --live = srsRAN live receiver: FAILED at home 12:5x (endless cell search,
+                     'buffer size 1024' warnings; likely DC spike on centre, live srsRAN has no low-IF).
+                     (--live) wraps live pdsch_ue (-f, -g) on one carrier, parses the
                      SIB1 line from print_sib1.py: first-decode time, SIB1 per second, identity changes,
                      summary -> ~/field/lte_track_summary.csv. LTE equivalent of gsm_arfcn_fast tracking.
   lte_scan ALL-BANDS RUN 12:5x: 4 cells OK (806 V PCI21 s20, 930.1 V s22, 952.5 O2 s122, 2132.3 V 15MHz s24),
