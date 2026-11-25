@@ -354,7 +354,12 @@ finds can be decoded. New options:
   Added --srsran-log DIR, --deep-search: PSS |corr|^2 folded over all 5 ms repeats per root/offset (z-score),
   SSS equalised with the PSS channel estimate and summed coherently, z-score vs 336 hypotheses (accept >=5;
   noise-only max 4.1); uncertain-but-real PSS combs -> top 3 PCIs to srsRAN (CRC decides). Synthetic: ~4 dB
-  more sensitive than stock, no false cells in noise-only trials. Use --search-secs 0.2 with it.
+  more sensitive than stock, no false cells in noise-only trials.
+  PI 16:0x: --deep-search FAILED ON AIR - search 31-35 s, many false PSS 'combs' (real LTE has other 5 ms
+  periodic structure; the noise calibration was synthetic-only), every candidate rejected, nothing new
+  -> REMOVED. EE 1846.7/1866.5 + Three 2117.6: gain 53-55, level -18 dBFS, still no sync -> antenna at
+  1800-2100 MHz suspected (like GSM 649). 2144.7 O2 (-59 phone): sync OK, MIB not decoded at 15.36 ->
+  test at --rate 30.72e6. srsRAN log names now include the frequency.
 
 ## LTE srsRAN (for lte_decode.py --engine srsran)
 *** LTE DECODE CONFIRMED 2026-11-25 10:57 (home): BladeRF capture at 806 MHz (15.36 Msps, low-IF 0.6)

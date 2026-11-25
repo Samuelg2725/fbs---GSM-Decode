@@ -49,6 +49,7 @@ def earfcn_to_mhz(earfcn):
 
 
 LAST_PEAK = [0.0]
+CUR_FREQ = [0.0]
 
 
 def capture(freq_hz, rate, secs, gain, low_if_hz=0.0):
@@ -331,8 +332,8 @@ def srsran_cell(samples, rate, hit, args, aligned=None):
             if args.srsran_log:
                 d = os.path.expanduser(args.srsran_log)
                 os.makedirs(d, exist_ok=True)
-                with open(os.path.join(d, "pdsch_%s_%.0fMsps_pci%d_p%d.txt" % (
-                        time.strftime("%H%M%S"), rate / 1e6, pci, n_prb)), "w") as fh:
+                with open(os.path.join(d, "pdsch_%s_%gMHz_%.0fMsps_pci%d_p%d.txt" % (
+                        time.strftime("%H%M%S"), CUR_FREQ[0], rate / 1e6, pci, n_prb)), "w") as fh:
                     fh.write(text)
             vals = [int(v) for v in MIB_PRB_RE.findall(text) if int(v) in (6, 15, 25, 50, 75, 100)] \
                 if "Decoded MIB" in text else []
@@ -363,101 +364,6 @@ def srsran_cell(samples, rate, hit, args, aligned=None):
     else:
         out["status"] = "MIB not decoded"
     return out
-
-
-def deep_search(samples, rate, pss_z=None, sss_z=None, debug=False, max_per_group=3):
-    """Sensitive cell search for WEAK cells (--deep-search).
-    1. PSS: |correlation|^2 summed over every 5 ms repeat in the window (non-coherent folding), per PSS
-       root and frequency offset - many weak bursts add up instead of each having to pass on its own.
-    2. SSS: each burst's PSS gives the channel on those 62 subcarriers; the SSS next to it is corrected
-       with it and the corrected SSS of all bursts are ADDED COHERENTLY (noise averages out), then matched
-       against all 168 x 2 hypotheses. A cell is accepted only if its best hypothesis stands far above the
-       rest (z-score), so noise cannot pass. Returns a report like search_samples()."""
-    import lte_sync as S
-    from lte_pci_search import resample_to_lte
-    from lte_sync import _pss_freq, sss_freq
-    pz = 7.0 if pss_z is None else float(pss_z)
-    szt = 5.0 if sss_z is None else float(sss_z)          # noise-only max seen: 4.1 (24 trials)
-    x = np.asarray(resample_to_lte(np.asarray(samples), rate), dtype=np.complex128)
-    L = len(x)
-    period = S._PERIOD
-    nper = L // period
-    if nper < 4:
-        return {"hits": [], "best_ratio": 0.0, "best_offset_hz": 0.0, "min_ratio": pz, "best_sss": 0.0,
-                "sss_min": szt}
-    nfft = 1 << (L + S.FFT_SIZE - 2).bit_length()
-    spectrum = np.fft.fft(x, nfft)
-    # reference SSS matrix: (168*2, 62) rows = (nid1, subframe5)
-    hits, best_overall = [], (0.0, 0.0)
-    for nid2 in range(3):
-        base = S.pss_time(nid2)
-        base = base / np.linalg.norm(base)
-        best = None
-        offs = list(range(-50000, 50001, 2500))
-        for off in offs:
-            mag = S._correlate_mag(spectrum, S._shifted(base, off), L)
-            f = (mag[:nper * period] ** 2).reshape(nper, period).sum(axis=0)
-            z = (f.max() - np.median(f)) / (np.std(f) + 1e-20)
-            if best is None or z > best[0]:
-                best = (z, off, f)
-        z, off, fold = best
-        if z > best_overall[0]:
-            best_overall = (z, off)
-        refs = np.array([sss_freq(n1, nid2, sf5) for n1 in range(168) for sf5 in (False, True)])
-        pss_ref = _pss_freq(nid2)
-        work = fold.copy()
-        med, sd = np.median(fold), np.std(fold) + 1e-20
-        for _k in range(max_per_group):
-            phase = int(np.argmax(work))
-            pzs = (work[phase] - med) / sd
-            if pzs < pz:
-                if debug:
-                    print("  [deep] group %d: next PSS comb z=%.1f < %.1f - stop" % (nid2, pzs, pz), flush=True)
-                break
-            lo, hi = max(0, phase - 300), min(period, phase + 300)
-            work[lo:hi] = med
-            ramp = np.exp(-2j * np.pi * off * np.arange(L) / S.FS)
-            xc = x * ramp
-            eq = ([], [])
-            for k in range(nper + 1):
-                t = phase + k * period
-                if t - S.SYMBOL < 0 or t + S.FFT_SIZE > L:
-                    continue
-                P = S._sss_from_symbol(xc[t:t + S.FFT_SIZE])
-                Sq = S._sss_from_symbol(xc[t - S.SYMBOL:t - S.SYMBOL + S.FFT_SIZE])
-                H = P * np.conj(pss_ref)                      # channel estimate on the 62 centre subcarriers
-                eq[k % 2].append(Sq * np.conj(H))
-            if not eq[0] or not eq[1]:
-                continue
-            s0, s1 = np.sum(eq[0], axis=0), np.sum(eq[1], axis=0)
-            # hypothesis (nid1, sf5 for group 0); group 1 is then the other half-frame
-            m0 = np.abs(refs.conj() @ s0)              # (336,)
-            m1 = np.abs(refs.conj() @ s1)
-            m0 = m0.reshape(168, 2)
-            m1 = m1.reshape(168, 2)
-            score = np.concatenate([m0[:, 0] + m1[:, 1], m0[:, 1] + m1[:, 0]])   # (336,): swap False / True
-            bi = int(np.argmax(score))
-            others = np.delete(score, bi)
-            sz = (score[bi] - others.mean()) / (others.std() + 1e-20)
-            nid1 = bi % 168
-            pci = 3 * nid1 + nid2
-            if debug:
-                print("  [deep] group %d: PSS comb z=%.1f at %d (offset %+.1f kHz) -> PCI %d  SSS z=%.1f  %s" % (
-                    nid2, pzs, phase, off / 1e3, pci, sz, "ACCEPT" if sz >= szt else "reject"), flush=True)
-            if sz >= szt and all(h["pci"] != pci for h in hits):
-                hits.append({"pci": pci, "nid1": nid1, "nid2": nid2, "pss_ratio": float(pzs), "sss_score": float(sz),
-                             "offset_hz": float(off), "phase": phase, "deep": True})
-            elif sz < szt and pzs >= pz + 4:     # only for a PSS comb that is clearly real (noise reaches ~7)
-                # PSS clearly there but SSS unsure: hand the 3 best PCIs to srsRAN - its CRC decides
-                for ci in np.argsort(score)[::-1][:3]:
-                    cpci = 3 * (int(ci) % 168) + nid2
-                    if all(h["pci"] != cpci for h in hits):
-                        hits.append({"pci": cpci, "nid1": int(ci) % 168, "nid2": nid2, "pss_ratio": float(pzs),
-                                     "sss_score": float((score[ci] - others.mean()) / (others.std() + 1e-20)),
-                                     "offset_hz": float(off), "phase": phase, "deep": True, "candidate": True})
-    hits.sort(key=lambda h: h["pss_ratio"], reverse=True)
-    return {"hits": hits, "best_ratio": best_overall[0], "best_offset_hz": best_overall[1], "min_ratio": pz,
-            "best_sss": 0.0, "sss_min": szt}
 
 
 def search_all_cells(samples, rate, pss_min=None, debug=False):
@@ -554,13 +460,7 @@ def srsran_all(samples, rate, freq_mhz, args):
         return None
     t0 = time.time()
     s_in = samples[:int(rate * args.search_secs)] if args.search_secs else samples
-    if args.deep_search:
-        report = deep_search(s_in, rate, debug=args.debug_search)
-        if args.weak_search:                  # union with the stock + weak search
-            extra = search_all_cells(s_in, rate, args.pss_min, args.debug_search)
-            have = {h["pci"] for h in report["hits"]}
-            report["hits"] = extra["hits"] + [h for h in report["hits"] if h["pci"] not in {e["pci"] for e in extra["hits"]}]
-    elif args.weak_search:
+    if args.weak_search:
         report = search_all_cells(s_in, rate, args.pss_min, args.debug_search)
     else:
         report = search_samples(s_in, rate)
@@ -569,11 +469,8 @@ def srsran_all(samples, rate, freq_mhz, args):
     hits = report["hits"]
     print("  sync search %.1fs: %d cell(s) heard on %.1f MHz: %s" % (
         time.time() - t0, len(hits), freq_mhz,
-        ", ".join("PCI %d (strength %.0f)%s" % (h["pci"], h["pss_ratio"],
-                  "?" if h.get("candidate") else ("*" if h.get("second_pass") else ("+" if h.get("deep") else "")))
+        ", ".join("PCI %d (strength %.0f)%s" % (h["pci"], h["pss_ratio"], "*" if h.get("second_pass") else "")
                   for h in hits) or "none"), flush=True)
-    if any(h.get("deep") for h in hits):
-        print("  (+ = found by --deep-search; ? = deep-search candidate, srsRAN's CRC decides)", flush=True)
     if any(h.get("second_pass") for h in hits):
         print("  (* = found only by --weak-search)", flush=True)
     if not hits:
@@ -584,8 +481,6 @@ def srsran_all(samples, rate, freq_mhz, args):
         res = srsran_cell(samples, rate, h, args)
         tried[res["pci"]] = res
         line = res["ident"] if res["ident"] else res["status"]
-        if h.get("candidate") and not res["ident"]:
-            line = "candidate rejected (%s)" % res["status"]
         print("  PCI %-3d strength %4.0f  %s  (%.1fs)" % (res["pci"], res["strength"], line, time.time() - t1),
               flush=True)
     if args.siblings:
@@ -635,6 +530,7 @@ def one_line(res, freq_mhz):
 def run_once(args, freq_mhz, rate):
     """Capture (or load) + decode one time; re-captures at a wider rate if the cell needs it."""
     timing = {}
+    CUR_FREQ[0] = freq_mhz
     if args.file:
         samples = condition(load_file(args.file, rate), rate, args.low_if_mhz * 1e6)
     else:
@@ -781,10 +677,6 @@ def main():
                          "gain (up to +20 dB) - then capture again. 800 and 2100 MHz need very different gains")
     ap.add_argument("--srsran-log", default=None,
                     help="save every srsRAN pdsch_ue output to this folder (e.g. ~/field/srslog) for diagnosis")
-    ap.add_argument("--deep-search", action="store_true",
-                    help="sensitive search for WEAK cells: PSS summed over every 5 ms repeat, SSS channel-corrected "
-                         "and added coherently; uncertain PCIs go to srsRAN (CRC decides). Use with "
-                         "--search-secs 0.2. Combine with --weak-search to also keep the stock search's cells")
     ap.add_argument("--fast-srsran", action="store_true",
                     help="srsran engine: stop pdsch_ue as soon as the cell identity is printed instead of also "
                          "running the other 3 bandwidth attempts (default = old behaviour)")
