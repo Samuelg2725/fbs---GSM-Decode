@@ -133,6 +133,11 @@ Why the first wide version was SLOWER than narrow (fixed):
   LD_LIBRARY_PATH=/usr/local/lib python3 ~/gsm_arfcn_fast.py --radio bladerf --arfcn 4
 User found the wideband approaches less accurate. Improvements now focus on this live tracker
 (--dwell only affects multi-channel mode; with one ARFCN it is ignored).
+MEASURE EVERY CHANGE: --label NAME [--log FILE] -> live stats every 60 s and on Ctrl-C a row in
+~/field/track_summary.csv: decoded / expected (SI3 every 0.9415 s from first decode), rate %, missed,
+longest gap, restarts, time to first decode, pwr avg/min/max, CIDs seen. Goal = rate % up.
+Next decode-rate candidates: restart threshold (2 s fixed now), fixed --ppm, gain/overload,
+unbounded message_debug memory on long runs.
 
 ## (superseded) UPGRADE PLAN (agreed order - accuracy first, then speed)
 1. DONE (needs Pi validation): gsm_wide.py --skip-empty / --stop-early / --fast / --probe-secs.

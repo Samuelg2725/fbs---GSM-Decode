@@ -268,6 +268,115 @@ def flush_df(pending):
     while pending and now - pending[0]["t"] >= 1.5:
         emit_df(pending.pop(0))
 
+SI3_PERIOD = 4 * 51 * 120.0 / 26.0 / 1000.0   # SI3 every 4 x 51-multiframes = 0.9415 s
+
+def parse_cell(text):
+    """Pull CID/LAC/MCC/MNC/Pwr out of a cell_text line (colour codes stripped)."""
+    import re
+    plain = re.sub("\x1b\\[[0-9;]*m", "", text)
+    out = {}
+    for key in ("CID", "LAC", "MCC", "MNC", "Pwr"):
+        m = re.search(key + r":\s*(-?\d+)", plain)
+        out[key] = int(m.group(1)) if m else None
+    m = re.search(r"MNC:\s*-?\d+\s+([^,]+)", plain)
+    out["op"] = m.group(1).strip() if m else ""
+    return out
+
+class TrackStats(object):
+    """Decode-rate bookkeeping for single-channel tracking (--label / --log)."""
+    def __init__(self, args, arfcn):
+        self.args = args
+        self.arfcn = arfcn
+        self.t_listen = time.time()
+        self.t_first = None
+        self.t_last = None
+        self.decodes = 0
+        self.missed = 0
+        self.longest = 0.0
+        self.restarts = 0
+        self.wrong = 0
+        self.cids = {}
+        self.pwr = []
+        self.logf = None
+        if args.log:
+            path = os.path.expanduser(args.log)
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            new = not os.path.exists(path)
+            self.logf = open(path, "a")
+            if new:
+                self.logf.write("utc,label,arfcn,cid,lac,mcc,mnc,operator,pwr,gap_s,missed_before,restarts\n")
+
+    def decoded(self, text):
+        now = time.time()
+        c = parse_cell(text)
+        gap = None
+        missed_here = 0
+        if self.t_last is None:
+            self.t_first = now
+        else:
+            gap = now - self.t_last
+            self.longest = max(self.longest, gap)
+            missed_here = max(0, int(round(gap / SI3_PERIOD)) - 1)
+            self.missed += missed_here
+        self.t_last = now
+        self.decodes += 1
+        self.cids[c["CID"]] = self.cids.get(c["CID"], 0) + 1
+        if self.args.cellid is not None and c["CID"] != self.args.cellid:
+            self.wrong += 1
+        if c["Pwr"] is not None:
+            self.pwr.append(c["Pwr"])
+        if self.logf:
+            self.logf.write("%s,%s,%d,%s,%s,%s,%s,%s,%s,%s,%d,%d\n" % (
+                clean.now_stamp(), self.args.label, self.arfcn, c["CID"], c["LAC"], c["MCC"], c["MNC"],
+                c["op"], c["Pwr"], "" if gap is None else "%.3f" % gap, missed_here, self.restarts))
+            self.logf.flush()
+
+    def numbers(self):
+        end = time.time()
+        if self.t_first is None:
+            expected = 0
+        else:
+            expected = int(round((self.t_last - self.t_first) / SI3_PERIOD)) + 1
+        rate = 100.0 * self.decodes / expected if expected else 0.0
+        return dict(runtime=end - self.t_listen, expected=expected, rate=rate,
+                    first=(self.t_first - self.t_listen) if self.t_first else None)
+
+    def line(self):
+        n = self.numbers()
+        pw = ("avg %.1f  min %d  max %d" % (sum(self.pwr) / len(self.pwr), min(self.pwr), max(self.pwr))
+              if self.pwr else "-")
+        return ("[%s] %.0fs  decoded %d / expected %d = %.1f%%  missed %d  longest gap %.1fs  "
+                "restarts %d  first after %s  pwr %s%s"
+                % (self.args.label, n["runtime"], self.decodes, n["expected"], n["rate"], self.missed,
+                   self.longest, self.restarts, "-" if n["first"] is None else "%.1fs" % n["first"], pw,
+                   ("  WRONG CID %d" % self.wrong) if self.wrong else ""))
+
+    def finish(self):
+        n = self.numbers()
+        print("")
+        print("===== tracking summary =====", flush=True)
+        print(self.line(), flush=True)
+        if len(self.cids) > 1:
+            print("  more than one CID seen: %s" % ", ".join("%s x%d" % kv for kv in self.cids.items()), flush=True)
+        path = os.path.expanduser(self.args.summary_csv)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        new = not os.path.exists(path)
+        with open(path, "a") as fh:
+            if new:
+                fh.write("start_utc,label,arfcn,radio,gain,runtime_s,decoded,expected,rate_pct,missed,"
+                         "longest_gap_s,restarts,first_decode_s,pwr_avg,pwr_min,pwr_max,cids,wrong_cid\n")
+            fh.write("%s,%s,%d,%s,%g,%.1f,%d,%d,%.1f,%d,%.2f,%d,%s,%s,%s,%s,%s,%d\n" % (
+                time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(self.t_listen)), self.args.label, self.arfcn,
+                self.args.radio, self.args.gain, n["runtime"], self.decodes, n["expected"], n["rate"],
+                self.missed, self.longest, self.restarts,
+                "" if n["first"] is None else "%.2f" % n["first"],
+                "%.1f" % (sum(self.pwr) / len(self.pwr)) if self.pwr else "",
+                min(self.pwr) if self.pwr else "", max(self.pwr) if self.pwr else "",
+                "/".join(str(k) for k in self.cids), self.wrong))
+        print("  summary row added to %s" % path, flush=True)
+        if self.logf:
+            self.logf.close()
+
 def main():
     global df_cellid, df_arfcn
     import argparse
@@ -283,6 +392,15 @@ def main():
                         help="multi-channel: seconds to wait for a cell ID per channel (default 1.5)")
     parser.add_argument("--passes", type=int, default=0,
                         help="multi-channel: stop after this many rounds (default 0 = forever)")
+    parser.add_argument("--label", default=None,
+                        help="single channel: name this run; prints decode-rate stats and adds a row to "
+                             "--summary-csv on Ctrl-C (e.g. --label gain40_roof)")
+    parser.add_argument("--log", default=None,
+                        help="single channel: CSV file with one row per decoded cell ID")
+    parser.add_argument("--summary-csv", default="~/field/track_summary.csv",
+                        help="where --label runs add their summary row (default ~/field/track_summary.csv)")
+    parser.add_argument("--stats-every", type=float, default=60.0,
+                        help="single channel with --label: print a stats line every N s (0 = only at the end)")
     args = parser.parse_args()
     if args.gain is None:
         args.gain = 40.0 if args.radio == "bladerf" else 50.0
@@ -328,6 +446,10 @@ def main():
             last_msg = time.time()
             shown = False
             pending = []
+            stats = TrackStats(args, arfcn) if (args.label or args.log) else None
+            if stats and not args.label:
+                args.label = "-"
+            next_stats = time.time() + args.stats_every if args.stats_every > 0 else None
             while True:
                 if args.df:
                     flush_df(pending)
@@ -343,6 +465,8 @@ def main():
                     took = now - last_print[arfcn]
                     last_print[arfcn] = now
                     cid = int(__import__("re").sub("\x1b\\[[0-9;]*m", "", text).split("CID:")[1].split(",")[0])
+                    if stats:
+                        stats.decoded(text)
                     if args.df:
                         pending.append({"t": time.time(), "stamp": clean.now_stamp(), "took": took, "text": text, "cid": cid})
                     elif args.cellid is None:
@@ -355,7 +479,12 @@ def main():
                     else:
                         print("%s  %6.1fs  %s" % (clean.now_stamp(), took, text), flush=True)
                         print("ARFCN %d expected %d, got %d" % (arfcn, args.cellid, cid), flush=True)
+                if stats and next_stats and time.time() >= next_stats:
+                    print(stats.line(), flush=True)
+                    next_stats = time.time() + args.stats_every
                 if time.time() - last_msg > 2:
+                    if stats:
+                        stats.restarts += 1
                     if args.cellid is None:
                         print("%s  restarting radio" % clean.now_stamp(), flush=True)
                     tb.retune(freq)
@@ -414,6 +543,8 @@ def main():
                 tb.stop()
             except Exception:
                 pass
+        if len(arfcns) == 1 and locals().get("stats"):
+            stats.finish()
     if len(arfcns) > 1:
         print("")
         print("===== %d unique cell(s) =====" % len(found_cells))
