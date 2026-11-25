@@ -164,8 +164,9 @@ def capture_bladerf_dual(n):
            "-e", "set frequency rx %d" % int(CENTER),
            "-e", "set samplerate rx %d" % int(RATE),
            "-e", "set bandwidth rx %d" % int(min(RATE * 0.9, 56e6)),
+           # with two channels bladeRF-cli's n= counts samples of BOTH channels together -> ask for 2n
            "-e", "rx config file=%s format=bin n=%d channel=1,2 samples=16384 buffers=64 xfers=16 timeout=20000"
-           % (raw, n),
+           % (raw, 2 * n),
            "-e", "set gain rx1 %d" % int(GAIN), "-e", "set gain rx2 %d" % int(GAIN2),
            "-e", "rx start", "-e", "rx wait %d" % int(SECS * 3000 + 15000)]
     env = dict(os.environ)

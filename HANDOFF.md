@@ -216,6 +216,9 @@ DUAL PROVEN 2026-11-25 13:18: both g20 -> RX1 100%, RX2 100%, every broadcast on
   channel, found if either decodes, summary says RX1/RX2 only); gsm_wide.py --gain2 G = record RX1+RX2
   together (bladeRF-cli channel=1,2), decode RX1, then RX2 only on channels RX1 found nothing on.
   gsm_wide bladerf default gain 40 -> 20.
+DUAL SWEEP 2026-11-25 13:26 (gsm_dual.py, g20/g40, 9 ch, 39 s): found 6,13,22,116,119 (all known except 9).
+  RX1 g20 5/5, RX2 g40 4/5 (missed 13: clipping) -> RX1 covered it. Cells decode in 0.2-1.0 s; empty
+  channels cost the full dwell. gsm_wide --gain2: bladeRF-cli n= counts BOTH channels -> fixed (2n).
 Also LTE: O2 816 MHz decoded = eNB 541524 sector 120 TAC 50496 PLMN 234-10 (matches phone).
 Next decode-rate candidates: restart threshold (2 s fixed now), fixed --ppm, gain/overload,
 unbounded message_debug memory on long runs.
