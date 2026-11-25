@@ -353,7 +353,9 @@ class TrackStats(object):
             expected = 0
         else:
             expected = int(round((self.t_last - self.t_first) / SI3_PERIOD)) + 1
-        rate = 100.0 * self.decodes / expected if expected else 0.0
+        # % of ID broadcasts caught = decoded / (decoded + missed). Some cells (O2 116/119) send the ID
+        # 3x per 1.9 s, so decoded/expected went above 100%; missed is counted from gaps, which is exact.
+        rate = 100.0 * self.decodes / (self.decodes + self.missed) if self.decodes else 0.0
         return dict(runtime=end - self.t_listen, expected=expected, rate=rate,
                     first=(self.t_first - self.t_listen) if self.t_first else None)
 
@@ -361,9 +363,9 @@ class TrackStats(object):
         n = self.numbers()
         pw = ("avg %.1f  min %d  max %d" % (sum(self.pwr) / len(self.pwr), min(self.pwr), max(self.pwr))
               if self.pwr else "-")
-        return ("[%s] %.0fs  decoded %d / expected %d = %.1f%%  missed %d  longest gap %.1fs  "
+        return ("[%s] %.0fs  decoded %d  missed %d  = %.1f%% caught  longest gap %.1fs  "
                 "restarts %d  first after %s  pwr %s%s"
-                % (self.args.label, n["runtime"], self.decodes, n["expected"], n["rate"], self.missed,
+                % (self.args.label, n["runtime"], self.decodes, self.missed, n["rate"],
                    self.longest, self.restarts, "-" if n["first"] is None else "%.1fs" % n["first"], pw,
                    ("  WRONG CID %d" % self.wrong) if self.wrong else ""))
 
@@ -398,8 +400,14 @@ class TrackStats(object):
         except BrokenPipeError:
             pass
 
+def _first_ctrl_c_only(signum, frame):
+    signal.signal(signal.SIGINT, signal.SIG_IGN)       # any further Ctrl-C (timeout forwards one) is ignored
+    raise KeyboardInterrupt
+
+
 def main():
     global df_cellid, df_arfcn
+    signal.signal(signal.SIGINT, _first_ctrl_c_only)
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--arfcn", type=int, nargs="+", required=True)
@@ -408,7 +416,7 @@ def main():
     parser.add_argument("--radio", choices=["lime", "bladerf"], default="lime",
                         help="lime (default, Owen's rig) or bladerf")
     parser.add_argument("--gain", type=float, default=None,
-                        help="default 50 for lime, 40 for bladerf (home test: 40 overloads, 20 = 100%% decode)")
+                        help="default 50 for lime, 20 for bladerf (40 overloads strong cells; was the old default)")
     parser.add_argument("--agc", action="store_true",
                         help="bladerf: use the radio's hardware AGC instead of the fixed --gain")
     parser.add_argument("--dwell", type=float, default=1.5,
@@ -429,7 +437,9 @@ def main():
                         help="single channel with --label: print a stats line every N s (0 = only at the end)")
     args = parser.parse_args()
     if args.gain is None:
-        args.gain = 40.0 if args.radio == "bladerf" else 50.0
+        # bladerf: 20 (2026-11-25 home: gain 40 overloads strong cells -> 21-32%, 116 never decoded;
+        # gain 10/20/AGC = 100% on all 5 cells). --gain 40 gives the old behaviour.
+        args.gain = 20.0 if args.radio == "bladerf" else 50.0
     if args.df and len(args.arfcn) != 1:
         print("df uses one channel")
         return 1
@@ -586,8 +596,10 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        # Ctrl-C under `timeout` arrives twice (terminal + timeout forwards it); ignore the 2nd so cleanup finishes
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except KeyboardInterrupt:
+            pass
         if tb is not None:
             try:
                 tb.stop()

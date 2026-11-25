@@ -188,6 +188,15 @@ GAIN TEST 2026-11-25 11:51-12:03 (home, ARFCN 13 = strongest cell, 2 min each):
   Added --agc (AD9361 hardware AGC on bladerf) to test against fixed gains.
   RX1/RX2: AD9361 shares LO + sample rate + bandwidth, but GAIN IS PER CHANNEL -> RX1 low gain for
   strong cells, RX2 high gain for weak ones, same frequency, is possible (needs 2-ch streaming).
+GAIN RESULT 2026-11-25 12:07-12:28 (home, 2 min each, single-channel tracking):
+  ARFCN 13: g10 100%, g20 100%, AGC 100%  (g30 38%, g40 32%)
+  ARFCN 116: g20 100%, AGC 100%  (g40: NEVER decoded, 52 restarts)
+  ARFCN 119: g20 100%, AGC 100%  (g40 21.5%, 8 restarts)
+  ARFCN 6, 22: g20 100%, AGC 100%.  Zero misses, zero restarts, longest gap 0.9 s everywhere.
+  -> gain 40 was the cause of nearly all lost decodes. bladerf default is now 20 (--gain 40 = old).
+  O2 116/119 send the cell ID 3x per 1.9 s (gaps 0.5/0.5/0.9) -> old rate showed 150%; rate is now
+  decoded/(decoded+missed). First Ctrl-C now stops cleanly, further ones ignored (h13_g10 summary was lost).
+  Still to test: weak cells (9 at -106, DCS 660 at -99) at g20 vs AGC vs g40; full sweep at g20/AGC.
 Also LTE: O2 816 MHz decoded = eNB 541524 sector 120 TAC 50496 PLMN 234-10 (matches phone).
 Next decode-rate candidates: restart threshold (2 s fixed now), fixed --ppm, gain/overload,
 unbounded message_debug memory on long runs.
