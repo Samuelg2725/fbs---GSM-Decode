@@ -200,3 +200,15 @@ Build libbladeRF 2.6.1 (deps: build-essential cmake git libusb-1.0-0-dev pkg-con
      libcurl4-openssl-dev libncurses-dev) -> cmake -DCMAKE_INSTALL_PREFIX=/usr/local .. ; make ; make install.
 Flash firmware v2.6.0. Copy gsm_arfcn_clean.py to /home/<user>/.
 
+
+## LTE srsRAN (for lte_decode.py --engine srsran)
+First on-air test 2026-11-25 (home, 800 MHz): survey found 10 MHz carriers at 801-811 (centre 806)
+and 811.5-821 (centre 816). Python engine found PCI 21 @806 and PCI 1 @816 but MIB failed by 3-5
+bits every time (also with --low-if-mhz 0.6). Owen's on-air HackRF path used srsRAN pdsch_ue for
+MIB+SIB1, so build it (paths are hard-coded to /home/revector):
+  sudo apt install -y build-essential cmake libfftw3-dev libmbedtls-dev libboost-program-options-dev \
+       libconfig++-dev libsctp-dev
+  cd ~ && git clone --depth 1 https://github.com/srsran/srsRAN_4G.git
+  python3 ~/fbs-upload/"osprey 2"/srsran_watch/print_sib1.py      # adds the SIB1 cell-ID print
+  mkdir -p ~/srsRAN_4G/build && cd ~/srsRAN_4G/build && cmake .. && make -j3 pdsch_ue
+Then: python3 ~/fbs-upload/lte_decode.py --freq-mhz 806 --low-if-mhz 0.6 --engine srsran
