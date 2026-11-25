@@ -159,7 +159,8 @@ def capture_bladerf_dual(n):
     """RX1 + RX2 together (shared tuner, separate gains). bladeRF-cli writes them interleaved;
     split into PATH (RX1) and PATH2 (RX2). Gains are set after 'rx config' so both channels get them."""
     raw = PATH + ".dual"
-    cmd = ["bladeRF-cli", "-e", "set agc rx off",
+    # 'set agc off' (both channels) - 'set agc rx off' only covers RX1 and RX2 then refuses a manual gain
+    cmd = ["bladeRF-cli", "-e", "set agc off",
            "-e", "set frequency rx %d" % int(CENTER),
            "-e", "set samplerate rx %d" % int(RATE),
            "-e", "set bandwidth rx %d" % int(min(RATE * 0.9, 56e6)),
