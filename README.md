@@ -41,7 +41,7 @@ Only one tool can use the BladeRF at a time.
 ## GSM
 
 ### Scan (`gsm_arfcn_fast.py --band …` or several `--arfcn`)
-Visits each channel in turn. Channels with no GSM signal are left after 1.2 s; a channel with a cell is held
+Visits each channel in turn (1-124 first, then 975-1023); a live line shows which ARFCN it is checking. Channels with no GSM signal are left after 1.2 s; a channel with a cell is held
 until its Cell ID is decoded (up to 2.5 s). Every channel gets a fresh decoder, which keeps the scan reliable.
 
 Useful options: `--passes 0` (repeat until Ctrl-C), `--verbose` (also list empty channels),

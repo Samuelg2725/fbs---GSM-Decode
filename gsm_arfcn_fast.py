@@ -30,7 +30,7 @@ import osmosdr                         # noqa: E402
 SAMPLE_RATE = 2e6
 SI3_PERIOD = 4 * 51 * 120.0 / 26.0 / 1000.0          # one SI3 every 4 x 51-multiframes = 0.9415 s
 BANDS = {
-    "900": list(range(975, 1024)) + list(range(1, 125)),      # E-GSM 900: 925.2-959.8 MHz
+    "900": list(range(1, 125)) + list(range(975, 1024)),      # P-GSM 935.2-959.8 MHz, then E-GSM 925.2-934.8
     "1800": list(range(512, 886)),                              # DCS 1800: 1805.2-1879.8 MHz
 }
 BANDS["all"] = BANDS["900"] + BANDS["1800"]
@@ -265,10 +265,12 @@ def scan(args, channels):
         while args.passes == 0 or passes < args.passes:
             passes += 1
             t_pass = time.time()
-            for arfcn in channels:
+            for i, arfcn in enumerate(channels, 1):
                 freq = downlink(arfcn)
                 if freq is None:
                     continue
+                C.status("  pass %d: checking ARFCN %d (%.1f MHz)   channel %d of %d   %d cell(s) found so far"
+                         % (passes, arfcn, freq / 1e6, i, len(channels), len(found)))
                 rx = radio.tune(freq)
                 t0, seen, cell, synced = time.time(), 0, None, False
                 while time.time() - t0 < args.dwell:
@@ -284,6 +286,8 @@ def scan(args, channels):
                         break
                     time.sleep(0.02)
                 took = time.time() - t0
+                if cell or synced or args.verbose:
+                    C.clear_status()
                 if cell:
                     print("%s   (%.1fs)" % (cell_line(cell), took), flush=True)
                     prev = found.get(arfcn)
@@ -302,6 +306,7 @@ def scan(args, channels):
                     nosync += 1
             C.info("pass %d finished in %.0f s - %d cell(s) so far" % (passes, time.time() - t_pass, len(found)))
     except KeyboardInterrupt:
+        C.clear_status()
         print("")
     finally:
         C.ignore_ctrl_c()

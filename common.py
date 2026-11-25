@@ -31,17 +31,39 @@ def strip(text):
     return re.sub("\x1b\\[[0-9;]*m", "", str(text))
 
 
+_STATUS = [False]
+
+
+def status(text):
+    """Show a one-line progress message that the next printed line replaces (terminal only)."""
+    if sys.stdout.isatty():
+        sys.stdout.write("\r\x1b[K" + c(text, "grey"))
+        sys.stdout.flush()
+        _STATUS[0] = True
+
+
+def clear_status():
+    """Remove the progress line shown by status()."""
+    if _STATUS[0]:
+        sys.stdout.write("\r\x1b[K")
+        sys.stdout.flush()
+        _STATUS[0] = False
+
+
 def heading(title):
     """Section heading line."""
+    clear_status()
     print("", flush=True)
     print(c("== %s " % title + "=" * max(0, 70 - len(title)), "cyan+bold"), flush=True)
 
 
 def info(text):
+    clear_status()
     print(c(text, "grey"), flush=True)
 
 
 def warn(text):
+    clear_status()
     print(c(text, "yellow"), flush=True)
 
 

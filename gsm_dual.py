@@ -243,10 +243,12 @@ def scan(args, channels):
            "Ctrl-C to stop." % (len(channels), names[0], names[1]))
     found, t_all, tb = {}, time.time(), None
     try:
-        for arfcn in channels:
+        for i, arfcn in enumerate(channels, 1):
             freq = G.downlink(arfcn)
             if freq is None:
                 continue
+            C.status("  checking ARFCN %d (%.1f MHz)   channel %d of %d   %d cell(s) found so far"
+                     % (arfcn, freq / 1e6, i, len(channels), len(found)))
             close_dual(tb)
             tb = open_dual(args, freq)
             t0, seen, got, cell = time.time(), [0, 0], set(), None
@@ -267,6 +269,8 @@ def scan(args, channels):
                 if not got and time.time() - t0 > args.sync_secs and not tb.synced(0) and not tb.synced(1):
                     break                    # no GSM sync on either antenna
                 time.sleep(0.02)
+            if cell or args.verbose:
+                C.clear_status()
             if cell:
                 tag, col = who(got)
                 print("%s  %s" % (G.cell_line(cell, time.time() - t0), C.c("[%s]" % tag, col)), flush=True)
@@ -276,6 +280,7 @@ def scan(args, channels):
                 print("%s          ARFCN %4d  %7.1f MHz  %s" % (C.c(C.now_stamp(), "grey"), arfcn, freq / 1e6,
                                                                 C.c("no cell", "grey")), flush=True)
     except KeyboardInterrupt:
+        C.clear_status()
         print("")
     finally:
         C.ignore_ctrl_c()
