@@ -327,6 +327,10 @@ def read_cell(s, rate, mhz, pci, cfo, args):
             r2 = want
         if s2 is not None:
             _, ident, problem = srsran_read(s2, r2, pci, cfo, prb, args.srsran_timeout)
+    if ident and not out.get("bw"):
+        # SIB1 only decodes when -p matches the cell, so a 50-RB decode means a 10 MHz cell
+        # (the MIB line can be cut off when pdsch_ue is stopped early)
+        out["rb"], out["bw"] = 50, "10"
     if ident:
         out.update(ident)
         out["status"] = "OK"
