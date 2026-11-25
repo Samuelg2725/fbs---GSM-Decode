@@ -48,6 +48,9 @@ def earfcn_to_mhz(earfcn):
     return None if c is None else c.downlink_mhz
 
 
+LAST_PEAK = [0.0]
+
+
 def capture(freq_hz, rate, secs, gain, low_if_hz=0.0):
     """bladeRF-cli capture -> complex64 baseband. Returns (samples, capture_seconds)."""
     n = int(rate * (secs + 0.01))
@@ -75,6 +78,7 @@ def capture(freq_hz, rate, secs, gain, low_if_hz=0.0):
     iq = (raw[0::2] + 1j * raw[1::2]).astype(np.complex64)
     iq = iq[int(rate * 0.01):]                     # drop the first 10 ms (tuning transient)
     pk = float(np.max(np.abs(raw))) if raw.size else 0.0
+    LAST_PEAK[0] = pk
     lvl = 10 * np.log10(float(np.mean(np.abs(iq) ** 2)) + 1e-20)
     print("  capture level %.1f dBFS, peak %.2f of full scale%s (gain %g)" % (
         lvl, pk, "  CLIPPING - use a lower --gain" if pk >= 0.99 else "", gain), flush=True)
@@ -219,6 +223,17 @@ def run_pdsch(exe, path, pci, n_prb, n_sf, timeout, early):
     return buf.decode(errors="replace")
 
 
+def align_wide(samples, rate, pci, cfo_hz):
+    """Owen's alignment (hackrf_lte_decode._align) but with the FFT size for THIS rate (his is fixed at
+    1024 = 15.36 Msps; 23.04/30.72 Msps captures for 15/20 MHz cells need 1536/2048)."""
+    from lte_cellid import _derotate, _locate_wide
+    corrected = _derotate(np.asarray(samples), cfo_hz, rate)
+    start = _locate_wide(corrected, pci, int(round(rate / 15000.0)))
+    if start is None:
+        return None
+    return np.asarray(corrected[start:], dtype=np.complex64)
+
+
 def align_narrow(samples, rate, pci, cfo_hz):
     """Subframe-0 alignment for a WEAK cell. The stock alignment correlates the PSS across the full
     bandwidth, where a stronger cell's whole transmission drowns it. Here: resample to 1.92 Msps (only the
@@ -296,7 +311,7 @@ def srsran_cell(samples, rate, hit, args, aligned=None):
     out = {"pci": pci, "strength": hit.get("pss_ratio", 0.0), "sss": hit.get("sss_score", 0.0),
            "status": "", "mib": None, "ident": None}
     if aligned is None:
-        aligned = H._align(samples, rate, pci, float(hit.get("offset_hz", 0.0)))
+        aligned = align_wide(samples, rate, pci, float(hit.get("offset_hz", 0.0)))
     if aligned is None:
         # weak cell: the full-band alignment is drowned by the strong cell; align on the narrow centre instead
         aligned = align_narrow(samples, rate, pci, float(hit.get("offset_hz", 0.0)))
@@ -309,12 +324,14 @@ def srsran_cell(samples, rate, hit, args, aligned=None):
     try:
         aligned.tofile(path)
         n_sf = max(40, len(aligned) // max(1, int(round(rate / 1000.0))))
-        widths = (50, 25, 75, 100)
+        own = {15360000: 50, 23040000: 75, 30720000: 100}.get(int(round(rate)), 50)
+        widths = [own] + [w for w in (50, 25, 75, 100) if w != own]
         for n_prb in widths:
             text = run_pdsch(H._pdsch(), path, pci, n_prb, n_sf, args.srsran_timeout, args.fast_srsran)
-            m = MIB_PRB_RE.search(text) if "Decoded MIB" in text else None
-            if m and out["mib"] is None:
-                out["mib"] = int(m.group(1))
+            vals = [int(v) for v in MIB_PRB_RE.findall(text) if int(v) in (6, 15, 25, 50, 75, 100)] \
+                if "Decoded MIB" in text else []
+            if vals and out["mib"] is None:
+                out["mib"] = vals[-1]
             s1 = SIB1_RE.search(text)
             if s1:
                 plmn = " ".join(x.strip() for x in (s1.group(5) or "").split("PLMN") if x.strip())
@@ -323,6 +340,8 @@ def srsran_cell(samples, rate, hit, args, aligned=None):
                 break
             if args.fast_srsran and out["mib"] is not None and out["mib"] == n_prb:
                 break                      # right width already tried and no SIB1: other widths won't help
+            if out["mib"] is not None and needed_rate(out["mib"]) > rate:
+                break                      # cell wider than this capture: needs a wider re-capture, not more tries
     finally:
         path.unlink(missing_ok=True)
     out["_aligned"] = aligned
@@ -458,7 +477,8 @@ def srsran_all(samples, rate, freq_mhz, args):
                 print("  PCI %-3d sibling of %-3d  %s  (%.1fs)" % (sib, parent["pci"], line, time.time() - t1),
                       flush=True)
     print("  srsRAN path took %.1fs" % (time.time() - t0), flush=True)
-    return None
+    need = [needed_rate(r["mib"]) for r in tried.values() if not r["ident"] and r["mib"] and r["mib"] > 50]
+    return {"need_rate": max(need) if need else None}
 
 
 def needed_rate(n_rb):
@@ -491,10 +511,36 @@ def run_once(args, freq_mhz, rate):
         samples, timing["capture"] = capture(freq_mhz * 1e6, rate, args.secs, args.gain, args.low_if_mhz * 1e6)
         if samples is None:
             return None, timing, rate
+    if args.engine == "srsran" and args.auto_gain and not args.file:
+        # one adjustment: clipping -> 10 dB down; very quiet -> up to 20 dB up (aim: peak ~0.5)
+        pk = LAST_PEAK[0]
+        new_gain = None
+        if pk >= 0.99:
+            new_gain = args.gain - 10
+        elif 0 < pk < 0.15:
+            new_gain = min(60.0, args.gain + min(20.0, round(20 * np.log10(0.5 / pk))))
+        if new_gain is not None and new_gain != args.gain:
+            print("  auto gain: %g -> %g and capturing again" % (args.gain, new_gain), flush=True)
+            args.gain = new_gain
+            samples, tc = capture(freq_mhz * 1e6, rate, args.secs, args.gain, args.low_if_mhz * 1e6)
+            timing["capture"] = timing.get("capture", 0) + tc
+            if samples is None:
+                return None, timing, rate
     if args.engine == "srsran":
         if args.all_pci or args.fast_srsran:
-            return srsran_all(samples, rate, freq_mhz, args) if args.all_pci else \
-                srsran_strongest_fast(samples, rate, freq_mhz, args), timing, rate
+            if not args.all_pci:
+                return srsran_strongest_fast(samples, rate, freq_mhz, args), timing, rate
+            res = srsran_all(samples, rate, freq_mhz, args)
+            need = res.get("need_rate") if res else None
+            if need and need > rate and args.rate == "auto" and not args.file:
+                print("  a cell is wider than this %.2f Msps capture - capturing again at %.2f Msps"
+                      % (rate / 1e6, need / 1e6), flush=True)
+                samples, tc = capture(freq_mhz * 1e6, need, args.secs, args.gain, args.low_if_mhz * 1e6)
+                timing["capture"] = timing.get("capture", 0) + tc
+                if samples is not None:
+                    rate = need
+                    srsran_all(samples, rate, freq_mhz, args)
+            return None, timing, rate
         return srsran_decode(samples, rate, freq_mhz, args), timing, rate
     results, t, report = decode(samples, rate, args.pci, args.all_pci)
     timing.update(t)
@@ -598,6 +644,9 @@ def main():
                     help="with --all-pci: also try the other two PCIs of each decoded cell's group (3*G+0/1/2 = "
                          "usually the same mast's other sectors) using that cell's frame timing - finds sectors "
                          "whose own sync signal is too weak to detect")
+    ap.add_argument("--auto-gain", action="store_true",
+                    help="srsran engine: if the capture clips, -10 dB; if it is very quiet (peak < 0.15), raise the "
+                         "gain (up to +20 dB) - then capture again. 800 and 2100 MHz need very different gains")
     ap.add_argument("--fast-srsran", action="store_true",
                     help="srsran engine: stop pdsch_ue as soon as the cell identity is printed instead of also "
                          "running the other 3 bandwidth attempts (default = old behaviour)")

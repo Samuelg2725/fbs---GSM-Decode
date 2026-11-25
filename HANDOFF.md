@@ -340,6 +340,13 @@ finds can be decoded. New options:
   eNB 541524 as PCI 1/sector 120) is not reaching our antenna as a detectable sync signal.
   Added --siblings: for each decoded PCI p, try 3*(p//3)+0/1/2 with p's frame alignment (co-sited sectors
   share the eNB clock); srsRAN CRC rejects absent PCIs.
+  PI 15:3x --siblings g20: 952.5 PCI 0 (sibling of 1) = MIB OK, no SIB1 -> a cell the sync search cannot see
+  IS there (phone 12:46 listed 541524:112); SIB1 lost to co-channel overlap with PCI 1. 816 PCI 0: MIB fails.
+  806/930.1: single cell (= phone). 2132.3 (15 MHz) / 2144.7 (20 MHz): capture only 15.36 Msps + level
+  -41..-46 dBFS at g20. Added: --auto-gain (clip -> -10 dB, peak<0.15 -> up to +20 dB, recapture once);
+  wider re-capture in the srsran --all-pci path when the MIB says 75/100 RB (23.04/30.72 Msps);
+  align_wide() = Owen's _align with nfft from the rate (his was fixed 1024); first srsRAN width = the
+  capture's own. Try --secs 1.0 for SIB1 of overlapped cells (50 SIB1 chances instead of 10).
 
 ## LTE srsRAN (for lte_decode.py --engine srsran)
 *** LTE DECODE CONFIRMED 2026-11-25 10:57 (home): BladeRF capture at 806 MHz (15.36 Msps, low-IF 0.6)
