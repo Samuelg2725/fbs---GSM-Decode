@@ -360,6 +360,13 @@ finds can be decoded. New options:
   -> REMOVED. EE 1846.7/1866.5 + Three 2117.6: gain 53-55, level -18 dBFS, still no sync -> antenna at
   1800-2100 MHz suspected (like GSM 649). 2144.7 O2 (-59 phone): sync OK, MIB not decoded at 15.36 ->
   test at --rate 30.72e6. srsRAN log names now include the frequency.
+  *** ROOT CAUSE (16:3x, --srsran-verbose): pdsch_ue logs 'Reading 11520 samples' per subframe = this srsRAN
+  build reads files at its COMPACT rates (6/15/25/50/75/100 PRB -> 1.92/3.84/5.76/11.52/15.36/23.04 Msps).
+  We (and Owen's HackRF path) wrote 15.36 Msps files for 50 PRB -> read 25% slow, timing slides; decodes only
+  when it momentarily lines up. Explains SNR 0.6-4.8 dB on the -68 dBm 806 cell, repeated 'MIB not decoded',
+  run-to-run variation, 2144.7 never. --match-rate resamples the aligned capture per attempt to
+  SRS_FILE_RATE[n_prb] (15.36->11.52 = 3/4; 20 MHz: capture 30.72 -> 23.04). --try-ports (4/1 ports) added
+  too: 2144.7 with 4 ports still failed (before the rate fix).
 
 ## LTE srsRAN (for lte_decode.py --engine srsran)
 *** LTE DECODE CONFIRMED 2026-11-25 10:57 (home): BladeRF capture at 806 MHz (15.36 Msps, low-IF 0.6)
