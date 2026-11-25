@@ -578,17 +578,22 @@ def decode_cell(samples, rate, hit, args, freq_mhz, aligned=None):
                     f.write(text)
             return text
 
+        def got_mib(text):
+            # srsRAN is stopped as soon as it prints the Cell ID, often before its "Decoded MIB" line comes out,
+            # so a Cell ID counts as a decoded MIB too
+            return "Decoded MIB" in text or bool(SIB1_RE.search(text))
+
         for i, n_prb in enumerate(order):
             text = srsran(n_prb, ports)
-            if i == 0 and "Decoded MIB" not in text:
+            if i == 0 and not got_mib(text) and not hit.get("ports"):
                 # no MIB: the cell may send from 4 (or 1) antennas - srsRAN must be told the right number
                 for p in (4, 1, 2):
                     if p != ports:
                         text = srsran(n_prb, p)
-                        if "Decoded MIB" in text:
+                        if got_mib(text):
                             ports = p
                             break
-                if "Decoded MIB" not in text:
+                if not got_mib(text):
                     break                            # the MIB does not depend on the width: stop here
             if "Decoded MIB" in text and out["mib"] is None:
                 vals = [int(v) for v in MIB_PRB_RE.findall(text) if int(v) in BW_MHZ]
