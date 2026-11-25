@@ -347,6 +347,14 @@ finds can be decoded. New options:
   wider re-capture in the srsran --all-pci path when the MIB says 75/100 RB (23.04/30.72 Msps);
   align_wide() = Owen's _align with nfft from the rate (his was fixed 1024); first srsRAN width = the
   capture's own. Try --secs 1.0 for SIB1 of overlapped cells (50 SIB1 chances instead of 10).
+  PI 15:4x all 10 carriers: 6/13 phone cells decoded (806 21, 816 1, 930.1 21, 952.5 1 + 0 via --siblings =
+  541524:112, 2132.3 21 via 23.04 re-capture); 816 PCI 0 MIB ok no SIB1; 2144.7 MIB not decoded (earlier
+  'MIB ok (150 RB)' = width misread -> now treated as 'try 30.72'); 793.5 best 6.9x no SSS; EE 1846.7/1866.5
+  + Three 2117.6 no sync at g40 (auto-gain only did one step -> now up to 3 steps, max 60).
+  Added --srsran-log DIR, --deep-search: PSS |corr|^2 folded over all 5 ms repeats per root/offset (z-score),
+  SSS equalised with the PSS channel estimate and summed coherently, z-score vs 336 hypotheses (accept >=5;
+  noise-only max 4.1); uncertain-but-real PSS combs -> top 3 PCIs to srsRAN (CRC decides). Synthetic: ~4 dB
+  more sensitive than stock, no false cells in noise-only trials. Use --search-secs 0.2 with it.
 
 ## LTE srsRAN (for lte_decode.py --engine srsran)
 *** LTE DECODE CONFIRMED 2026-11-25 10:57 (home): BladeRF capture at 806 MHz (15.36 Msps, low-IF 0.6)
