@@ -129,7 +129,12 @@ Why the first wide version was SLOWER than narrow (fixed):
   analog filter rolls off. Channels in the outer ~1 MHz of ANY capture get lost (e.g. ARFCN 15/16
   missed at centre 930.9, ARFCN 2/5 missed at 942.5) -> overlapping captures are more complete.
 
-## UPGRADE PLAN (agreed order - accuracy first, then speed)
+## DECISION 2026-11-25: main method = continuous single-channel tracking
+  LD_LIBRARY_PATH=/usr/local/lib python3 ~/gsm_arfcn_fast.py --radio bladerf --arfcn 4
+User found the wideband approaches less accurate. Improvements now focus on this live tracker
+(--dwell only affects multi-channel mode; with one ARFCN it is ignored).
+
+## (superseded) UPGRADE PLAN (agreed order - accuracy first, then speed)
 1. DONE (needs Pi validation): gsm_wide.py --skip-empty / --stop-early / --fast / --probe-secs.
    Probe = decode first PROBE_SECS; receiver C0 bursts only appear after FCCH+SCH lock, so 0 bursts
    = no GSM carrier -> skip. Also reports "SYNCED but no cell ID" channels (carrier there, ID not
