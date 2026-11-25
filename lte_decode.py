@@ -185,12 +185,12 @@ MIB_PRB_RE = __import__("re").compile(r"PRB:\s+(\d+)")
 SRS_EXTRA = []
 
 
-def run_pdsch(exe, path, pci, n_prb, n_sf, timeout, early):
+def run_pdsch(exe, path, pci, n_prb, n_sf, timeout, early, ports=2):
     """pdsch_ue on an aligned file. early=True: stop it as soon as it prints a SIB1 identity line
     (it would otherwise read the whole file and then the next bandwidth attempt would start)."""
     import select
     import shutil
-    cmd = [str(exe), "-d", "-i", str(path), "-p", str(n_prb), "-c", str(pci), "-P", "2", "-Q", "-n", str(n_sf)]
+    cmd = [str(exe), "-d", "-i", str(path), "-p", str(n_prb), "-c", str(pci), "-P", str(ports), "-Q", "-n", str(n_sf)]
     if SRS_EXTRA:
         cmd = [c for c in cmd if not (c == "-Q" and "-v" in SRS_EXTRA)] + SRS_EXTRA
     if shutil.which("stdbuf"):
@@ -332,13 +332,20 @@ def srsran_cell(samples, rate, hit, args, aligned=None):
         n_sf = max(40, len(aligned) // max(1, int(round(rate / 1000.0))))
         own = {15360000: 50, 23040000: 75, 30720000: 100}.get(int(round(rate)), 50)
         widths = [own] + [w for w in (50, 25, 75, 100) if w != own]
-        for n_prb in widths:
-            text = run_pdsch(H._pdsch(), path, pci, n_prb, n_sf, args.srsran_timeout, args.fast_srsran)
+        # (width, ports) attempts: Owen's fixed 2 ports first; with --try-ports, a MIB failure at the
+        # capture's own width is retried with 4 and 1 ports (file mode must be told the cell's port count)
+        attempts = [(w, 2) for w in widths]
+        if args.try_ports:
+            attempts = [(own, 2), (own, 4), (own, 1)] + [(w, 2) for w in widths if w != own]
+        for n_prb, ports in attempts:
+            if ports != 2 and (out["mib"] is not None or out["ident"]):
+                continue                   # MIB already decoded with 2 ports: port count is not the problem
+            text = run_pdsch(H._pdsch(), path, pci, n_prb, n_sf, args.srsran_timeout, args.fast_srsran, ports)
             if args.srsran_log:
                 d = os.path.expanduser(args.srsran_log)
                 os.makedirs(d, exist_ok=True)
-                with open(os.path.join(d, "pdsch_%s_%gMHz_%.0fMsps_pci%d_p%d.txt" % (
-                        time.strftime("%H%M%S"), CUR_FREQ[0], rate / 1e6, pci, n_prb)), "w") as fh:
+                with open(os.path.join(d, "pdsch_%s_%gMHz_%.0fMsps_pci%d_p%d_P%d.txt" % (
+                        time.strftime("%H%M%S"), CUR_FREQ[0], rate / 1e6, pci, n_prb, ports)), "w") as fh:
                     fh.write(text)
             vals = [int(v) for v in MIB_PRB_RE.findall(text) if int(v) in (6, 15, 25, 50, 75, 100)] \
                 if "Decoded MIB" in text else []
@@ -347,6 +354,8 @@ def srsran_cell(samples, rate, hit, args, aligned=None):
             elif "Decoded MIB" in text and out["mib"] is None:
                 out["mib_odd"] = MIB_PRB_RE.findall(text)        # MIB decoded, width not understood
             s1 = SIB1_RE.search(text)
+            if ("Decoded MIB" in text or s1) and ports != 2:
+                out["ports"] = ports
             if s1:
                 plmn = " ".join(x.strip() for x in (s1.group(5) or "").split("PLMN") if x.strip())
                 out["ident"] = "CellID %s (eNB %s sector %s)  TAC %s  PLMN %s" % (
@@ -359,6 +368,8 @@ def srsran_cell(samples, rate, hit, args, aligned=None):
     finally:
         path.unlink(missing_ok=True)
     out["_aligned"] = aligned
+    if out.get("ports") and out["ident"]:
+        out["ident"] += "  [%d antenna ports]" % out["ports"]
     if out["ident"]:
         out["status"] = "OK"
     elif out["mib"]:
@@ -685,6 +696,9 @@ def main():
     ap.add_argument("--srsran-verbose", action="store_true",
                     help="run pdsch_ue with -v (and without -Q) so its sync / MIB attempts are written to the "
                          "--srsran-log files - for diagnosing cells that fail silently")
+    ap.add_argument("--try-ports", action="store_true",
+                    help="if the MIB fails with 2 antenna ports (Owen's fixed -P 2), retry with 4 and 1 "
+                         "(srsRAN file mode must be told the port count; many 1800/2100 cells use 4)")
     ap.add_argument("--fast-srsran", action="store_true",
                     help="srsran engine: stop pdsch_ue as soon as the cell identity is printed instead of also "
                          "running the other 3 bandwidth attempts (default = old behaviour)")
