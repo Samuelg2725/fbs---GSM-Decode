@@ -121,6 +121,30 @@ def decode(samples, rate, want_pci=None, all_pci=False):
     return out, t, report
 
 
+def srsran_decode(samples, rate, freq_mhz, args):
+    """Owen's proven on-air path: PCI in Python, MIB + SIB1 by srsRAN's pdsch_ue (file mode)."""
+    import hackrf_lte_decode as H
+    exe = H._pdsch()
+    if not exe.is_file():
+        print("  srsRAN pdsch_ue not found at %s - see HANDOFF 'LTE srsRAN' to build it" % exe, flush=True)
+        return None
+    cell_txt = os.path.expanduser("~/sib1_cell.txt")
+    before = os.path.getsize(cell_txt) if os.path.exists(cell_txt) else 0
+    t0 = time.time()
+    text = H.decode_capture(samples, rate, freq_mhz, args.earfcn, args.pci, None, None)
+    print(text, flush=True)
+    if os.path.exists(cell_txt) and os.path.getsize(cell_txt) > before:
+        with open(cell_txt) as fh:
+            fh.seek(before)
+            new = fh.read().strip()
+        if new:
+            print("  srsRAN SIB1 log (~/sib1_cell.txt):", flush=True)
+            for line in new.splitlines()[-5:]:
+                print("    " + line, flush=True)
+    print("  srsRAN path took %.1fs" % (time.time() - t0), flush=True)
+    return None
+
+
 def needed_rate(n_rb):
     for rate, max_rb in RATES:
         if n_rb <= max_rb:
@@ -146,11 +170,13 @@ def run_once(args, freq_mhz, rate):
     """Capture (or load) + decode one time; re-captures at a wider rate if the cell needs it."""
     timing = {}
     if args.file:
-        samples = load_file(args.file, rate)
+        samples = condition(load_file(args.file, rate), rate, args.low_if_mhz * 1e6)
     else:
         samples, timing["capture"] = capture(freq_mhz * 1e6, rate, args.secs, args.gain, args.low_if_mhz * 1e6)
         if samples is None:
             return None, timing, rate
+    if args.engine == "srsran":
+        return srsran_decode(samples, rate, freq_mhz, args), timing, rate
     results, t, report = decode(samples, rate, args.pci, args.all_pci)
     timing.update(t)
     if (results and not args.file and args.rate == "auto" and results[0].get("bandwidth_rb")
@@ -170,7 +196,10 @@ def run_once(args, freq_mhz, rate):
               % (freq_mhz, report["best_ratio"], report["best_offset_hz"] / 1000.0, report["best_sss"],
                  report["sss_min"]), flush=True)
     if args.save and not args.file and os.path.exists(SC16):
-        os.replace(SC16, os.path.expanduser(args.save))
+        import shutil
+        dest = os.path.expanduser(args.save)
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        shutil.copyfile(SC16, dest)          # /dev/shm is a different filesystem: copy, not rename
         print("  saved capture to %s (%.2f Msps sc16)" % (args.save, rate / 1e6), flush=True)
     return results, timing, rate
 
@@ -239,6 +268,9 @@ def main():
     ap.add_argument("--file", help="decode a saved capture (.sc16 from --save, or complex64)")
     ap.add_argument("--save", help="keep the raw capture here (sc16)")
     ap.add_argument("--survey", metavar="LO-HI", help="power map of a range in MHz, e.g. 791-821")
+    ap.add_argument("--engine", choices=["python", "srsran"], default="python",
+                    help="python = all-Python decoder (default); srsran = Owen's HackRF path: srsRAN pdsch_ue "
+                         "reads MIB + SIB1 from the capture (needs ~/srsRAN_4G built)")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
 
