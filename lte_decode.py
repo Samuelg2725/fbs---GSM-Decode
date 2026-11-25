@@ -182,12 +182,17 @@ SIB1_RE = __import__("re").compile(
 MIB_PRB_RE = __import__("re").compile(r"PRB:\s+(\d+)")
 
 
+SRS_EXTRA = []
+
+
 def run_pdsch(exe, path, pci, n_prb, n_sf, timeout, early):
     """pdsch_ue on an aligned file. early=True: stop it as soon as it prints a SIB1 identity line
     (it would otherwise read the whole file and then the next bandwidth attempt would start)."""
     import select
     import shutil
     cmd = [str(exe), "-d", "-i", str(path), "-p", str(n_prb), "-c", str(pci), "-P", "2", "-Q", "-n", str(n_sf)]
+    if SRS_EXTRA:
+        cmd = [c for c in cmd if not (c == "-Q" and "-v" in SRS_EXTRA)] + SRS_EXTRA
     if shutil.which("stdbuf"):
         cmd = ["stdbuf", "-oL", "-eL"] + cmd
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
@@ -677,6 +682,9 @@ def main():
                          "gain (up to +20 dB) - then capture again. 800 and 2100 MHz need very different gains")
     ap.add_argument("--srsran-log", default=None,
                     help="save every srsRAN pdsch_ue output to this folder (e.g. ~/field/srslog) for diagnosis")
+    ap.add_argument("--srsran-verbose", action="store_true",
+                    help="run pdsch_ue with -v (and without -Q) so its sync / MIB attempts are written to the "
+                         "--srsran-log files - for diagnosing cells that fail silently")
     ap.add_argument("--fast-srsran", action="store_true",
                     help="srsran engine: stop pdsch_ue as soon as the cell identity is printed instead of also "
                          "running the other 3 bandwidth attempts (default = old behaviour)")
@@ -692,6 +700,8 @@ def main():
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
 
+    if args.srsran_verbose:
+        SRS_EXTRA[:] = ["-v"]
     if args.self_test:
         return self_test()
     if args.survey:
