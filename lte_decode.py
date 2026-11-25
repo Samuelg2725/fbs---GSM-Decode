@@ -460,9 +460,10 @@ def pdsch_ue():
     return H._pdsch()
 
 
-def run_pdsch(path, pci, n_prb, n_sf, timeout):
-    """srsRAN pdsch_ue on an aligned capture file; stopped as soon as it prints the SIB1 identity line."""
-    cmd = [str(pdsch_ue()), "-d", "-i", str(path), "-p", str(n_prb), "-c", str(pci), "-P", "2", "-Q",
+def run_pdsch(path, pci, n_prb, n_sf, timeout, ports=2):
+    """srsRAN pdsch_ue on an aligned capture file; stopped as soon as it prints the SIB1 identity line.
+    ports: the cell's number of transmit antennas (1, 2 or 4) - in file mode srsRAN only tries this one."""
+    cmd = [str(pdsch_ue()), "-d", "-i", str(path), "-p", str(n_prb), "-c", str(pci), "-P", str(ports), "-Q",
            "-n", str(n_sf)]
     if shutil.which("stdbuf"):
         cmd = ["stdbuf", "-oL", "-eL"] + cmd
@@ -523,26 +524,45 @@ def decode_cell(samples, rate, hit, args, freq_mhz, aligned=None):
         if hit.get("width") in order:                        # width already known from an earlier MIB
             order.remove(hit["width"])
             order.insert(0, hit["width"])
-        for n_prb in order:
-            # srsRAN reads a file at the standard rate for the width it is told (5 MHz = 7.68 Msps, ...): give a
-            # narrower cell a recording reduced to its own rate
+        ports = hit.get("ports") or 2
+
+        def srsran(n_prb, ports):
+            C.status("  PCI %d: srsRAN decoding (%s MHz, %d transmit antenna%s)..." % (
+                pci, BW_MHZ.get(n_prb, "?"), ports, "" if ports == 1 else "s"))
+            # srsRAN reads a file at the standard rate for the width it is told (5 MHz = 7.68 Msps, ...): give
+            # a narrower cell a recording reduced to its own rate
             k = rate / NATIVE_RATE[n_prb]
             if k > 1.01 and abs(k - round(k)) < 1e-6:
                 from scipy.signal import resample_poly
                 small = path.with_name(path.stem + "_%d.cf32" % n_prb)
                 resample_poly(aligned, 1, int(round(k))).astype(np.complex64).tofile(small)
                 try:
-                    text = run_pdsch(small, pci, n_prb, n_sf, args.srsran_timeout)
+                    text = run_pdsch(small, pci, n_prb, n_sf, args.srsran_timeout, ports)
                 finally:
                     small.unlink(missing_ok=True)
             else:
-                text = run_pdsch(path, pci, n_prb, n_sf, args.srsran_timeout)
+                text = run_pdsch(path, pci, n_prb, n_sf, args.srsran_timeout, ports)
+            C.clear_status()
             if args.srsran_log:
                 d = os.path.expanduser(args.srsran_log)
                 os.makedirs(d, exist_ok=True)
-                with open(os.path.join(d, "pdsch_%s_%gMHz_%.0fMsps_pci%d_prb%d.txt" % (
-                        time.strftime("%H%M%S"), freq_mhz, rate / 1e6, pci, n_prb)), "w") as f:
+                with open(os.path.join(d, "pdsch_%s_%gMHz_%.0fMsps_pci%d_prb%d_ports%d.txt" % (
+                        time.strftime("%H%M%S"), freq_mhz, rate / 1e6, pci, n_prb, ports)), "w") as f:
                     f.write(text)
+            return text
+
+        for i, n_prb in enumerate(order):
+            text = srsran(n_prb, ports)
+            if i == 0 and "Decoded MIB" not in text:
+                # no MIB: the cell may send from 4 (or 1) antennas - srsRAN must be told the right number
+                for p in (4, 1, 2):
+                    if p != ports:
+                        text = srsran(n_prb, p)
+                        if "Decoded MIB" in text:
+                            ports = p
+                            break
+                if "Decoded MIB" not in text:
+                    break                            # the MIB does not depend on the width: stop here
             if "Decoded MIB" in text and out["mib"] is None:
                 vals = [int(v) for v in MIB_PRB_RE.findall(text) if int(v) in BW_MHZ]
                 if vals:
@@ -563,6 +583,7 @@ def decode_cell(samples, rate, hit, args, freq_mhz, aligned=None):
                 break                                # right width tried, or the cell needs a wider capture
     finally:
         path.unlink(missing_ok=True)
+    out["ports"] = ports if (out["mib"] or out["mib_odd"]) else None
     if out["ident"]:
         out["status"] = "decoded"
     elif out["mib"]:
@@ -641,7 +662,8 @@ def decode_carrier(args, freq_mhz):
     rates_done = {rate}
     best = {}                                    # pci -> best result over all recordings of this carrier
     args._done_pcis = set()
-    for attempt in range(3):
+    retries = args.retries
+    while True:
         for r in _decode_capture(args, freq_mhz, rate, x1, x2):
             old = best.get(r["pci"])
             if old is None or (r["ident"] and not old["ident"]) or (not old["ident"] and r["mib"] and not old["mib"]):
@@ -667,6 +689,18 @@ def decode_carrier(args, freq_mhz):
             if x1 is None:
                 break
             continue
+        # a weak cell whose MIB decoded is certainly there: SIB1 often decodes on another recording
+        weak = sorted(r["pci"] for r in results if not r["ident"] and (r["mib"] or r["mib_odd"]))
+        if weak and retries > 0:
+            retries -= 1
+            C.info("  PCI %s: MIB read but not the Cell ID - recording again for another try (%d more after this)"
+                   % (", ".join(map(str, weak)), retries))
+            args._targets_now = sorted(set(args._targets_now) | set(weak))
+            x1 = x2 = None
+            x1, x2 = record(args, freq_mhz, rate)
+            if x1 is None:
+                break
+            continue
         break
     for r in results:
         r.update({"mhz": freq_mhz, "earfcn": earfcn, "band": band})
@@ -679,6 +713,7 @@ def decode_carrier(args, freq_mhz):
 
 def _decode_capture(args, freq_mhz, rate, x1, x2):
     t0 = time.time()
+    C.status("  searching for cells...")
     report = search_cells(x1, rate, args)
     hits = list(report["hits"])
     if x2 is not None:                       # a cell can be heard on one antenna only
@@ -730,8 +765,8 @@ def _decode_capture(args, freq_mhz, rate, x1, x2):
         parent = next((p for p in results if p["ident"] and p.get("aligned") is not None
                        and p["pci"] // 3 == pci // 3), None)
         if parent is not None:                   # same mast as a decoded cell: use its frame timing first
-            r = decode_cell(None, rate, {"pci": pci, "width": parent.get("mib")}, args, freq_mhz,
-                            aligned=parent["aligned"])
+            r = decode_cell(None, rate, {"pci": pci, "width": parent.get("mib"), "ports": parent.get("ports")},
+                            args, freq_mhz, aligned=parent["aligned"])
             if r["ident"]:
                 r["how"] = "looked for (--cells), timing of PCI %d" % parent["pci"]
                 results.append(r)
@@ -765,7 +800,8 @@ def _decode_capture(args, freq_mhz, rate, x1, x2):
                 if sib in tried:
                     continue
                 tried.add(sib)
-                r = decode_cell(None, rate, {"pci": sib, "width": parent.get("mib")}, args, freq_mhz, aligned=parent["aligned"])
+                r = decode_cell(None, rate, {"pci": sib, "width": parent.get("mib"), "ports": parent.get("ports")}, args,
+                                freq_mhz, aligned=parent["aligned"])
                 r["how"] = "sector of PCI %d's mast" % parent["pci"]
                 if r["ident"] or args.show_failed_siblings:
                     results.append(r)
@@ -862,6 +898,8 @@ def main():
                     help="do not try the other sectors of each decoded mast")
     ap.add_argument("--show-failed-siblings", action="store_true",
                     help="also list sector tries that did not decode")
+    ap.add_argument("--retries", type=int, default=2,
+                    help="extra recordings for cells whose MIB decoded but not their Cell ID (default 2)")
     ap.add_argument("--srsran-timeout", type=int, default=30, help="seconds per srsRAN attempt (default 30)")
     ap.add_argument("--srsran-log", default=None, help="save every srsRAN output to this folder (diagnosis)")
     ap.add_argument("--debug-search", action="store_true", help="print every weak-search peak and its result")

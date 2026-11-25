@@ -54,6 +54,7 @@ class Cell(object):
         self.pci = pci
         self.ident = None            # dict from lte_decode.decode_cell when identified
         self.width = None            # MIB resource blocks
+        self.ports = None            # transmit antennas (1, 2, 4) found when the MIB decoded
         self.status = "not decoded yet"
         self.how = ""                # "cell search", "weak-cell search", "RX2 only", "sector of PCI n's mast"
         self.sector_only = False     # found only through its mast's timing (no sync signal of its own)
@@ -340,6 +341,8 @@ def apply_result(cell, r):
     cell.tries += 1
     if r.get("mib"):
         cell.width = r["mib"]
+    if r.get("ports"):
+        cell.ports = r["ports"]
     if r["ident"]:
         cell.ident = r["ident"]
     cell.status = r["status"]
@@ -452,7 +455,8 @@ def track(args):
                 C.status("  cycle %d: decoding PCI %d with srsRAN..." % (cycles, pci))
                 cell.last_try = cycles
                 r = L.decode_cell(signal_for(args, rate, x1, x2, pci, offset), rate,
-                                  {"pci": pci, "pss_ratio": strength, "offset_hz": offset, "width": cell.width}, args, args.freq_mhz_now)
+                                  {"pci": pci, "pss_ratio": strength, "offset_hz": offset, "width": cell.width,
+                                   "ports": cell.ports}, args, args.freq_mhz_now)
                 apply_result(cell, r)
                 if r.get("aligned") is not None:
                     aligned[pci] = r["aligned"]
@@ -491,7 +495,7 @@ def track(args):
                         if aligned[parent] is None:
                             continue
                         C.status("  cycle %d: trying PCI %d (sector of PCI %d's mast)..." % (cycles, sib, parent))
-                        r = L.decode_cell(None, rate, {"pci": sib, "width": cells[parent].width}, args, args.freq_mhz_now, aligned=aligned[parent])
+                        r = L.decode_cell(None, rate, {"pci": sib, "width": cells[parent].width, "ports": cells[parent].ports}, args, args.freq_mhz_now, aligned=aligned[parent])
                         if cell is None and not r["ident"]:
                             continue
                         if cell is None:
