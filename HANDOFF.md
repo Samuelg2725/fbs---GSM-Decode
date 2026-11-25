@@ -150,6 +150,14 @@ HOME REFERENCE (phone, 2026-11-25 11:40): GSM ARFCN 13 CID 942 (-55), 119 CID 22
 116 CID 12679 (-79), 6 CID 941 (-82), 22 CID 943 (-83), 660 EE CID 51861 (-99), 9 CID 30669 (-106).
 gsm_wide --fast found 13, 22, 116, 119 (all CIDs match). The narrow 900 sweep (old retune) found
 NOTHING, not even ARFCN 13 (-19 on BladeRF) -> sweep retune bug confirmed; --fresh is the fix candidate.
+RESULTS 2026-11-25 11:32-11:46 (home, gain 40, after self-kill fix 1bc323a):
+- Label vs no label, ARFCN 13: 23 vs 24 decodes in ~100 s -> label changes nothing (as designed).
+  Rate only ~27% of the SI3 maximum, 2 restarts in the unlabelled run; Pwr -16 = very hot -> test lower gain.
+- Short sweep 975-980,6,9,13,22,116,119: old retune found 6,22 (MISSED 13 at -16); --fresh found 6,13,22.
+  --fresh also slightly faster (27.4 s vs 29.7 s). Sweep bug confirmed; --fresh fixes it.
+- Full 900 sweep --fresh (173 ch, 477 s): 6, 13, 22. Still misses 116/119 (gsm_wide finds them) and 9 (-106).
+- Ctrl-C under timeout|tee sent SIGINT twice and killed tee -> summary lost. Fixed: CSV written first,
+  2nd SIGINT ignored, BrokenPipe tolerated.
 Also LTE: O2 816 MHz decoded = eNB 541524 sector 120 TAC 50496 PLMN 234-10 (matches phone).
 Next decode-rate candidates: restart threshold (2 s fixed now), fixed --ppm, gain/overload,
 unbounded message_debug memory on long runs.

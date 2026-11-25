@@ -367,11 +367,6 @@ class TrackStats(object):
 
     def finish(self):
         n = self.numbers()
-        print("")
-        print("===== tracking summary =====", flush=True)
-        print(self.line(), flush=True)
-        if len(self.cids) > 1:
-            print("  more than one CID seen: %s" % ", ".join("%s x%d" % kv for kv in self.cids.items()), flush=True)
         path = os.path.expanduser(self.args.summary_csv)
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         new = not os.path.exists(path)
@@ -387,9 +382,19 @@ class TrackStats(object):
                 "%.1f" % (sum(self.pwr) / len(self.pwr)) if self.pwr else "",
                 min(self.pwr) if self.pwr else "", max(self.pwr) if self.pwr else "",
                 "/".join(str(k) for k in self.cids), self.wrong))
-        print("  summary row added to %s" % path, flush=True)
         if self.logf:
             self.logf.close()
+        # print after the CSV is safe on disk, so a closed pipe (tee killed by Ctrl-C) loses nothing
+        try:
+            print("")
+            print("===== tracking summary =====", flush=True)
+            print(self.line(), flush=True)
+            if len(self.cids) > 1:
+                print("  more than one CID seen: %s" % ", ".join("%s x%d" % kv for kv in self.cids.items()),
+                      flush=True)
+            print("  summary row added to %s" % path, flush=True)
+        except BrokenPipeError:
+            pass
 
 def main():
     global df_cellid, df_arfcn
@@ -574,8 +579,10 @@ def main():
                       % (done_passes, time.time() - pass_start, len(found_cells)), flush=True)
                 pass_start = time.time()
     except KeyboardInterrupt:
-        print("")
+        pass
     finally:
+        # Ctrl-C under `timeout` arrives twice (terminal + timeout forwards it); ignore the 2nd so cleanup finishes
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         if tb is not None:
             try:
                 tb.stop()
@@ -584,10 +591,18 @@ def main():
         if len(arfcns) == 1 and locals().get("stats"):
             stats.finish()
     if len(arfcns) > 1:
-        print("")
-        print("===== %d unique cell(s) =====" % len(found_cells))
-        for a in sorted(found_cells, key=lambda k: (k < 900 and k > 500, k < 900, k)):
-            print("  " + found_cells[a])
+        try:
+            print("")
+            print("===== %d unique cell(s) =====" % len(found_cells))
+            for a in sorted(found_cells, key=lambda k: (k < 900 and k > 500, k < 900, k)):
+                print("  " + found_cells[a])
+            sys.stdout.flush()
+        except BrokenPipeError:
+            pass
+    try:
+        sys.stdout.close()
+    except BrokenPipeError:
+        pass
     return 0
 
 if __name__ == "__main__":
