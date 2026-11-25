@@ -28,6 +28,10 @@ import gsm_freqlist as FL           # noqa: E402
 from gnuradio import gsm            # noqa: E402
 
 BAND900 = list(range(975, 1024)) + list(range(1, 125))
+# The previous (stopped) flowgraph is kept alive until the next one exists: gr-osmosdr then re-uses the
+# open BladeRF instead of closing + reopening it (~0.3 s per channel instead of ~2.8 s). This is what
+# gsm_arfcn_fast --fresh does implicitly.
+_PREV = [None]
 
 
 def visit(args, arfcn):
@@ -43,6 +47,7 @@ def visit(args, arfcn):
         tb.start()
     finally:
         F.clean.restore(*muted)
+    _PREV[0] = None                      # new radio flowgraph is up: the old one can go now
     t0 = time.time()
     seen = 0
     want_ext = False
@@ -82,7 +87,7 @@ def visit(args, arfcn):
             tb.wait()
         except Exception:
             pass
-        del tb
+        _PREV[0] = tb
     return out
 
 
