@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""LTE (4G) cell identity with the BladeRF.
+
+Captures one LTE carrier with bladeRF-cli and decodes it with the pure-Python decoder in
+"osprey 2" (lte_pci_search -> PCI, lte_cellid/lte_sib1 -> MIB + SIB1). No srsRAN needed.
+
+  python3 lte_decode.py --self-test                 # check the decoder works on this machine
+  python3 lte_decode.py --freq-mhz 806              # one capture + decode at 806 MHz
+  python3 lte_decode.py --earfcn 6300               # same, by EARFCN
+  python3 lte_decode.py --freq-mhz 806 --loop       # keep decoding the same carrier (tracking)
+  python3 lte_decode.py --survey 791-821            # power map, to find where the LTE blocks are
+  python3 lte_decode.py --file cap.sc16 --rate 15.36e6 --freq-mhz 806   # decode a saved capture
+
+What you get: PCI (physical cell ID), bandwidth, then from SIB1 the 28-bit Cell ID, eNB ID,
+sector, PLMN (MCC-MNC = operator) and TAC. The centre frequency must be the MIDDLE of the LTE
+carrier (the sync signals sit in the centre 1.08 MHz).
+"""
+import argparse
+import os
+import subprocess
+import sys
+import time
+
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+for cand in (os.path.join(HERE, "osprey 2"), os.path.expanduser("~/fbs-upload/osprey 2"),
+             os.path.expanduser("~/fbs---GSM-Decode/osprey 2")):
+    if os.path.isfile(os.path.join(cand, "lte_cellid.py")):
+        sys.path.insert(0, cand)
+        break
+else:
+    sys.exit("can't find the 'osprey 2' folder with lte_cellid.py - run this from the repo folder")
+
+from lte_cellid import decode_cell_identity, format_result   # noqa: E402
+from lte_pci_search import search_samples                     # noqa: E402
+
+BLADE_LIBS = "/usr/local/lib"
+SC16 = "/dev/shm/_lte.sc16"
+# LTE-friendly rates (15 kHz grid) and the widest cell each one fully covers
+RATES = [(15.36e6, 50), (23.04e6, 75), (30.72e6, 100)]
+BW_MHZ = {6: 1.4, 15: 3, 25: 5, 50: 10, 75: 15, 100: 20}
+
+
+def earfcn_to_mhz(earfcn):
+    from cellular_resolver import lte_carrier
+    c = lte_carrier(earfcn)
+    return None if c is None else c.downlink_mhz
+
+
+def capture(freq_hz, rate, secs, gain, low_if_hz=0.0):
+    """bladeRF-cli capture -> complex64 baseband. Returns (samples, capture_seconds)."""
+    n = int(rate * (secs + 0.01))
+    if os.path.exists(SC16):
+        os.remove(SC16)
+    tune = freq_hz + low_if_hz
+    cmd = ["bladeRF-cli", "-e", "set agc rx off",
+           "-e", "set frequency rx %d" % int(tune),
+           "-e", "set samplerate rx %d" % int(rate),
+           "-e", "set bandwidth rx %d" % int(min(rate * 0.9, 56e6)),
+           "-e", "set gain rx %d" % int(gain),
+           "-e", "rx config file=%s format=bin n=%d samples=16384 buffers=64 xfers=16 timeout=20000" % (SC16, n),
+           "-e", "rx start", "-e", "rx wait %d" % int(secs * 3000 + 15000)]
+    env = dict(os.environ)
+    env["LD_LIBRARY_PATH"] = BLADE_LIBS + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+    t0 = time.time()
+    p = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    took = time.time() - t0
+    size = os.path.getsize(SC16) if os.path.exists(SC16) else 0
+    if size < n * 4 * 0.9:
+        print("capture is short (%d of %d bytes). bladeRF-cli said:" % (size, n * 4), flush=True)
+        print(p.stdout.decode(errors="replace")[-600:], flush=True)
+        return None, took
+    raw = np.fromfile(SC16, np.int16).astype(np.float32) / 2048.0
+    iq = (raw[0::2] + 1j * raw[1::2]).astype(np.complex64)
+    iq = iq[int(rate * 0.01):]                     # drop the first 10 ms (tuning transient)
+    return condition(iq, rate, low_if_hz), took
+
+
+def condition(samples, rate, low_if_hz):
+    """Remove DC; if tuned off-centre (low IF), shift the cell back to baseband."""
+    samples = samples - np.mean(samples)
+    if low_if_hz:
+        idx = np.arange(len(samples))
+        samples = samples * np.exp(1j * 2 * np.pi * float(low_if_hz) * idx / float(rate))
+    return samples.astype(np.complex64)
+
+
+def load_file(path, rate):
+    if path.endswith(".sc16"):
+        raw = np.fromfile(path, np.int16).astype(np.float32) / 2048.0
+        iq = (raw[0::2] + 1j * raw[1::2]).astype(np.complex64)
+    else:
+        iq = np.fromfile(path, np.complex64)
+    return iq - np.mean(iq)
+
+
+def decode(samples, rate, want_pci=None, all_pci=False):
+    """PCI search then MIB+SIB1. Returns (list of results, timings dict)."""
+    t = {}
+    t0 = time.time()
+    report = search_samples(samples, rate)
+    t["pci_search"] = time.time() - t0
+    hits = list(report["hits"])
+    if want_pci is not None:
+        hits = [h for h in hits if h["pci"] == want_pci] or [{"pci": want_pci, "offset_hz": 0.0, "sss_score": 0.0}]
+    if not hits:
+        return [], t, report
+    if not all_pci:
+        hits = hits[:1]
+    out = []
+    t0 = time.time()
+    for h in hits:
+        res = decode_cell_identity(samples, int(h["pci"]), cfo_hz=float(h.get("offset_hz", 0.0)), sample_rate=rate)
+        res["_hit"] = h
+        out.append(res)
+    t["mib_sib1"] = time.time() - t0
+    return out, t, report
+
+
+def needed_rate(n_rb):
+    for rate, max_rb in RATES:
+        if n_rb <= max_rb:
+            return rate
+    return RATES[-1][0]
+
+
+def one_line(res, freq_mhz):
+    h = res["_hit"]
+    s = "%.1f MHz  PCI %d (offset %+.1f kHz)" % (freq_mhz, res["pci"], h.get("offset_hz", 0.0) / 1000.0)
+    if res.get("bandwidth_rb"):
+        s += "  %s MHz" % res["bandwidth_mhz"]
+    if res.get("cell_id") is not None:
+        s += "  CellID %d (eNB %d sector %d)" % (res["cell_id"], res["enb_id"], res["sector_id"])
+        if res.get("mcc") is not None:
+            s += "  PLMN %s-%s %s  TAC %s" % (res["mcc"], res["mnc"], res.get("operator") or "", res.get("tac"))
+    else:
+        s += "  [%s]" % res.get("cell_id_status")
+    return s
+
+
+def run_once(args, freq_mhz, rate):
+    """Capture (or load) + decode one time; re-captures at a wider rate if the cell needs it."""
+    timing = {}
+    if args.file:
+        samples = load_file(args.file, rate)
+    else:
+        samples, timing["capture"] = capture(freq_mhz * 1e6, rate, args.secs, args.gain, args.low_if_mhz * 1e6)
+        if samples is None:
+            return None, timing, rate
+    results, t, report = decode(samples, rate, args.pci, args.all_pci)
+    timing.update(t)
+    if (results and not args.file and args.rate == "auto" and results[0].get("bandwidth_rb")
+            and needed_rate(results[0]["bandwidth_rb"]) > rate):
+        new_rate = needed_rate(results[0]["bandwidth_rb"])
+        print("  cell is %s MHz wide - re-capturing at %.2f Msps" % (results[0]["bandwidth_mhz"], new_rate / 1e6),
+              flush=True)
+        samples, tc = capture(freq_mhz * 1e6, new_rate, args.secs, args.gain, args.low_if_mhz * 1e6)
+        timing["capture"] = timing.get("capture", 0) + tc
+        if samples is not None:
+            rate = new_rate
+            results, t, report = decode(samples, rate, args.pci, args.all_pci)
+            for k, v in t.items():
+                timing[k] = timing.get(k, 0) + v
+    if not results:
+        print("  no LTE cell found at %.3f MHz (best PSS %.1fx at %+.1f kHz, SSS %.2f, needs %.2f)"
+              % (freq_mhz, report["best_ratio"], report["best_offset_hz"] / 1000.0, report["best_sss"],
+                 report["sss_min"]), flush=True)
+    if args.save and not args.file and os.path.exists(SC16):
+        os.replace(SC16, os.path.expanduser(args.save))
+        print("  saved capture to %s (%.2f Msps sc16)" % (args.save, rate / 1e6), flush=True)
+    return results, timing, rate
+
+
+def survey(args):
+    """Power in 0.5 MHz bins across a range, to find LTE blocks (flat raised areas 5-20 MHz wide)."""
+    lo, hi = [float(x) for x in args.survey.replace(":", "-").split("-")]
+    rate = 30.72e6
+    usable = 24e6
+    centre = lo * 1e6 + usable / 2
+    rows = []
+    while centre - usable / 2 < hi * 1e6:
+        samples, _ = capture(centre, rate, 0.05, args.gain)
+        if samples is not None:
+            nfft = 2048
+            nblk = len(samples) // nfft
+            x = samples[:nblk * nfft].reshape(nblk, nfft) * np.hanning(nfft)
+            psd = np.fft.fftshift((np.abs(np.fft.fft(x, axis=1)) ** 2).mean(axis=0))
+            axis = centre + (np.arange(nfft) - nfft / 2) * rate / nfft
+            for b in np.arange(centre - usable / 2, centre + usable / 2, 0.5e6):
+                if lo * 1e6 <= b < hi * 1e6:
+                    sel = (axis >= b) & (axis < b + 0.5e6)
+                    rows.append((b, 10 * np.log10(psd[sel].mean() + 1e-20)))
+        centre += usable
+    if not rows:
+        return 1
+    floor = np.percentile([r[1] for r in rows], 10)
+    print("\nPower above the quietest 10%% (each # = 1 dB), %s MHz at gain %g:" % (args.survey, args.gain))
+    for b, p in rows:
+        d = p - floor
+        print("  %7.1f MHz %5.1f dB %s" % (b / 1e6, d, "#" * int(max(0, min(60, d)))))
+    print("LTE blocks show as flat raised runs 5/10/15/20 MHz wide; use the MIDDLE of a run as --freq-mhz.")
+    return 0
+
+
+def self_test():
+    from lte_cellid import synthesize_cell
+    ok = True
+    narrow = synthesize_cell(430, 7159822, n_rb=6, ports=1)
+    narrow = np.tile(narrow, 3).astype(np.complex64)
+    results, t, _ = decode(narrow, 1.92e6)
+    got = results[0] if results else {}
+    print("1.4 MHz synthetic cell: %s" % (one_line(got, 0.0) if got else "nothing found"))
+    ok &= bool(got) and got.get("cell_id") == 7159822 and got.get("pci") == 430
+    from hackrf_lte_decode import self_test as sib1_test
+    ok2 = sib1_test()
+    print("10 MHz SIB1 decode (Vodafone test vector): %s" % ("OK" if ok2 else "FAILED"))
+    print("self-test %s" % ("OK" if ok and ok2 else "FAILED"))
+    return 0 if ok and ok2 else 1
+
+
+def main():
+    ap = argparse.ArgumentParser(description="LTE cell identity with the BladeRF (pure-Python decoder).",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap.add_argument("--freq-mhz", type=float, help="centre of the LTE carrier")
+    ap.add_argument("--earfcn", type=int, help="LTE channel number instead of --freq-mhz")
+    ap.add_argument("--rate", default="auto",
+                    help="auto (15.36e6, re-capture wider if the cell needs it) or 15.36e6/23.04e6/30.72e6")
+    ap.add_argument("--secs", type=float, default=0.2, help="capture length (default 0.2 = 20 LTE frames)")
+    ap.add_argument("--gain", type=float, default=40.0, help="BladeRF gain (default 40)")
+    ap.add_argument("--low-if-mhz", type=float, default=0.0,
+                    help="tune this far above the cell to keep the radio's DC spike off it (default 0)")
+    ap.add_argument("--pci", type=int, help="decode this PCI even if the sync search is unsure")
+    ap.add_argument("--all-pci", action="store_true", help="decode every PCI heard, not just the strongest")
+    ap.add_argument("--loop", action="store_true", help="keep capturing + decoding until Ctrl-C")
+    ap.add_argument("--file", help="decode a saved capture (.sc16 from --save, or complex64)")
+    ap.add_argument("--save", help="keep the raw capture here (sc16)")
+    ap.add_argument("--survey", metavar="LO-HI", help="power map of a range in MHz, e.g. 791-821")
+    ap.add_argument("--self-test", action="store_true")
+    args = ap.parse_args()
+
+    if args.self_test:
+        return self_test()
+    if args.survey:
+        return survey(args)
+    if args.earfcn is not None:
+        freq_mhz = earfcn_to_mhz(args.earfcn)
+        if freq_mhz is None:
+            sys.exit("EARFCN %d is not an LTE downlink channel" % args.earfcn)
+    elif args.freq_mhz is not None:
+        freq_mhz = args.freq_mhz
+    else:
+        sys.exit("give --freq-mhz, --earfcn, --survey or --self-test")
+    rate = 15.36e6 if args.rate == "auto" else float(args.rate)
+
+    print("LTE decode %.3f MHz%s  rate %s  %.2fs  gain %g%s" % (
+        freq_mhz, (" (EARFCN %d)" % args.earfcn) if args.earfcn is not None else "",
+        args.rate, args.secs, args.gain, "  loop" if args.loop else ""), flush=True)
+    runs = ok = 0
+    seen = {}
+    t_start = time.time()
+    try:
+        while True:
+            runs += 1
+            t0 = time.time()
+            results, timing, rate = run_once(args, freq_mhz, rate)
+            total = time.time() - t0
+            stamp = time.strftime("%H:%M:%S")
+            if results:
+                for res in results:
+                    print("%s  %s" % (stamp, one_line(res, freq_mhz)), flush=True)
+                    if res.get("cell_id") is not None:
+                        ok += 1
+                        seen[res["cell_id"]] = one_line(res, freq_mhz)
+                if not args.loop:
+                    print("")
+                    print(format_result(results[0]))
+            print("  timing: %s  total %.1fs" % ("  ".join("%s %.1fs" % kv for kv in timing.items()), total),
+                  flush=True)
+            if not args.loop or args.file:
+                break
+    except KeyboardInterrupt:
+        print("")
+    if args.loop:
+        el = time.time() - t_start
+        print("\n===== %d run(s) in %.0fs, Cell ID decoded in %d (%.0f%%) =====" % (
+            runs, el, ok, 100.0 * ok / max(1, runs)))
+        for line in seen.values():
+            print("  " + line)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

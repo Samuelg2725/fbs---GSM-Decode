@@ -53,6 +53,12 @@ Wideband (ONE capture -> many channels):
 Lime (live, Owen's rig): python3 gsm_arfcn_fast.py --arfcn 13 --df   (osmosdr driver=lime + Kraken bearing)
 
 ## Files
+- lte_decode.py      LTE/4G cell identity on the BladeRF. bladeRF-cli capture -> pure-Python decoder in
+                     "osprey 2" (lte_pci_search: PCI; lte_cellid + lte_sib1: MIB + SIB1 -> CellID, eNB,
+                     sector, PLMN, TAC). No srsRAN. --freq-mhz/--earfcn, --rate auto (15.36 Msps,
+                     re-captures at 23.04/30.72 for 15/20 MHz cells), --loop, --survey LO-HI (power map
+                     to find carriers), --file/--save, --self-test. Needs python3-scipy.
+                     Self-test + synthetic file decode pass (2026-11-25); NOT yet tried on air.
 - scan_uk.sh         field scan: ./scan_uk.sh [900|1800|uk] [label]. 900 = 3 x 15.36 Msps
                      (930.9/942.5/954.1), 1800 = 7 x 15.36 Msps (1810.5..1874.5), 4 s each, --fast.
                      Logs + merged unique-cell summary in ~/field/<date>_<label>_<band>/.
