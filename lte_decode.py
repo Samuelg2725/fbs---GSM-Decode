@@ -168,6 +168,186 @@ def srsran_decode(samples, rate, freq_mhz, args):
     return None
 
 
+SIB1_RE = __import__("re").compile(
+    r"SIB1 cell identity (\d+)\s+eNB (\d+)\s+sector (\d+)\s+TAC (\d+)((?:[ \t]+PLMN \d+-\d+)*)[ \t]*\r?\n")
+MIB_PRB_RE = __import__("re").compile(r"PRB:\s+(\d+)")
+
+
+def run_pdsch(exe, path, pci, n_prb, n_sf, timeout, early):
+    """pdsch_ue on an aligned file. early=True: stop it as soon as it prints a SIB1 identity line
+    (it would otherwise read the whole file and then the next bandwidth attempt would start)."""
+    import select
+    import shutil
+    cmd = [str(exe), "-d", "-i", str(path), "-p", str(n_prb), "-c", str(pci), "-P", "2", "-Q", "-n", str(n_sf)]
+    if shutil.which("stdbuf"):
+        cmd = ["stdbuf", "-oL", "-eL"] + cmd
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+    buf = b""
+    deadline = time.time() + timeout
+    try:
+        while time.time() < deadline:
+            ready, _, _ = select.select([p.stdout], [], [], 0.25)
+            if not ready:
+                if p.poll() is not None:
+                    break
+                continue
+            chunk = os.read(p.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            buf += chunk
+            if early and SIB1_RE.search(buf.decode(errors="replace")):
+                break
+    finally:
+        if p.poll() is None:
+            try:
+                os.killpg(p.pid, 9)
+            except OSError:
+                p.kill()
+        try:
+            buf += p.stdout.read() or b""
+        except Exception:
+            pass
+        p.stdout.close()
+        try:
+            p.wait(timeout=2)
+        except Exception:
+            pass
+    return buf.decode(errors="replace")
+
+
+def srsran_cell(samples, rate, hit, args):
+    """srsRAN MIB + SIB1 for ONE PCI (any PCI the search found, not only the strongest)."""
+    import tempfile
+    from pathlib import Path
+    import hackrf_lte_decode as H
+    pci = int(hit["pci"])
+    out = {"pci": pci, "strength": hit.get("pss_ratio", 0.0), "sss": hit.get("sss_score", 0.0),
+           "status": "", "mib": None, "ident": None}
+    aligned = H._align(samples, rate, pci, float(hit.get("offset_hz", 0.0)))
+    if aligned is None:
+        out["status"] = "frame start not found"
+        return out
+    with tempfile.NamedTemporaryFile(suffix=".cf32", delete=False, dir="/dev/shm") as fh:
+        path = Path(fh.name)
+    try:
+        aligned.tofile(path)
+        n_sf = max(40, len(aligned) // max(1, int(round(rate / 1000.0))))
+        widths = (50, 25, 75, 100)
+        for n_prb in widths:
+            text = run_pdsch(H._pdsch(), path, pci, n_prb, n_sf, args.srsran_timeout, args.fast_srsran)
+            m = MIB_PRB_RE.search(text) if "Decoded MIB" in text else None
+            if m and out["mib"] is None:
+                out["mib"] = int(m.group(1))
+            s1 = SIB1_RE.search(text)
+            if s1:
+                plmn = " ".join(x.strip() for x in (s1.group(5) or "").split("PLMN") if x.strip())
+                out["ident"] = "CellID %s (eNB %s sector %s)  TAC %s  PLMN %s" % (
+                    s1.group(1), s1.group(2), s1.group(3), s1.group(4), plmn or "?")
+                break
+            if args.fast_srsran and out["mib"] is not None and out["mib"] == n_prb:
+                break                      # right width already tried and no SIB1: other widths won't help
+    finally:
+        path.unlink(missing_ok=True)
+    out["status"] = "OK" if out["ident"] else ("MIB ok (%d RB), no SIB1" % out["mib"] if out["mib"] else "MIB not decoded")
+    return out
+
+
+def search_all_cells(samples, rate, pss_min=None):
+    """Owen's sync search, plus a second pass for WEAKER cells on the same carrier.
+
+    The stock search picks one frequency offset per PSS group (the highest correlation anywhere). A strong
+    cell's false peak at a wrong offset can beat a weak cell's real peak, so the weak cell is never tested
+    at the right frequency. All cells on one carrier share the carrier's frequency, so the strongest cell's
+    offset is right for every cell: search all 3 PSS groups again at that offset (+-2 kHz)."""
+    import lte_sync as S
+    from lte_pci_search import resample_to_lte
+    report = search_samples(samples, rate)
+    hits = list(report["hits"])
+    if not hits:
+        return report
+    pmin = S.PSS_MIN_RATIO if pss_min is None else float(pss_min)
+    x = np.asarray(resample_to_lte(np.asarray(samples), rate), dtype=np.complex128)
+    length = int(x.size)
+    scale = float(np.sqrt(np.mean(np.abs(x) ** 2) + 1e-12))
+    nfft = 1 << (length + S.FFT_SIZE - 2).bit_length()
+    spectrum = np.fft.fft(x, nfft)
+    off0 = float(hits[0]["offset_hz"])
+    have = {h["pci"] for h in hits}
+    for nid2 in range(3):
+        base = S.pss_time(nid2)
+        base = base / np.linalg.norm(base)
+        best = None
+        for d in range(-2000, 2001, 500):
+            mag = S._correlate_mag(spectrum, S._shifted(base, off0 + d), length)
+            _at, peak = S._strongest(mag)
+            if best is None or peak > best[0]:
+                best = (peak, off0 + d, mag)
+        _peak, offset, mag = best
+        work = np.array(mag, copy=True)
+        for _attempt in range(4):
+            usable = S._usable_peak(work)
+            if usable is None:
+                break
+            at, peak = usable
+            ratio = peak / scale
+            if ratio < pmin:
+                break
+            nid1, score, pss_seq = S._confirm_sss(x, work, at, offset, nid2)
+            S._blank_comb(work, at)
+            if score < S.SSS_MIN_SCORE or pss_seq < S.SSS_MIN_SCORE:
+                continue
+            pci = 3 * nid1 + nid2
+            if pci in have:
+                continue
+            have.add(pci)
+            hits.append({"pci": pci, "nid1": nid1, "nid2": nid2, "pss_peak": peak, "pss_ratio": ratio,
+                         "pss_seq": pss_seq, "sss_score": score, "offset_hz": offset, "second_pass": True})
+    hits.sort(key=lambda h: h["pss_ratio"], reverse=True)
+    report = dict(report)
+    report["hits"] = hits
+    return report
+
+
+def srsran_strongest_fast(samples, rate, freq_mhz, args):
+    """--fast-srsran without --all-pci: strongest cell only (as the default), but srsRAN stops at the ID."""
+    t0 = time.time()
+    hits = search_samples(samples, rate)["hits"]
+    if not hits:
+        print("  no LTE cell found at %.3f MHz" % freq_mhz, flush=True)
+        return None
+    res = srsran_cell(samples, rate, hits[0], args)
+    print("  PCI %-3d strength %4.0f  %s" % (res["pci"], res["strength"], res["ident"] or res["status"]), flush=True)
+    print("  srsRAN path took %.1fs" % (time.time() - t0), flush=True)
+    return None
+
+
+def srsran_all(samples, rate, freq_mhz, args):
+    """--all-pci: every cell the sync search hears on this carrier, each decoded by srsRAN."""
+    import hackrf_lte_decode as H
+    if not H._pdsch().is_file():
+        print("  srsRAN pdsch_ue not found at %s - see HANDOFF 'LTE srsRAN' to build it" % H._pdsch(), flush=True)
+        return None
+    t0 = time.time()
+    report = search_all_cells(samples, rate, args.pss_min) if args.weak_search else search_samples(samples, rate)
+    hits = report["hits"]
+    print("  sync search %.1fs: %d cell(s) heard on %.1f MHz: %s" % (
+        time.time() - t0, len(hits), freq_mhz,
+        ", ".join("PCI %d (strength %.0f)%s" % (h["pci"], h["pss_ratio"], "*" if h.get("second_pass") else "")
+                  for h in hits) or "none"), flush=True)
+    if any(h.get("second_pass") for h in hits):
+        print("  (* = found only by --weak-search)", flush=True)
+    if not hits:
+        print("  (best sync peak %.1fx, needs %.1fx)" % (report["best_ratio"], report["min_ratio"]), flush=True)
+    for h in hits:
+        t1 = time.time()
+        res = srsran_cell(samples, rate, h, args)
+        line = res["ident"] if res["ident"] else res["status"]
+        print("  PCI %-3d strength %4.0f  %s  (%.1fs)" % (res["pci"], res["strength"], line, time.time() - t1),
+              flush=True)
+    print("  srsRAN path took %.1fs" % (time.time() - t0), flush=True)
+    return None
+
+
 def needed_rate(n_rb):
     for rate, max_rb in RATES:
         if n_rb <= max_rb:
@@ -199,6 +379,9 @@ def run_once(args, freq_mhz, rate):
         if samples is None:
             return None, timing, rate
     if args.engine == "srsran":
+        if args.all_pci or args.fast_srsran:
+            return srsran_all(samples, rate, freq_mhz, args) if args.all_pci else \
+                srsran_strongest_fast(samples, rate, freq_mhz, args), timing, rate
         return srsran_decode(samples, rate, freq_mhz, args), timing, rate
     results, t, report = decode(samples, rate, args.pci, args.all_pci)
     timing.update(t)
@@ -286,7 +469,16 @@ def main():
     ap.add_argument("--low-if-mhz", type=float, default=0.0,
                     help="tune this far above the cell to keep the radio's DC spike off it (default 0)")
     ap.add_argument("--pci", type=int, help="decode this PCI even if the sync search is unsure")
-    ap.add_argument("--all-pci", action="store_true", help="decode every PCI heard, not just the strongest")
+    ap.add_argument("--all-pci", action="store_true",
+                    help="decode every PCI heard, not just the strongest (python engine and srsran engine)")
+    ap.add_argument("--weak-search", action="store_true",
+                    help="with --all-pci: second sync pass at the strongest cell's frequency offset to find weaker "
+                         "cells on the same carrier (the stock search can lock onto a false peak and miss them)")
+    ap.add_argument("--pss-min", type=float, default=None,
+                    help="--weak-search: sync threshold (default 6.0 = stock); lower (e.g. 4) to try weaker cells")
+    ap.add_argument("--fast-srsran", action="store_true",
+                    help="srsran engine: stop pdsch_ue as soon as the cell identity is printed instead of also "
+                         "running the other 3 bandwidth attempts (default = old behaviour)")
     ap.add_argument("--loop", action="store_true", help="keep capturing + decoding until Ctrl-C")
     ap.add_argument("--file", help="decode a saved capture (.sc16 from --save, or complex64)")
     ap.add_argument("--save", help="keep the raw capture here (sc16)")

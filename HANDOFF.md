@@ -316,6 +316,20 @@ Build libbladeRF 2.6.1 (deps: build-essential cmake git libusb-1.0-0-dev pkg-con
 Flash firmware v2.6.0. Copy gsm_arfcn_clean.py to /home/<user>/.
 
 
+## LTE ALL CELLS (2026-11-25 afternoon, lte_decode.py options; default behaviour unchanged)
+Baseline re-checked 14:48: 806 -> 4968724 (eNB 19409 s20), 816 -> 138630264 (eNB 541524 s120), ~18.6 s each.
+"srsRAN only does the strongest" = live mode. In file mode we pass -c PCI, so any PCI the Python search
+finds can be decoded. New options:
+  --all-pci (srsran engine): srsRAN per PCI found, labelled per PCI.
+  --fast-srsran: stop pdsch_ue at the first SIB1 line (default runs widths 50/25/75/100 regardless = most of
+                 the 16 s); skip other widths once the MIB's own width was tried.
+  --weak-search: stock search picks ONE freq offset per PSS root (global max) - a strong cell's false peak at
+                 a wrong offset (-39 kHz) hid a -10 dB cell. Second pass at the strongest cell's offset.
+  --pss-min N:   lower sync threshold for the second pass (stock 6).
+  Synthetic: stock finds only strongest; --weak-search finds -10 dB cells; + --pss-min 4 finds -16 dB;
+  -20 dB not. Detected != decoded: a weak co-channel cell's SIB1 overlaps the strong cell (may need
+  interference cancellation later). Phone references: O2 816 PCI 0+1, O2 952.5 PCI 0+1, EE 1846.7 389+461.
+
 ## LTE srsRAN (for lte_decode.py --engine srsran)
 *** LTE DECODE CONFIRMED 2026-11-25 10:57 (home): BladeRF capture at 806 MHz (15.36 Msps, low-IF 0.6)
 -> srsRAN pdsch_ue file mode -> SIB1 cell identity 4968724 = eNB 19409 sector 20, TAC 57379,
