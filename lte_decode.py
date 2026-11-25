@@ -287,7 +287,7 @@ def align_narrow(samples, rate, pci, cfo_hz):
     return np.asarray(wide[start:], dtype=np.complex64)
 
 
-def srsran_cell(samples, rate, hit, args):
+def srsran_cell(samples, rate, hit, args, aligned=None):
     """srsRAN MIB + SIB1 for ONE PCI (any PCI the search found, not only the strongest)."""
     import tempfile
     from pathlib import Path
@@ -295,7 +295,8 @@ def srsran_cell(samples, rate, hit, args):
     pci = int(hit["pci"])
     out = {"pci": pci, "strength": hit.get("pss_ratio", 0.0), "sss": hit.get("sss_score", 0.0),
            "status": "", "mib": None, "ident": None}
-    aligned = H._align(samples, rate, pci, float(hit.get("offset_hz", 0.0)))
+    if aligned is None:
+        aligned = H._align(samples, rate, pci, float(hit.get("offset_hz", 0.0)))
     if aligned is None:
         # weak cell: the full-band alignment is drowned by the strong cell; align on the narrow centre instead
         aligned = align_narrow(samples, rate, pci, float(hit.get("offset_hz", 0.0)))
@@ -324,6 +325,7 @@ def srsran_cell(samples, rate, hit, args):
                 break                      # right width already tried and no SIB1: other widths won't help
     finally:
         path.unlink(missing_ok=True)
+    out["_aligned"] = aligned
     out["status"] = "OK" if out["ident"] else ("MIB ok (%d RB), no SIB1" % out["mib"] if out["mib"] else "MIB not decoded")
     return out
 
@@ -431,12 +433,30 @@ def srsran_all(samples, rate, freq_mhz, args):
         print("  (* = found only by --weak-search)", flush=True)
     if not hits:
         print("  (best sync peak %.1fx, needs %.1fx)" % (report["best_ratio"], report["min_ratio"]), flush=True)
+    tried = {}
     for h in hits:
         t1 = time.time()
         res = srsran_cell(samples, rate, h, args)
+        tried[res["pci"]] = res
         line = res["ident"] if res["ident"] else res["status"]
         print("  PCI %-3d strength %4.0f  %s  (%.1fs)" % (res["pci"], res["strength"], line, time.time() - t1),
               flush=True)
+    if args.siblings:
+        # sectors of one mast share its clock (same frame timing) and are usually numbered 3*G + 0/1/2:
+        # decode the other two PCIs of every decoded cell's group using THAT cell's frame timing.
+        # No sync signal needed; srsRAN's CRC rejects a PCI that is not there.
+        for parent in [r for r in list(tried.values()) if r["ident"] and r.get("_aligned") is not None]:
+            base = 3 * (parent["pci"] // 3)
+            for sib in (base, base + 1, base + 2):
+                if sib in tried:
+                    continue
+                t1 = time.time()
+                res = srsran_cell(samples, rate, {"pci": sib, "pss_ratio": 0.0, "sss_score": 0.0,
+                                                  "offset_hz": 0.0}, args, aligned=parent["_aligned"])
+                tried[sib] = res
+                line = res["ident"] if res["ident"] else res["status"]
+                print("  PCI %-3d sibling of %-3d  %s  (%.1fs)" % (sib, parent["pci"], line, time.time() - t1),
+                      flush=True)
     print("  srsRAN path took %.1fs" % (time.time() - t0), flush=True)
     return None
 
@@ -574,6 +594,10 @@ def main():
                          "cell search; default = whole capture). srsRAN still gets the whole capture")
     ap.add_argument("--debug-search", action="store_true",
                     help="print every sync peak per PSS group and why it was accepted / rejected")
+    ap.add_argument("--siblings", action="store_true",
+                    help="with --all-pci: also try the other two PCIs of each decoded cell's group (3*G+0/1/2 = "
+                         "usually the same mast's other sectors) using that cell's frame timing - finds sectors "
+                         "whose own sync signal is too weak to detect")
     ap.add_argument("--fast-srsran", action="store_true",
                     help="srsran engine: stop pdsch_ue as soon as the cell identity is printed instead of also "
                          "running the other 3 bandwidth attempts (default = old behaviour)")

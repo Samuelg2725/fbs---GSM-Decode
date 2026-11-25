@@ -335,6 +335,11 @@ finds can be decoded. New options:
   align_narrow(): weak cell 'frame start not found' because H._align correlates PSS over the full 10 MHz
   where the strong cell drowns it -> fallback aligns at 1.92 Msps, SSS averaged over all repeats; exact on
   synthetic (-10 dB where stock fails). Full phone LTE list 15:14 saved in the conversation (13 cells).
+  PI 15:2x (816, debug): g40 CLIPS (peak 1.00) -> use --gain 20 for LTE too. Group 0 (PCI 0's PSS) has NO
+  real peak at either gain (best 9.7x, SSS 0.35 = noise; PCI 1 30x SSS 0.98): PCI 0 (sector 110 of the same
+  eNB 541524 as PCI 1/sector 120) is not reaching our antenna as a detectable sync signal.
+  Added --siblings: for each decoded PCI p, try 3*(p//3)+0/1/2 with p's frame alignment (co-sited sectors
+  share the eNB clock); srsRAN CRC rejects absent PCIs.
 
 ## LTE srsRAN (for lte_decode.py --engine srsran)
 *** LTE DECODE CONFIRMED 2026-11-25 10:57 (home): BladeRF capture at 806 MHz (15.36 Msps, low-IF 0.6)
