@@ -33,6 +33,9 @@ SAMP = 2e6
 SOURCES = ["soapy", "osmo-soapy", "osmo-numchan", "osmo-nchan"]
 
 
+BW = [SAMP]   # analog filter bandwidth (shared by RX1/RX2), set from --bw
+
+
 def make_source(kind, freq, gains, agcs):
     """Return a block with 2 outputs (RX1, RX2), already configured."""
     if kind == "soapy":
@@ -41,7 +44,7 @@ def make_source(kind, freq, gains, agcs):
         for ch in (0, 1):
             src.set_sample_rate(ch, SAMP)
             src.set_frequency(ch, freq)
-            src.set_bandwidth(ch, SAMP)
+            src.set_bandwidth(ch, BW[0])
             src.set_gain_mode(ch, bool(agcs[ch]))
             if not agcs[ch]:
                 src.set_gain(ch, float(gains[ch]))
@@ -57,7 +60,7 @@ def make_source(kind, freq, gains, agcs):
     for ch in (0, 1):
         src.set_center_freq(freq, ch)
         src.set_freq_corr(0, ch)
-        src.set_bandwidth(SAMP, ch)
+        src.set_bandwidth(BW[0], ch)
         src.set_gain_mode(bool(agcs[ch]), ch)
         if not agcs[ch]:
             src.set_gain(float(gains[ch]), ch)
@@ -155,6 +158,9 @@ def main():
     ap.add_argument("--agc1", action="store_true", help="RX1 uses the radio's AGC instead of --gain1")
     ap.add_argument("--agc2", action="store_true", help="RX2 uses the radio's AGC instead of --gain2")
     ap.add_argument("--src", default="auto", choices=["auto"] + SOURCES)
+    ap.add_argument("--bw", type=float, default=2e6,
+                    help="analog filter bandwidth in Hz (default 2e6, min 200e3). Narrow it (e.g. 400e3) so a strong "
+                         "neighbouring cell is filtered out before the converter and high gain can work")
     ap.add_argument("--levels", action="store_true", help="only print both channels' signal levels")
     ap.add_argument("--label", default=None)
     ap.add_argument("--stats-every", type=float, default=60.0)
@@ -162,11 +168,13 @@ def main():
     ap.add_argument("--verbose", action="store_true", help="show radio driver messages")
     args = ap.parse_args()
 
+    BW[0] = max(200e3, float(args.bw))
     freq = gsm.arfcn.arfcn2downlink(args.arfcn)
     if freq is None or freq < 100e6:
         sys.exit("ARFCN %d is not a downlink channel" % args.arfcn)
     names = (tag("RX1", args.agc1, args.gain1), tag("RX2", args.agc2, args.gain2))
-    print("dual tracking ARFCN %d (%.1f MHz)  %s  |  %s" % (args.arfcn, freq / 1e6, names[0], names[1]), flush=True)
+    print("dual tracking ARFCN %d (%.1f MHz)  %s  |  %s  |  filter %.0f kHz" % (
+        args.arfcn, freq / 1e6, names[0], names[1], BW[0] / 1e3), flush=True)
     for pid in F.other_scanners():
         try:
             os.kill(pid, signal.SIGINT)
@@ -242,8 +250,9 @@ def main():
             now = time.time()
             if args.levels and now >= next_level:
                 l1, l2 = tb.level(0), tb.level(1)
-                print("%s  RX1 %6.1f dBFS peak %.2f   RX2 %6.1f dBFS peak %.2f   (difference %.1f dB)" % (
-                    F.clean.now_stamp(), l1[0], l1[1], l2[0], l2[1], l2[0] - l1[0]), flush=True)
+                clip = lambda l: "  CLIPPING" if l[1] >= 0.99 else ""
+                print("%s  RX1 %6.1f dBFS peak %.2f%s   RX2 %6.1f dBFS peak %.2f%s   (difference %.1f dB)" % (
+                    F.clean.now_stamp(), l1[0], l1[1], clip(l1), l2[0], l2[1], clip(l2), l2[0] - l1[0]), flush=True)
                 next_level = now + 1.0
             for ch in (0, 1):
                 try:
@@ -259,7 +268,7 @@ def main():
                         continue
                     t = time.time()
                     dec[ch].append(t)
-                    if events and t - events[-1][0] < 0.3:
+                    if events and t - events[-1][0] < 0.3 and ch not in events[-1][1]:
                         events[-1][1].add(ch)
                         if pending is not None and pending[0] == events[-1][0]:
                             pending[1].add(ch)

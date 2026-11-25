@@ -204,6 +204,12 @@ GAIN RESULT 2026-11-25 12:07-12:28 (home, 2 min each, single-channel tracking):
   O2 116/119 send the cell ID 3x per 1.9 s (gaps 0.5/0.5/0.9) -> old rate showed 150%; rate is now
   decoded/(decoded+missed). First Ctrl-C now stops cleanly, further ones ignored (h13_g10 summary was lost).
   Still to test: weak cells (9 at -106, DCS 660 at -99) at g20 vs AGC vs g40; full sweep at g20/AGC.
+DUAL RESULT 2026-11-25 13:10 (home): gr-soapy streams both channels ("streaming via soapy").
+  ARFCN 13: RX1 g20 100%, RX2 g45 0% (+2 dBFS, peak 1.42 = fully clipped). ARFCN 9: nothing on either,
+  endless restarts. Cause: the 2 MHz analog filter also passes ARFCN 13 (0.8 MHz from 9) -> at high gain
+  13 clips the ADC and buries 9; at g20 9 (-106) is below noise. Added --bw (analog filter, min 200 kHz)
+  to gsm_dual.py and gsm_arfcn_fast.py to filter the neighbour out before the ADC. Merge fix: a 2nd decode
+  from the same channel within 0.3 s is a new broadcast (COMBINED was 1 below RX1).
 Also LTE: O2 816 MHz decoded = eNB 541524 sector 120 TAC 50496 PLMN 234-10 (matches phone).
 Next decode-rate candidates: restart threshold (2 s fixed now), fixed --ppm, gain/overload,
 unbounded message_debug memory on long runs.

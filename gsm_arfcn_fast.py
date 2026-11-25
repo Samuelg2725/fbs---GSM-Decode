@@ -155,7 +155,7 @@ def radio_args(radio):
     return "numchan=1 " + dev_args
 
 class top(gr.top_block):
-    def __init__(self, freq, gain=50, radio="lime", agc=False):
+    def __init__(self, freq, gain=50, radio="lime", agc=False, bw=None):
         gr.top_block.__init__(self, "fast")
         samp_rate = 2e6
         self.src = osmosdr.source(args=radio_args(radio))
@@ -167,7 +167,7 @@ class top(gr.top_block):
         self.src.set_gain_mode(radio != "bladerf" or agc, 0)
         if radio != "bladerf" or not agc:
             self.src.set_gain(gain, 0)
-        self.src.set_bandwidth(samp_rate, 0)
+        self.src.set_bandwidth(bw or samp_rate, 0)     # --bw: narrow analog filter vs strong neighbours
         self.gsm_input = gsm.gsm_input(ppm=0, osr=4, fc=freq, samp_rate_in=samp_rate)
         self.gsm_receiver = gsm.receiver(4, ([0]), ([]))
         self.gsm_clock = gsm.clock_offset_control(freq, samp_rate, osr=4)
@@ -417,6 +417,9 @@ def main():
                         help="lime (default, Owen's rig) or bladerf")
     parser.add_argument("--gain", type=float, default=None,
                         help="default 50 for lime, 20 for bladerf (40 overloads strong cells; was the old default)")
+    parser.add_argument("--bw", type=float, default=None,
+                        help="analog filter bandwidth in Hz (default = 2e6 sample rate; min 200e3). Narrow (e.g. 400e3) "
+                             "to keep a strong neighbouring cell out of the converter")
     parser.add_argument("--agc", action="store_true",
                         help="bladerf: use the radio's hardware AGC instead of the fixed --gain")
     parser.add_argument("--dwell", type=float, default=1.5,
@@ -465,7 +468,7 @@ def main():
     muted = clean.silence()
     tb = None
     try:
-        tb = top(freqs[0], args.gain, args.radio, args.agc)
+        tb = top(freqs[0], args.gain, args.radio, args.agc, args.bw)
         tb.start()
     finally:
         clean.restore(*muted)
@@ -492,7 +495,7 @@ def main():
         del tb
         muted = clean.silence()
         try:
-            new = top(freq, args.gain, args.radio, args.agc)
+            new = top(freq, args.gain, args.radio, args.agc, args.bw)
             new.start()
         finally:
             clean.restore(*muted)
