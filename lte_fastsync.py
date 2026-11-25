@@ -107,6 +107,29 @@ def correlate_mag_fast(spectrum, template, length):
     return np.abs(corr[:length])
 
 
+class _FFTProxy(object):
+    """np.fft stand-in for lte_sync: the one big zero-padded FFT in search_cell (power-of-2 size, e.g. 262144
+    for 153600 samples) is done at the smallest fast size that still holds the full linear correlation
+    (~154k) on all cores. Every other np.fft call passes straight through to numpy."""
+    def __getattr__(self, name):
+        return getattr(np.fft, name)
+
+    def fft(self, a, n=None, axis=-1, norm=None):
+        import lte_sync as S
+        a = np.asarray(a)
+        if n is not None and a.ndim == 1 and (n & (n - 1)) == 0 and n >= a.size + S.FFT_SIZE - 1 > 4096:
+            import scipy.fft as sf
+            return sf.fft(a, sf.next_fast_len(a.size + S.FFT_SIZE - 1), workers=-1)
+        return np.fft.fft(a, n=n, axis=axis, norm=norm)
+
+
+class _NPProxy(object):
+    fft = _FFTProxy()
+
+    def __getattr__(self, name):
+        return getattr(np, name)
+
+
 ORIG = {}
 
 
@@ -116,8 +139,10 @@ def install():
         return
     ORIG["confirm"] = S._confirm_sss
     ORIG["corr"] = S._correlate_mag
+    ORIG["np"] = S.np
     S._confirm_sss = confirm_sss_fast
     S._correlate_mag = correlate_mag_fast
+    S.np = _NPProxy()
 
 
 def uninstall():
@@ -125,6 +150,7 @@ def uninstall():
     if ORIG:
         S._confirm_sss = ORIG.pop("confirm")
         S._correlate_mag = ORIG.pop("corr")
+        S.np = ORIG.pop("np")
 
 
 if __name__ == "__main__":

@@ -384,6 +384,9 @@ finds can be decoded. New options:
   built once per PSS group, 336 hypotheses per matrix product; the original rebuilt sss_freq ~20k times),
   _correlate_mag on scipy.fft all cores + cached template FFTs. 'python3 lte_fastsync.py' = self-check:
   identical hits/ratios/scores on 5 synthetic cases, 2.9x overall, ~4x per search once cached.
+  Pi self-check 17:1x: SAME x5, only 1.7x (29.8 -> 18.0 s). Then: search_cell's big FFT was a power of 2
+  (262144 for 153600 samples) -> np proxy in lte_sync uses scipy next_fast_len (~154k) on all cores;
+  weak-search second pass likewise. Here: SAME x5, 3.5x.
 
 ## LTE srsRAN (for lte_decode.py --engine srsran)
 *** LTE DECODE CONFIRMED 2026-11-25 10:57 (home): BladeRF capture at 806 MHz (15.36 Msps, low-IF 0.6)

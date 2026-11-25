@@ -495,8 +495,9 @@ def search_all_cells(samples, rate, pss_min=None, debug=False):
     x = np.asarray(resample_to_lte(np.asarray(samples), rate), dtype=np.complex128)
     length = int(x.size)
     scale = float(np.sqrt(np.mean(np.abs(x) ** 2) + 1e-12))
-    nfft = 1 << (length + S.FFT_SIZE - 2).bit_length()
-    spectrum = np.fft.fft(x, nfft)
+    import scipy.fft as sf
+    nfft = sf.next_fast_len(length + S.FFT_SIZE - 1)       # smallest fast size holding the full correlation
+    spectrum = sf.fft(x, nfft, workers=-1)
     off0 = float(hits_seed[0]["offset_hz"])
     have = {h["pci"] for h in hits}
     for nid2 in range(3):
