@@ -63,6 +63,14 @@ Lime (live, Owen's rig): python3 gsm_arfcn_fast.py --arfcn 13 --df   (osmosdr dr
                      instead of saving sib1_bits.bin -> now parsed from the text. Survey centres were 1-2 MHz
                      off -> default is now the phone's carrier list (B20 6175/6225/6300/6400, B8 3501/3725,
                      B3 1363/1617, B1 223/347); --discover adds the survey. All PCIs per carrier decoded.
+- lte_track.py       LIVE LTE TRACKING (2026-11-25): wraps live pdsch_ue (-f, -g) on one carrier, parses the
+                     SIB1 line from print_sib1.py: first-decode time, SIB1 per second, identity changes,
+                     summary -> ~/field/lte_track_summary.csv. LTE equivalent of gsm_arfcn_fast tracking.
+  lte_scan ALL-BANDS RUN 12:5x: 4 cells OK (806 V PCI21 s20, 930.1 V s22, 952.5 O2 s122, 2132.3 V 15MHz s24),
+  all match phone; ~7.5 s per carrier, 92 s for 10. Fails: 816 'no LTE' (OK alone) -> probe now retries on
+  the whole capture; 1821.3 Three + 2144.7 O2 'MIB not decoded' -> --debug-dir saves pdsch_ue output;
+  793.5/798.5/1846.7 EE no sync (weak, -84..-92). Speed: pdsch_ue now stopped as soon as SIB1 prints
+  (--no-early-stop = old), --timing shows capture/probe/align/srsran split.
 - lte_decode.py      LTE/4G cell identity on the BladeRF. bladeRF-cli capture -> pure-Python decoder in
                      "osprey 2" (lte_pci_search: PCI; lte_cellid + lte_sib1: MIB + SIB1 -> CellID, eNB,
                      sector, PLMN, TAC). No srsRAN. --freq-mhz/--earfcn, --rate auto (15.36 Msps,

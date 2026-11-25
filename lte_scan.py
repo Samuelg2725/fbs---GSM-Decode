@@ -50,7 +50,7 @@ KNOWN_EARFCN = {
 OPERATOR = {"234-10": "O2", "234-15": "Vodafone", "234-20": "Three", "234-30": "EE", "234-33": "EE",
             "234-31": "EE", "234-32": "EE", "234-58": "Manx", "234-50": "JT"}
 RATE_FOR_RB = [(50, 15.36e6), (75, 23.04e6), (100, 30.72e6)]
-SIB1_RE = re.compile(r"SIB1 cell identity (\d+)\s+eNB (\d+)\s+sector (\d+)\s+TAC (\d+)((?:\s+PLMN \d+-\d+)*)")
+SIB1_RE = re.compile(r"SIB1 cell identity (\d+)\s+eNB (\d+)\s+sector (\d+)\s+TAC (\d+)((?:[ \t]+PLMN \d+-\d+)*)[ \t]*\r?\n")
 SURVEY_RATE = 30.72e6
 SURVEY_USABLE = 24e6
 
@@ -132,14 +132,79 @@ def shift(samples, rate, hz):
     return (samples * np.exp(-2j * np.pi * hz * n / rate)).astype(np.complex64)
 
 
-def probe(samples, rate, nudges_mhz):
-    """LTE sync search on the first 40 ms, trying small centre corrections. -> (nudge_hz, hits)."""
-    head = samples[:int(rate * 0.04)]
-    for nudge in nudges_mhz:
-        rep = search_samples(shift(head, rate, nudge * 1e6), rate)
-        if rep["hits"]:
-            return nudge * 1e6, rep["hits"]
-    return None, []
+def probe(samples, rate, nudges_mhz, full_retry=True):
+    """LTE sync search on the first 40 ms, trying small centre corrections. -> (nudge_hz, hits).
+    If nothing is found, one more try on the WHOLE capture at the nominal centre (816 was missed once
+    by the 40 ms probe in a run where it decoded fine alone)."""
+    t0 = time.time()
+    try:
+        head = samples[:int(rate * 0.04)]
+        for nudge in nudges_mhz:
+            rep = search_samples(shift(head, rate, nudge * 1e6), rate)
+            if rep["hits"]:
+                return nudge * 1e6, rep["hits"]
+        if full_retry:
+            rep = search_samples(samples, rate)
+            if rep["hits"]:
+                return 0.0, rep["hits"]
+        return None, []
+    finally:
+        T["probe"] += time.time() - t0
+
+
+EARLY = [True]
+DEBUG = [None]
+T = {"capture": 0.0, "probe": 0.0, "align": 0.0, "srsran": 0.0}
+
+
+def run_pdsch(path, pci, n_prb, n_sf, timeout, early):
+    """pdsch_ue on a file. With early=True it is stopped as soon as a SIB1 identity line appears
+    (SIB1 repeats every 20 ms; the rest of the file adds nothing). Returns all output text."""
+    import select
+    import shutil
+    import subprocess
+    cmd = [str(H._pdsch()), "-d", "-i", str(path), "-p", str(n_prb), "-c", str(pci), "-P", "2", "-Q",
+           "-n", str(n_sf)]
+    if shutil.which("stdbuf"):
+        cmd = ["stdbuf", "-oL", "-eL"] + cmd           # line-buffered so the MIB lines arrive before a stop
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+    out = []
+    deadline = time.time() + timeout
+    buf = b""
+    try:
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                break
+            ready, _, _ = select.select([p.stdout], [], [], min(left, 0.5))
+            if not ready:
+                if p.poll() is not None:
+                    break
+                continue
+            chunk = os.read(p.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            buf += chunk
+            if early and SIB1_RE.search(buf.decode(errors="replace")):
+                break
+    finally:
+        rest = b""
+        if p.poll() is None:
+            try:
+                os.killpg(p.pid, 9)
+            except OSError:
+                p.kill()
+        else:
+            try:
+                rest = p.stdout.read() or b""
+            except Exception:
+                pass
+        p.stdout.close()
+        try:
+            p.wait(timeout=2)
+        except Exception:
+            pass
+    return (buf + rest).decode(errors="replace")
 
 
 # ---------------------------------------------------------------- 3. decode
@@ -179,21 +244,31 @@ def srsran_read(samples, rate, pci, cfo_hz, n_prb, timeout):
     import tempfile
     from pathlib import Path
     from lte_cellid import _derotate, _locate_wide
+    t_al = time.time()
     corrected = _derotate(np.asarray(samples), cfo_hz, rate)
     start = _locate_wide(corrected, pci, int(round(rate / 15000.0)))     # FFT size for this rate
     aligned = None if start is None else np.asarray(corrected[start:], dtype=np.complex64)
     if aligned is None:
+        T["align"] += time.time() - t_al
         return {}, None, "frame start not found"
     with tempfile.NamedTemporaryFile(suffix=".cf32", delete=False, dir="/dev/shm") as fh:
         path = Path(fh.name)
-    real, limited = limited_subprocess(timeout)
     try:
         aligned.tofile(path)
+        T["align"] += time.time() - t_al
         n_sf = max(40, len(aligned) // max(1, int(round(rate / 1000.0))))
-        H.subprocess.run = limited
-        text, payload = H._run_broadcast(path, pci, n_prb, n_sf)
+        t_sr = time.time()
+        H._clear_sib_bits()
+        text = run_pdsch(path, pci, n_prb, n_sf, timeout, EARLY[0])
+        sib = H._saved_sib_bits()
+        payload = sib.read_bytes() if sib is not None else None
+        T["srsran"] += time.time() - t_sr
+        if DEBUG[0]:
+            d = os.path.expanduser(DEBUG[0])
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "pdsch_%s_pci%d_p%d.txt" % (time.strftime("%H%M%S"), pci, n_prb)), "w") as fh:
+                fh.write(text)
     finally:
-        H.subprocess.run = real
         path.unlink(missing_ok=True)
     mib = H._read_mib(text)
     # our pdsch_ue build (srsran_watch/print_sib1.py) prints the decoded SIB1 as a text line
@@ -229,7 +304,8 @@ def read_cell(s, rate, mhz, pci, cfo, args):
         else:                                 # 15/20 MHz: needs a wider capture
             print("    PCI %d is %s MHz wide - re-capturing at %.2f Msps" % (pci, mib.get("mhz"), want / 1e6),
                   flush=True)
-            s2, _ = L.capture(mhz * 1e6, want, args.secs, args.gain, args.low_if_mhz * 1e6)
+            s2, tc = L.capture(mhz * 1e6, want, args.secs, args.gain, args.low_if_mhz * 1e6)
+            T["capture"] += tc
             r2 = want
         if s2 is not None:
             _, ident, problem = srsran_read(s2, r2, pci, cfo, prb, args.srsran_timeout)
@@ -246,7 +322,8 @@ def decode_carrier(mhz, args):
     base = {"mhz": mhz, "band": band_of(mhz), "earfcn": earfcn_of(mhz), "status": "", "t": 0.0}
     t0 = time.time()
     rate = 15.36e6
-    s, _ = L.capture(mhz * 1e6, rate, args.secs, args.gain, args.low_if_mhz * 1e6)
+    s, tc = L.capture(mhz * 1e6, rate, args.secs, args.gain, args.low_if_mhz * 1e6)
+    T["capture"] += tc
     if s is None:
         base.update(status="capture failed", t=time.time() - t0)
         return [base]
@@ -339,6 +416,10 @@ def main():
                     help="decode up to this many PCIs per carrier, strongest first (default 3)")
     ap.add_argument("--nudges", type=float, nargs="+", default=[0, 0.1, -0.1],
                     help="centre corrections (MHz) tried by the sync probe")
+    ap.add_argument("--no-early-stop", action="store_true",
+                    help="let pdsch_ue read the whole capture even after SIB1 decoded (old behaviour, slower)")
+    ap.add_argument("--timing", action="store_true", help="print where the time goes for every carrier")
+    ap.add_argument("--debug-dir", help="save every pdsch_ue output here (for failed MIB/SIB1 rows)")
     ap.add_argument("--srsran-timeout", type=int, default=20, help="seconds per pdsch_ue attempt")
     ap.add_argument("--loop", action="store_true", help="repeat until Ctrl-C")
     ap.add_argument("--rediscover", type=int, default=0, help="--loop: re-survey every N passes (0 = never)")
@@ -346,6 +427,8 @@ def main():
     ap.add_argument("--csv", default="~/field/lte_scan.csv")
     args = ap.parse_args()
 
+    EARLY[0] = not args.no_early_stop
+    DEBUG[0] = args.debug_dir
     if not H._pdsch().is_file():
         sys.exit("srsRAN pdsch_ue not found at %s - build it first (HANDOFF 'LTE srsRAN')" % H._pdsch())
 
@@ -366,6 +449,7 @@ def main():
             print(HEAD, flush=True)
             got = []
             for c in cands:
+                before = dict(T)
                 for r in decode_carrier(c, args):
                     print(row(r), flush=True)
                     log_csv(args.csv, r, args.label)
@@ -375,6 +459,8 @@ def main():
                     if r.get("status") == "OK":
                         cells[(r["mhz"], r["cell_id"])] = r
                         got.append(r)
+                if args.timing:
+                    print("      time: " + "  ".join("%s %.1fs" % (k, T[k] - before[k]) for k in T), flush=True)
             if passes == 1 and not args.freqs:
                 # later passes only revisit carriers that had LTE sync (fast tracking)
                 live = sorted({round(r["mhz"], 1) for r in got})
@@ -386,7 +472,10 @@ def main():
                 break
     except KeyboardInterrupt:
         print("")
-    print("\n===== %d unique LTE cell(s), %d pass(es), %.0fs =====" % (len(cells), passes, time.time() - t_all))
+    el = time.time() - t_all
+    print("\n===== %d unique LTE cell(s), %d pass(es), %.0fs =====" % (len(cells), passes, el))
+    print("time split: " + "  ".join("%s %.1fs" % kv for kv in T.items())
+          + "  other %.1fs" % max(0.0, el - sum(T.values())))
     if cells:
         print(HEAD.rsplit(" ", 1)[0])
         for k in sorted(cells):
