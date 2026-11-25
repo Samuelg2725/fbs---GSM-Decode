@@ -183,8 +183,6 @@ MIB_PRB_RE = __import__("re").compile(r"PRB:\s+(\d+)")
 
 
 SRS_EXTRA = []
-# sample rate this srsRAN build reads a FILE at, per cell width (compact symbol sizes 128/256/384/768/1024/1536)
-SRS_FILE_RATE = {6: 1.92e6, 15: 3.84e6, 25: 5.76e6, 50: 11.52e6, 75: 15.36e6, 100: 23.04e6}
 
 
 def run_pdsch(exe, path, pci, n_prb, n_sf, timeout, early, ports=2):
@@ -334,30 +332,11 @@ def srsran_cell(samples, rate, hit, args, aligned=None):
         n_sf = max(40, len(aligned) // max(1, int(round(rate / 1000.0))))
         own = {15360000: 50, 23040000: 75, 30720000: 100}.get(int(round(rate)), 50)
         widths = [own] + [w for w in (50, 25, 75, 100) if w != own]
-        if args.match_rate:
-            # this srsRAN build reads files at its compact rates (log: "Reading 11520 samples" per subframe
-            # for 50 PRB = 11.52 Msps). Write each attempt's file at the rate srsRAN expects for that width.
-            widths = [w for w in (50, 75, 100, 25, 15, 6) if SRS_FILE_RATE[w] <= rate + 1]
-            mib_w = hit.get("mib_width")
-            if mib_w in widths:
-                widths.remove(mib_w)
-                widths.insert(0, mib_w)
-            own = widths[0]
         written = {}
 
         def file_for(n_prb):
-            """path + subframe count of the aligned capture at srsRAN's rate for n_prb (match-rate mode)."""
-            if not args.match_rate:
-                return path, n_sf
-            if n_prb not in written:
-                from fractions import Fraction
-                from scipy.signal import resample_poly
-                fr = Fraction(int(SRS_FILE_RATE[n_prb]), int(round(rate))).limit_denominator(64)
-                y = aligned if fr == 1 else resample_poly(aligned, fr.numerator, fr.denominator)
-                pth = Path(str(path) + ".p%d" % n_prb)
-                np.asarray(y, dtype=np.complex64).tofile(pth)
-                written[n_prb] = (pth, max(40, len(y) // max(1, int(round(SRS_FILE_RATE[n_prb] / 1000.0)))))
-            return written[n_prb]
+            return path, n_sf
+
         # (width, ports) attempts: Owen's fixed 2 ports first; with --try-ports, a MIB failure at the
         # capture's own width is retried with 4 and 1 ports (file mode must be told the cell's port count)
         attempts = [(w, 2) for w in widths]
@@ -390,8 +369,7 @@ def srsran_cell(samples, rate, hit, args, aligned=None):
                 break
             if args.fast_srsran and out["mib"] is not None and out["mib"] == n_prb:
                 break                      # right width already tried and no SIB1: other widths won't help
-            if out["mib"] is not None and (SRS_FILE_RATE.get(out["mib"], 0) > rate + 1 if args.match_rate
-                                           else needed_rate(out["mib"]) > rate):
+            if out["mib"] is not None and needed_rate(out["mib"]) > rate:
                 break                      # cell wider than this capture: needs a wider re-capture, not more tries
     finally:
         path.unlink(missing_ok=True)
@@ -546,11 +524,7 @@ def srsran_all(samples, rate, freq_mhz, args):
                 print("  PCI %-3d sibling of %-3d  %s  (%.1fs)" % (sib, parent["pci"], line, time.time() - t1),
                       flush=True)
     print("  srsRAN path took %.1fs" % (time.time() - t0), flush=True)
-    if args.match_rate:
-        need = [needed_rate(r["mib"]) for r in tried.values()
-                if not r["ident"] and r["mib"] and SRS_FILE_RATE.get(r["mib"], 0) > rate + 1]
-    else:
-        need = [needed_rate(r["mib"]) for r in tried.values() if not r["ident"] and r["mib"] and r["mib"] > 50]
+    need = [needed_rate(r["mib"]) for r in tried.values() if not r["ident"] and r["mib"] and r["mib"] > 50]
     need += [30.72e6 for r in tried.values() if not r["ident"] and not r["mib"] and r.get("mib_odd") is not None
              and rate < 30.72e6]
     return {"need_rate": max(need) if need else None}
@@ -728,15 +702,11 @@ def main():
     ap.add_argument("--srsran-log", default=None,
                     help="save every srsRAN pdsch_ue output to this folder (e.g. ~/field/srslog) for diagnosis")
     ap.add_argument("--srsran-verbose", action="store_true",
-                    help="run pdsch_ue with -v (and without -Q) so its sync / MIB attempts are written to the "
-                         "--srsran-log files - for diagnosing cells that fail silently")
+                    help="DIAGNOSIS ONLY: run pdsch_ue with -v (and without -Q) so its sync / MIB attempts are "
+                         "written to the --srsran-log files. Slows it down and can stop SIB1 decoding")
     ap.add_argument("--try-ports", action="store_true",
                     help="if the MIB fails with 2 antenna ports (Owen's fixed -P 2), retry with 4 and 1 "
                          "(srsRAN file mode must be told the port count; many 1800/2100 cells use 4)")
-    ap.add_argument("--match-rate", action="store_true",
-                    help="write srsRAN's input at the rate it actually reads (11.52 Msps for 10 MHz cells, 15.36 for "
-                         "15 MHz, 23.04 for 20 MHz) instead of the capture rate. Its log says 'Reading 11520 samples' "
-                         "per subframe = 11.52 Msps, so 15.36 Msps files were being read 25%% too slowly")
     ap.add_argument("--fast-srsran", action="store_true",
                     help="srsran engine: stop pdsch_ue as soon as the cell identity is printed instead of also "
                          "running the other 3 bandwidth attempts (default = old behaviour)")
