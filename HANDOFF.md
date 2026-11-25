@@ -387,6 +387,9 @@ finds can be decoded. New options:
   Pi self-check 17:1x: SAME x5, only 1.7x (29.8 -> 18.0 s). Then: search_cell's big FFT was a power of 2
   (262144 for 153600 samples) -> np proxy in lte_sync uses scipy next_fast_len (~154k) on all cores;
   weak-search second pass likewise. Here: SAME x5, 3.5x.
+  PI 17:2x: self-check SAME x5, 5.1x (30.7 -> 6.0 s). 816: sync search 8.4 -> 2.2 s, carrier 13.0 -> 6.8 s,
+  PCI 1 + PCI 0 (541524:120 + :110) both full IDs. Remaining time: bladeRF-cli start ~2 s per capture,
+  srsRAN ~0.7 s per decoded cell, ~1.1 s per failed sibling try.
 
 ## LTE srsRAN (for lte_decode.py --engine srsran)
 *** LTE DECODE CONFIRMED 2026-11-25 10:57 (home): BladeRF capture at 806 MHz (15.36 Msps, low-IF 0.6)
