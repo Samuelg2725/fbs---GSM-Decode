@@ -226,6 +226,12 @@ WIDEBAND FIXES 2026-11-25 (gsm_wide.py, all optional; --best = all of them):
   signal but no cell ID -> gsm_dual.py sweep, 300 kHz filter, RX1/RX2 g20/g45). --best = --fast
   --gain auto --gate 6 --rescue. Chris: wideband less accurate for WEAK cells (one gain per 15 MHz slice,
   strongest cell sets it) -> rescue does the weak ones narrow. Power map tested here on synthetic sc16.
+WIDEBAND --best RESULT 2026-11-25 13:32-13:42: decode itself found 6,13,22 (942.5) and 116,119 (954.1) at
+  0.2-0.4 s each with auto gain 18-25. The power gate was fooled by LTE: 925-935 MHz (977-1022) = Vodafone
+  LTE 930.1, 64-72 = O2 LTE 952.5 -> rescue spent ~7 min on LTE. DECISION (user): stick with NARROW.
+  Narrow sweep cost was ~5.6 s/channel for a 3 s dwell (2.6 s = reopening the radio). Added
+  gsm_dual.py --quick: radio stays open (retune + disconnect_all + fresh decoder chains), and a channel is
+  left after --sync-secs (1.2) if neither antenna has GSM sync (receiver C0 bursts). Stub-tested only.
 Also LTE: O2 816 MHz decoded = eNB 541524 sector 120 TAC 50496 PLMN 234-10 (matches phone).
 Next decode-rate candidates: restart threshold (2 s fixed now), fixed --ppm, gain/overload,
 unbounded message_debug memory on long runs.

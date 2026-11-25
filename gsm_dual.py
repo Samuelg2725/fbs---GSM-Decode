@@ -70,8 +70,13 @@ def make_source(kind, freq, gains, agcs):
 class dual(gr.top_block):
     def __init__(self, kind, freq, gains, agcs):
         gr.top_block.__init__(self, "dual")
+        self.kind = kind
         self.src = make_source(kind, freq, gains, agcs)
-        self.dbg, self.probe, self.keep = [], [], []
+        self._chains(freq)
+
+    def _chains(self, freq):
+        """Two fresh decoder chains (+ level meters) behind the source."""
+        self.dbg, self.probe, self.keep, self.sync = [], [], [], []
         for ch in (0, 1):
             gi = gsm.gsm_input(ppm=0, osr=4, fc=freq, samp_rate_in=SAMP)
             rx = gsm.receiver(4, ([0]), ([]))
@@ -86,6 +91,10 @@ class dual(gr.top_block):
             self.msg_connect(rx, "measurements", clk, "measurements")
             self.msg_connect(dm, "bursts", dec, "bursts")
             self.msg_connect(dec, "msgs", dbg, "store")
+            # the receiver only emits C0 bursts once it has locked to a cell's FCCH+SCH
+            syn = blocks.message_debug()
+            self.msg_connect(rx, "C0", syn, "store")
+            self.sync.append(syn)
             # level meter: mean |x|^2 over ~0.1 s, and peak |x| (clipping check)
             mag = blocks.complex_to_mag_squared(1)
             avg = blocks.moving_average_ff(int(SAMP * 0.1), 1.0 / (SAMP * 0.1), 4000, 1)
@@ -100,6 +109,28 @@ class dual(gr.top_block):
             self.dbg.append(dbg)
             self.probe.append((pr, prp))
             self.keep += [gi, rx, clk, dm, dec, mag, avg, pk, st, mxv]
+
+    def synced(self, ch):
+        try:
+            return self.sync[ch].num_messages() > 0
+        except Exception:
+            return False
+
+    def retune(self, freq):
+        """Keep the radio open; new frequency + brand-new decoders (no carried-over clock correction)."""
+        try:
+            self.stop()
+            self.wait()
+        except Exception:
+            pass
+        self.disconnect_all()
+        for ch in (0, 1):
+            if self.kind == "soapy":
+                self.src.set_frequency(ch, freq)
+            else:
+                self.src.set_center_freq(freq, ch)
+        self._chains(freq)
+        self.start()
 
     def level(self, ch):
         import math
@@ -175,20 +206,34 @@ def sweep(args):
             passes += 1
             t_pass = time.time()
             for a, f in chans:
-                if tb is not None:
+                if tb is not None and args.quick:
+                    try:
+                        tb.retune(f)
+                    except Exception as exc:
+                        print("  retune failed (%s) - reopening the radio" % str(exc)[:60], flush=True)
+                        try:
+                            tb.stop()
+                            tb.wait()
+                        except Exception:
+                            pass
+                        tb = None
+                elif tb is not None:
                     try:
                         tb.stop()
                         tb.wait()
                     except Exception:
                         pass
                     del tb
-                tb, kind = build(args, f, check=(kind is None))
+                    tb = None
+                if tb is None:
+                    tb, kind = build(args, f, check=(kind is None))
                 if kind and passes == 1 and a == chans[0][0]:
                     print("streaming via %s" % kind, flush=True)
                 if kind and args.src == "auto":
                     args.src = kind              # keep the route that worked
                 t0 = time.time()
                 seen, got, text = [0, 0], set(), None
+                nosync = False
                 while time.time() - t0 < args.dwell:
                     for ch in (0, 1):
                         try:
@@ -204,6 +249,10 @@ def sweep(args):
                                 text = text or t
                     if got == {0, 1} or (got and time.time() - t0 > 1.0):
                         break                     # both have it, or one has it and we gave the other 1 s
+                    if (args.quick and not got and time.time() - t0 > args.sync_secs
+                            and not tb.synced(0) and not tb.synced(1)):
+                        nosync = True
+                        break                     # no GSM sync on either antenna: nothing to wait for
                     time.sleep(0.02)
                 took = time.time() - t0
                 if got:
@@ -212,7 +261,8 @@ def sweep(args):
                     plain = re.sub("\x1b\\[[0-9;]*m", "", text).split(", Pwr")[0]
                     found.setdefault(a, [plain, set()])[1].update(got)
                 else:
-                    print("%s  %5.1fs  ARFCN %d  no cell" % (F.clean.now_stamp(), took, a), flush=True)
+                    print("%s  %5.1fs  ARFCN %d  %s" % (F.clean.now_stamp(), took, a,
+                          "no GSM sync" if nosync else "no cell"), flush=True)
             print("pass %d done in %.1fs, %d cell(s) so far" % (passes, time.time() - t_pass, len(found)), flush=True)
     except KeyboardInterrupt:
         pass
@@ -250,6 +300,11 @@ def main():
                     help="one ARFCN = track it; several = sweep them (both antennas on every channel)")
     ap.add_argument("--dwell", type=float, default=2.5, help="sweep: seconds per channel (default 2.5)")
     ap.add_argument("--passes", type=int, default=1, help="sweep: rounds (default 1, 0 = forever)")
+    ap.add_argument("--quick", action="store_true",
+                    help="sweep: keep the radio open between channels (fresh decoders each time) and move on "
+                         "after --sync-secs if neither antenna gets GSM sync")
+    ap.add_argument("--sync-secs", type=float, default=1.2,
+                    help="--quick: seconds to wait for GSM sync before moving on (default 1.2)")
     ap.add_argument("--gain1", type=float, default=20.0, help="RX1 gain (default 20: strong cells)")
     ap.add_argument("--gain2", type=float, default=45.0, help="RX2 gain (default 45: weak cells)")
     ap.add_argument("--agc1", action="store_true", help="RX1 uses the radio's AGC instead of --gain1")
