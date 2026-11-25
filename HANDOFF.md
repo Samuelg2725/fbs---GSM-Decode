@@ -57,8 +57,12 @@ Lime (live, Owen's rig): python3 gsm_arfcn_fast.py --arfcn 13 --df   (osmosdr dr
                      centres (+ known B20 793.5/798.5/806/816) -> 0.2 s capture, low-IF 0.6, Python PSS/SSS
                      probe with +-0.3 MHz digital nudges -> srsRAN pdsch_ue -p 50 (MIB) then re-read at the
                      cell's own rate (decimate for 5 MHz, re-capture 23.04/30.72 for 15/20 MHz) -> table +
-                     ~/field/lte_scan.csv. --bands, --freqs (skip survey), --loop (re-decode live carriers),
-                     --rediscover N, --label. Mock-tested here (synthetic cell, nudge recovery); needs Pi test.
+                     ~/field/lte_scan.csv. --bands, --freqs/--earfcns, --discover, --max-pci, --loop, --label.
+                     FIRST PI RUN 12:4x: sync found the phone's PCIs (806 PCI 21, 816 PCI 1, 952.5 PCI 1) but
+                     every row said 'MIB ok, no SIB1': our pdsch_ue patch PRINTS the SIB1 line (sib1_print.cc)
+                     instead of saving sib1_bits.bin -> now parsed from the text. Survey centres were 1-2 MHz
+                     off -> default is now the phone's carrier list (B20 6175/6225/6300/6400, B8 3501/3725,
+                     B3 1363/1617, B1 223/347); --discover adds the survey. All PCIs per carrier decoded.
 - lte_decode.py      LTE/4G cell identity on the BladeRF. bladeRF-cli capture -> pure-Python decoder in
                      "osprey 2" (lte_pci_search: PCI; lte_cellid + lte_sib1: MIB + SIB1 -> CellID, eNB,
                      sector, PLMN, TAC). No srsRAN. --freq-mhz/--earfcn, --rate auto (15.36 Msps,

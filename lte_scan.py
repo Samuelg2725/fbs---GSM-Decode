@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """LTE multi-band scanner for the BladeRF: find every LTE carrier, decode its identity, print one table.
 
-  python3 ~/fbs-upload/lte_scan.py                         # UK bands 20 8 3 1 7, one pass
+  python3 ~/fbs-upload/lte_scan.py                         # known UK carriers in bands 20 8 3 1 7
   python3 ~/fbs-upload/lte_scan.py --bands 20 3            # only some bands
-  python3 ~/fbs-upload/lte_scan.py --freqs 806 816         # skip discovery, decode these centres (fastest)
-  python3 ~/fbs-upload/lte_scan.py --loop                  # discover once, then keep re-decoding (Ctrl-C)
-  python3 ~/fbs-upload/lte_scan.py --loop --rediscover 5   # full re-discovery every 5th pass
+  python3 ~/fbs-upload/lte_scan.py --earfcns 6300 6400     # just these channels (fastest)
+  python3 ~/fbs-upload/lte_scan.py --discover              # also survey for carriers not in the list
+  python3 ~/fbs-upload/lte_scan.py --loop                  # keep re-decoding the live carriers (Ctrl-C)
 
 How it works, per band:
-  1. survey   - wide 30.72 Msps snapshots, power in 100 kHz bins -> raised blocks = candidate carriers
-                (plus the known UK centres for that band). Skipped with --freqs.
+  1. survey   - (--discover only) wide 30.72 Msps snapshots, power in 100 kHz bins -> raised blocks = candidate carriers
+                (plus the known UK list, which alone is the default).
   2. probe    - 0.2 s capture at the candidate (low-IF 0.6 MHz, DC spike notched), LTE sync (PSS/SSS)
                 search in Python, nudging the centre +-0.3 MHz digitally. No sync -> "no LTE", next.
-  3. decode   - srsRAN pdsch_ue (Owen's proven path) reads MIB + SIB1 -> Cell ID, eNB, sector, TAC, PLMN.
+  3. decode   - for EVERY PCI heard (--max-pci, default 3): srsRAN pdsch_ue reads MIB + SIB1 -> Cell ID, eNB, sector, TAC, PLMN.
                 If the MIB says the cell is wider than the capture, re-capture at 23.04/30.72 Msps.
 Every result is appended to --csv (default ~/field/lte_scan.csv). Needs ~/srsRAN_4G built (see HANDOFF).
 Only one program can use the BladeRF at a time: stop GSM tracking first.
 """
 import argparse
 import os
+import re
 import sys
 import time
 import types
@@ -37,9 +38,19 @@ BANDS = {
     8: (925.0, 960.0, 3450),
     20: (791.0, 821.0, 6150),
 }
-# centres seen on air / Owen's notes (tried even if the survey misses them)
-KNOWN = {20: [793.5, 798.5, 806.0, 816.0]}
+# UK carriers seen by the phone scanner at home 2026-11-25 (EARFCN -> centre). Default candidate list;
+# --discover adds survey-found blocks on top (for new places).
+KNOWN_EARFCN = {
+    20: [6175, 6225, 6300, 6400],     # EE 793.5, EE 798.5, Vodafone 806, O2 816
+    8: [3501, 3725],                  # Vodafone 930.1, O2 952.5
+    3: [1363, 1617],                  # Three 1821.3, EE 1846.7
+    1: [223, 347],                    # Vodafone 2132.3, O2 2144.7
+    7: [],
+}
+OPERATOR = {"234-10": "O2", "234-15": "Vodafone", "234-20": "Three", "234-30": "EE", "234-33": "EE",
+            "234-31": "EE", "234-32": "EE", "234-58": "Manx", "234-50": "JT"}
 RATE_FOR_RB = [(50, 15.36e6), (75, 23.04e6), (100, 30.72e6)]
+SIB1_RE = re.compile(r"SIB1 cell identity (\d+)\s+eNB (\d+)\s+sector (\d+)\s+TAC (\d+)((?:\s+PLMN \d+-\d+)*)")
 SURVEY_RATE = 30.72e6
 SURVEY_USABLE = 24e6
 
@@ -48,6 +59,14 @@ def band_of(mhz):
     for b, (lo, hi, _) in BANDS.items():
         if lo <= mhz <= hi:
             return b
+    return None
+
+
+def mhz_of(earfcn):
+    for b, (lo, hi, off) in BANDS.items():
+        n = (earfcn - off) / 10.0 + lo
+        if 0 <= earfcn - off and lo <= n <= hi:
+            return round(n, 1)
     return None
 
 
@@ -177,58 +196,77 @@ def srsran_read(samples, rate, pci, cfo_hz, n_prb, timeout):
         H.subprocess.run = real
         path.unlink(missing_ok=True)
     mib = H._read_mib(text)
+    # our pdsch_ue build (srsran_watch/print_sib1.py) prints the decoded SIB1 as a text line
+    m = SIB1_RE.search(text)
+    if m:
+        plmns = re.findall(r"PLMN (\d+)-(\d+)", m.group(5) or "")
+        mcc, mnc = plmns[0] if plmns else ("?", "?")
+        ident = {"cell_id": int(m.group(1)), "enb_id": int(m.group(2)), "sector_id": int(m.group(3)),
+                 "tac": int(m.group(4)), "mcc": mcc, "mnc_digits": mnc,
+                 "operator": OPERATOR.get("%s-%s" % (mcc, mnc), ""),
+                 "plmns": ["%s-%s" % x for x in plmns]}
+        return mib, ident, ""
+    if payload:                                   # Owen's bit-file variant of the patch
+        ident = H.identity_from_transport_block(payload)
+        if ident:
+            return mib, ident, ""
     if not mib:
         return {}, None, "MIB not decoded"
-    if not payload:
-        return mib, None, "MIB ok, no SIB1"
-    ident = H.identity_from_transport_block(payload)
-    return mib, ident, "" if ident else "SIB1 not a UK identity"
+    return mib, None, "MIB ok, no SIB1"
 
 
-def decode_carrier(mhz, args):
-    """Capture + probe + srsRAN. Returns a result dict (always, with 'status')."""
-    res = {"mhz": mhz, "band": band_of(mhz), "earfcn": earfcn_of(mhz), "status": "", "t": 0.0}
-    t0 = time.time()
-    rate = 15.36e6
-    s, _ = L.capture(mhz * 1e6, rate, args.secs, args.gain, args.low_if_mhz * 1e6)
-    if s is None:
-        res.update(status="capture failed", t=time.time() - t0)
-        return res
-    nudge, hits = probe(s, rate, args.nudges)
-    if not hits:
-        res.update(status="no LTE", t=time.time() - t0)
-        return res
-    mhz_true = round(mhz + nudge / 1e6, 1)
-    res.update(mhz=mhz_true, band=band_of(mhz_true), earfcn=earfcn_of(mhz_true))
-    hit = hits[0]
-    pci = int(hit["pci"])
-    res["pci"] = pci
-    res["also_pci"] = [int(h["pci"]) for h in hits[1:]]
-    s = shift(s, rate, nudge)
-    cfo = float(hit.get("offset_hz", 0.0))
-    # step 1: 50-PRB read at 15.36 Msps - the MIB (centre 6 RB) decodes whatever the cell width
+def read_cell(s, rate, mhz, pci, cfo, args):
+    """MIB + SIB1 for one PCI; re-reads at the cell's own rate if it is not 10 MHz."""
+    out = {"pci": pci}
     mib, ident, problem = srsran_read(s, rate, pci, cfo, 50, args.srsran_timeout)
     if mib:
-        res["rb"], res["bw"] = mib.get("prb"), mib.get("mhz")
+        out["rb"], out["bw"] = mib.get("prb"), mib.get("mhz")
     prb = mib.get("prb") if mib else None
     if not ident and prb in SRS_RATE and prb != 50:
         want = SRS_RATE[prb]
         if want < rate:                       # 1.4/3/5 MHz: down-sample what we have
             s2, r2 = decimate(s, int(round(rate / want))), want
         else:                                 # 15/20 MHz: needs a wider capture
-            print("    cell is %s MHz wide - re-capturing at %.2f Msps" % (mib.get("mhz"), want / 1e6), flush=True)
-            s2, _ = L.capture(mhz_true * 1e6, want, args.secs, args.gain, args.low_if_mhz * 1e6)
+            print("    PCI %d is %s MHz wide - re-capturing at %.2f Msps" % (pci, mib.get("mhz"), want / 1e6),
+                  flush=True)
+            s2, _ = L.capture(mhz * 1e6, want, args.secs, args.gain, args.low_if_mhz * 1e6)
             r2 = want
         if s2 is not None:
-            mib2, ident, problem = srsran_read(s2, r2, pci, cfo, prb, args.srsran_timeout)
-            mib = mib2 or mib
+            _, ident, problem = srsran_read(s2, r2, pci, cfo, prb, args.srsran_timeout)
     if ident:
-        res.update(ident)
-        res["status"] = "OK"
+        out.update(ident)
+        out["status"] = "OK"
     else:
-        res["status"] = problem or "no SIB1"
-    res["t"] = time.time() - t0
-    return res
+        out["status"] = problem or "no SIB1"
+    return out
+
+
+def decode_carrier(mhz, args):
+    """Capture + probe + srsRAN for every PCI heard (strongest first). Returns a list of result dicts."""
+    base = {"mhz": mhz, "band": band_of(mhz), "earfcn": earfcn_of(mhz), "status": "", "t": 0.0}
+    t0 = time.time()
+    rate = 15.36e6
+    s, _ = L.capture(mhz * 1e6, rate, args.secs, args.gain, args.low_if_mhz * 1e6)
+    if s is None:
+        base.update(status="capture failed", t=time.time() - t0)
+        return [base]
+    nudge, hits = probe(s, rate, args.nudges)
+    if not hits:
+        base.update(status="no LTE", t=time.time() - t0)
+        return [base]
+    mhz_true = round(mhz + nudge / 1e6, 1)
+    base.update(mhz=mhz_true, band=band_of(mhz_true), earfcn=earfcn_of(mhz_true))
+    s = shift(s, rate, nudge)
+    out = []
+    for hit in hits[:max(1, args.max_pci)]:
+        t1 = time.time()
+        r = dict(base)
+        r.update(read_cell(s, rate, mhz_true, int(hit["pci"]), float(hit.get("offset_hz", 0.0)), args))
+        r["t"] = time.time() - (t0 if not out else t1)
+        out.append(r)
+    if len(hits) > args.max_pci:
+        out[-1]["also_pci"] = [int(h["pci"]) for h in hits[args.max_pci:]]
+    return out
 
 
 # ---------------------------------------------------------------- output
@@ -266,9 +304,15 @@ def discover(args):
     cands = []
     for b in args.bands:
         lo, hi, _ = BANDS[b]
+        known = [mhz_of(e) for e in KNOWN_EARFCN.get(b, [])]
+        if not args.discover:
+            if known:
+                print("Band %d: known carriers %s" % (b, ", ".join("%.1f" % k for k in known)), flush=True)
+            cands += known
+            continue
         t0 = time.time()
         found, runs = survey_band(lo, hi, args.gain, args.thresh_db, args.min_mhz)
-        extra = [k for k in KNOWN.get(b, []) if all(abs(k - c) > 0.35 for c in found)]
+        extra = [k for k in known if all(abs(k - c) > 0.35 for c in found)]
         print("Band %d (%g-%g MHz): survey %.1fs, raised blocks %s -> try %s%s" % (
             b, lo, hi, time.time() - t0,
             ", ".join("%.1f-%.1f" % r for r in runs) if runs else "none",
@@ -288,7 +332,12 @@ def main():
     ap.add_argument("--low-if-mhz", type=float, default=0.6, help="tune off-centre to dodge DC (default 0.6)")
     ap.add_argument("--thresh-db", type=float, default=6.0, help="survey: dB above floor counts as raised")
     ap.add_argument("--min-mhz", type=float, default=4.0, help="survey: narrowest block that can be LTE")
-    ap.add_argument("--nudges", type=float, nargs="+", default=[0, 0.1, -0.1, 0.2, -0.2, 0.3, -0.3],
+    ap.add_argument("--discover", action="store_true",
+                    help="also survey each band for carriers not in the known UK list (new places; slower)")
+    ap.add_argument("--earfcns", type=int, nargs="+", help="decode these EARFCNs (e.g. 6300 1617), no survey")
+    ap.add_argument("--max-pci", type=int, default=3,
+                    help="decode up to this many PCIs per carrier, strongest first (default 3)")
+    ap.add_argument("--nudges", type=float, nargs="+", default=[0, 0.1, -0.1],
                     help="centre corrections (MHz) tried by the sync probe")
     ap.add_argument("--srsran-timeout", type=int, default=20, help="seconds per pdsch_ue attempt")
     ap.add_argument("--loop", action="store_true", help="repeat until Ctrl-C")
@@ -304,6 +353,8 @@ def main():
     passes = 0
     t_all = time.time()
     try:
+        if args.earfcns:
+            args.freqs = (args.freqs or []) + [mhz_of(e) for e in args.earfcns if mhz_of(e)]
         cands = sorted(set(args.freqs)) if args.freqs else None
         while True:
             passes += 1
@@ -315,15 +366,15 @@ def main():
             print(HEAD, flush=True)
             got = []
             for c in cands:
-                r = decode_carrier(c, args)
-                print(row(r), flush=True)
-                log_csv(args.csv, r, args.label)
-                if r.get("also_pci"):
-                    print("      also heard PCI %s (weaker cells on the same carrier)"
-                          % ", ".join(str(p) for p in r["also_pci"]), flush=True)
-                if r.get("status") == "OK":
-                    cells[(r["mhz"], r["cell_id"])] = r
-                    got.append(r)
+                for r in decode_carrier(c, args):
+                    print(row(r), flush=True)
+                    log_csv(args.csv, r, args.label)
+                    if r.get("also_pci"):
+                        print("      also heard PCI %s (not decoded, raise --max-pci)"
+                              % ", ".join(str(p) for p in r["also_pci"]), flush=True)
+                    if r.get("status") == "OK":
+                        cells[(r["mhz"], r["cell_id"])] = r
+                        got.append(r)
             if passes == 1 and not args.freqs:
                 # later passes only revisit carriers that had LTE sync (fast tracking)
                 live = sorted({round(r["mhz"], 1) for r in got})
