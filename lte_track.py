@@ -67,6 +67,7 @@ class Cell(object):
         self.checks = 0              # sector checks (sector_only cells)
         self.confirmed = 0
         self.missing = 0             # consecutive cycles not heard
+        self.offset = 0.0            # frequency offset from the last search that found it
         self.lost_reported = False
         self.files = 0               # IQ recordings it appears in
 
@@ -297,14 +298,25 @@ def recording(args, rate, secs):
         args.secs = keep
 
 
+def retry_due(args, cell, cycles):
+    """An unidentified PCI is tried every --retry-every cycles (default: every cycle) for --max-tries tries,
+    then every 10 cycles. A weak cell is decoded on some recordings and not others, so tries pay off."""
+    if cell.ident:
+        return False
+    every = args.retry_every if cell.tries < args.max_tries else max(args.retry_every, 10)
+    return cell.tries == 0 or cycles - cell.last_try >= every
+
+
 def work_due(args, cells, cycles):
     """True when this cycle needs a full-length recording: an unidentified PCI is due another srsRAN try,
     or the other sectors of a mast are due a check."""
     for cell in cells.values():
-        if cell.missing or cell.sector_only:
+        if cell.sector_only:
             continue
-        if not cell.ident and cell.tries < args.max_tries and cycles - cell.last_try >= args.retry_every:
+        if not cell.ident and cell.missing <= args.lost_after and retry_due(args, cell, cycles):
             return True
+        if cell.missing:
+            continue
         if cell.ident and not args.no_siblings:
             g = cell.pci // 3
             for sib in (3 * g, 3 * g + 1, 3 * g + 2):
@@ -411,7 +423,8 @@ def track(args):
                     print("%s  %s" % (C.c(C.now_stamp(), "grey"), C.c("PCI %d (%s) heard again" % (
                         pci, cell.label), "cyan")), flush=True)
                 cell.missing, cell.lost_reported = 0, False
-                heard[pci] = (cell, float(h.get("offset_hz", 0.0)), float(h["pss_ratio"]), cell.how)
+                cell.offset = float(h.get("offset_hz", 0.0))
+                heard[pci] = (cell, cell.offset, float(h["pss_ratio"]), cell.how)
             for cell in cells.values():
                 if cell.pci not in heard and not cell.sector_only:
                     cell.missing += 1
@@ -428,10 +441,13 @@ def track(args):
             # identify PCIs not decoded yet (first time at once, then every --retry-every cycles)
             aligned = {}
             want_rate = rate
-            for pci, (cell, offset, strength, how) in sorted(heard.items(), key=lambda kv: -kv[1][2]):
-                if cell.ident or not full:
-                    continue
-                if cell.tries and (cell.tries >= args.max_tries or cycles - cell.last_try < args.retry_every):
+            # a PCI the search missed this time but heard in the last few cycles is tried too (with its
+            # last known frequency offset): the short search window misses weak cells that are still there
+            todo = [(pci, v[0], v[1], v[2]) for pci, v in heard.items()]
+            todo += [(c.pci, c, c.offset, None) for c in cells.values() if c.pci not in heard and not c.ident
+                     and not c.sector_only and c.missing <= args.lost_after]
+            for pci, cell, offset, strength in sorted(todo, key=lambda t: -(t[3] or 0)):
+                if cell.ident or not full or not retry_due(args, cell, cycles):
                     continue
                 C.status("  cycle %d: decoding PCI %d with srsRAN..." % (cycles, pci))
                 cell.last_try = cycles
@@ -440,6 +456,9 @@ def track(args):
                 apply_result(cell, r)
                 if r.get("aligned") is not None:
                     aligned[pci] = r["aligned"]
+                if cell.ident and pci not in heard:              # decoded although the search missed it
+                    cell.last = time.time()
+                    heard[pci] = (cell, offset, None, cell.how)
                 C.clear_status()
                 print(result_line(cell, ", try %d" % cell.tries if cell.tries > 1 else ""), flush=True)
                 if cell.width:
@@ -589,9 +608,9 @@ def main():
     ap.add_argument("--iq-dir", default="~/field/iq", help="folder for IQ recordings (default ~/field/iq)")
     ap.add_argument("--iq-max-gb", type=float, default=20.0,
                     help="delete the oldest recordings above this total size, GB (default 20, 0 = no limit)")
-    ap.add_argument("--retry-every", type=int, default=3,
-                    help="re-try decoding an unidentified PCI every N cycles (default 3)")
-    ap.add_argument("--max-tries", type=int, default=5, help="srsRAN tries per unidentified PCI (default 5)")
+    ap.add_argument("--retry-every", type=int, default=1,
+                    help="re-try decoding an unidentified PCI every N cycles (default 1 = every cycle)")
+    ap.add_argument("--max-tries", type=int, default=10, help="tries at --retry-every before slowing to every 10 cycles (default 10)")
     ap.add_argument("--sector-every", type=int, default=10,
                     help="re-check the other sectors of each mast every N cycles (default 10)")
     ap.add_argument("--no-siblings", action="store_true", help="do not try the other sectors of each mast")
