@@ -76,7 +76,8 @@ class dual(gr.top_block):
 
     def _chains(self, freq):
         """Two fresh decoder chains (+ level meters) behind the source."""
-        self.dbg, self.probe, self.keep, self.sync = [], [], [], []
+        self.dbg, self.probe, self.keep, self.sync, self.parts = [], [], [], [], []
+        self.dbg_base, self.sync_base = [0, 0], [0, 0]
         self.edges, self.msg_edges = [], []
 
         def conn(*bl):
@@ -104,6 +105,7 @@ class dual(gr.top_block):
             syn = blocks.message_debug()
             mconn(rx, "C0", syn, "store")
             self.sync.append(syn)
+            self.parts.append((gi, rx, clk))
             # level meter: mean |x|^2 over ~0.1 s, and peak |x| (clipping check)
             mag = blocks.complex_to_mag_squared(1)
             avg = blocks.moving_average_ff(int(SAMP * 0.1), 1.0 / (SAMP * 0.1), 4000, 1)
@@ -121,29 +123,36 @@ class dual(gr.top_block):
 
     def synced(self, ch):
         try:
-            return self.sync[ch].num_messages() > 0
+            return self.sync[ch].num_messages() > self.sync_base[ch]
         except Exception:
             return False
 
     def retune(self, freq):
-        """Keep the radio open; new frequency + brand-new decoders (no carried-over clock correction)."""
+        """Keep the radio open and the decoders connected; give them the new frequency and reset them
+        (Owen's retune). Message counts are re-based so old messages are ignored."""
         try:
             self.stop()
             self.wait()
         except Exception:
             pass
-        # remove our connections one by one: disconnect_all() leaves gsm_input's inner filter behind
-        # ("fir_filter_blk ... insufficient connected")
-        for e in self.msg_edges:
-            self.msg_disconnect(*e)
-        for e in self.edges:
-            self.disconnect(*e)
         for ch in (0, 1):
             if self.kind == "soapy":
                 self.src.set_frequency(ch, freq)
             else:
                 self.src.set_center_freq(freq, ch)
-        self._chains(freq)
+        for gi, rx, clk in self.parts:
+            for blk, calls in ((gi, (("set_fc", freq),)), (clk, (("set_fc", freq), ("reset", None))),
+                               (rx, (("reset", None),))):
+                for name, arg in calls:
+                    fn = getattr(blk, name, None)
+                    if fn is None:
+                        continue
+                    try:
+                        fn() if arg is None else fn(arg)
+                    except Exception:
+                        pass
+        self.dbg_base = [d.num_messages() for d in self.dbg]
+        self.sync_base = [d.num_messages() for d in self.sync]
         self.start()
 
     def level(self, ch):
@@ -246,7 +255,7 @@ def sweep(args):
                 if kind and args.src == "auto":
                     args.src = kind              # keep the route that worked
                 t0 = time.time()
-                seen, got, text = [0, 0], set(), None
+                seen, got, text = list(getattr(tb, "dbg_base", [0, 0])), set(), None
                 nosync = False
                 while time.time() - t0 < args.dwell:
                     for ch in (0, 1):

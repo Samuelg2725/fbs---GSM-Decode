@@ -233,7 +233,10 @@ WIDEBAND --best RESULT 2026-11-25 13:32-13:42: decode itself found 6,13,22 (942.
   gsm_dual.py --quick: radio stays open (retune + disconnect_all + fresh decoder chains), and a channel is
   left after --sync-secs (1.2) if neither antenna has GSM sync (receiver C0 bursts). Pi 13:44: sync skip works
   (5/5, 33.5 s vs 39 s) but retune failed: disconnect_all() leaves gsm_input's inner FIR behind
-  ('insufficient connected') -> now disconnects each recorded edge; falls back to reopening if it fails.
+  ('insufficient connected'); per-edge disconnect then failed on msg_disconnect ('Port does not exist').
+  NOW: --quick keeps decoders connected (Owen-style retune: set_fc on gsm_input/clock, reset() where the
+  block has it, message counts re-based). Test = does the 9-channel list still find 5/5 (old retune bug
+  was only ever seen at gain 40).
 Also LTE: O2 816 MHz decoded = eNB 541524 sector 120 TAC 50496 PLMN 234-10 (matches phone).
 Next decode-rate candidates: restart threshold (2 s fixed now), fixed --ppm, gain/overload,
 unbounded message_debug memory on long runs.
