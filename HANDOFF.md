@@ -53,7 +53,7 @@ Wideband (ONE capture -> many channels):
 Lime (live, Owen's rig): python3 gsm_arfcn_fast.py --arfcn 13 --df   (osmosdr driver=lime + Kraken bearing)
 
 ## Files
-- lte_scan.py        LTE MULTI-BAND SCAN (2026-11-25): per band survey (100 kHz power bins) -> candidate
+- experimental_lte/lte_scan.py  (PARKED 15:xx - user reverted to basic lte_decode.py) LTE MULTI-BAND SCAN (2026-11-25): per band survey (100 kHz power bins) -> candidate
                      centres (+ known B20 793.5/798.5/806/816) -> 0.2 s capture, low-IF 0.6, Python PSS/SSS
                      probe with +-0.3 MHz digital nudges -> srsRAN pdsch_ue -p 50 (MIB) then re-read at the
                      cell's own rate (decimate for 5 MHz, re-capture 23.04/30.72 for 15/20 MHz) -> table +
@@ -82,7 +82,7 @@ Lime (live, Owen's rig): python3 gsm_arfcn_fast.py --arfcn 13 --df   (osmosdr dr
                      REMOVED (seed sweep + stride + near-check). gsm_neigh now = start cells given with
                      --arfcn, --follow, retry weak listed channels once (8 s). No start cell -> full sweep.
                      Re-uses the open BladeRF (old flowgraph kept until the new one runs).
-- lte_track.py       LTE TRACKING. Default = CAPTURE MODE: lock once (probe PCI/CFO, MIB -> RB), then loop
+- experimental_lte/lte_track.py (PARKED) LTE TRACKING. Default = CAPTURE MODE: lock once (probe PCI/CFO, MIB -> RB), then loop
                      0.1 s capture -> align (first 30 ms only) -> pdsch_ue stopped at first SIB1; re-lock
                      after 3 misses. --live = srsRAN live receiver: FAILED at home 12:5x (endless cell search,
                      'buffer size 1024' warnings; likely DC spike on centre, live srsRAN has no low-IF).
@@ -94,7 +94,7 @@ Lime (live, Owen's rig): python3 gsm_arfcn_fast.py --arfcn 13 --df   (osmosdr dr
   the whole capture; 1821.3 Three + 2144.7 O2 'MIB not decoded' -> --debug-dir saves pdsch_ue output;
   793.5/798.5/1846.7 EE no sync (weak, -84..-92). Speed: pdsch_ue now stopped as soon as SIB1 prints
   (--no-early-stop = old), --timing shows capture/probe/align/srsran split.
-- lte_decode.py      LTE/4G cell identity on the BladeRF. bladeRF-cli capture -> pure-Python decoder in
+- lte_decode.py      *** THE LTE TOOL (basic, unchanged since 10:58) *** LTE/4G cell identity on the BladeRF. bladeRF-cli capture -> pure-Python decoder in
                      "osprey 2" (lte_pci_search: PCI; lte_cellid + lte_sib1: MIB + SIB1 -> CellID, eNB,
                      sector, PLMN, TAC). No srsRAN. --freq-mhz/--earfcn, --rate auto (15.36 Msps,
                      re-captures at 23.04/30.72 for 15/20 MHz cells), --loop, --survey LO-HI (power map

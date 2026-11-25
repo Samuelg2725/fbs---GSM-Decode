@@ -26,6 +26,7 @@ import types
 
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # repo root (lte_decode.py)
 import lte_decode as L                     # capture(), condition(), osprey 2 path setup
 import hackrf_lte_decode as H              # Owen's srsRAN broadcast reader
 from lte_pci_search import search_samples

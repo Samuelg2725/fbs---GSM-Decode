@@ -46,6 +46,8 @@ def find_pdsch():
 def track_capture(args, mhz):
     """Lock once (PCI, frequency offset, bandwidth), then loop: short capture -> align -> pdsch_ue,
     stopped at the first SIB1. Same proven path as lte_scan.py, minus the per-capture sync search."""
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import lte_scan as S
     import lte_decode as L
     S.EARLY[0] = True
