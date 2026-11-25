@@ -208,6 +208,7 @@ class LibRadio(object):
 
 RADIO = [None]           # a LibRadio when the radio is kept open, else bladeRF-cli is used
 LAST_RAW = [None]        # int16 samples of the last capture (tuning transient removed), for saving
+KEEP_RAW = [False]       # lte_track.py sets this; lte_decode.py does not need the raw copy
 
 
 def capture_raw(freq_hz, rate, secs, gain, dual):
@@ -219,7 +220,7 @@ def capture_raw(freq_hz, rate, secs, gain, dual):
     if raw is None:
         return None
     raw = raw[int(rate * 0.01):]
-    LAST_RAW[0] = raw
+    LAST_RAW[0] = raw if KEEP_RAW[0] else None
     return raw
 
 
@@ -366,11 +367,25 @@ def search_cells(samples, rate, args):
 
 
 # ---------------------------------------------------------------------------------------- alignment
+def derotate(samples, cfo_hz, rate):
+    """Remove a constant frequency offset, in pieces and in single precision (the whole-recording version
+    needed several GB for a 2 s, two-antenna, 20 MHz recording)."""
+    samples = np.asarray(samples)
+    if abs(cfo_hz) < 1:
+        return samples.astype(np.complex64, copy=False)
+    out = np.empty(len(samples), np.complex64)
+    step = 1 << 20
+    for i in range(0, len(samples), step):
+        idx = np.arange(i, min(len(samples), i + step), dtype=np.float64)
+        out[i:i + len(idx)] = samples[i:i + len(idx)] * np.exp(-2j * np.pi * float(cfo_hz) * idx / float(rate))
+    return out
+
+
 def align_wide(samples, rate, pci, cfo_hz):
     """Start of subframe 0, found with the PSS/SSS at the capture's full rate (FFT size from the rate).
     The first 40 ms are searched first (fast); the whole capture only if that fails."""
-    from lte_cellid import _derotate, _locate_wide
-    corrected = _derotate(np.asarray(samples), cfo_hz, rate)
+    from lte_cellid import _locate_wide
+    corrected = derotate(samples, cfo_hz, rate)
     nfft = int(round(rate / 15000.0))
     start = _locate_wide(corrected[:int(rate * 0.04)], pci, nfft)
     if start is None and len(corrected) > int(rate * 0.04):
@@ -386,9 +401,9 @@ def align_narrow(samples, rate, pci, cfo_hz):
     found on its 5 ms comb, and the SSS is averaged over every repeat to tell subframe 0 from subframe 5."""
     import lte_sync as S
     from lte_pci_search import resample_to_lte
-    from lte_cellid import _derotate, _useful_wide, _subframe_wide, _refine_wide, symbol_useful_offset
+    from lte_cellid import _useful_wide, _subframe_wide, _refine_wide, symbol_useful_offset
     from lte_sync import _pss_freq, sss_freq
-    wide = _derotate(np.asarray(samples), cfo_hz, rate)
+    wide = derotate(samples, cfo_hz, rate)
     x = np.asarray(resample_to_lte(wide, rate), dtype=np.complex128)
     nid2, nid1 = pci % 3, pci // 3
     tpl = S.pss_time(nid2)
@@ -623,12 +638,26 @@ def decode_carrier(args, freq_mhz):
     rows = []
     if x1 is None:
         return [{"mhz": freq_mhz, "earfcn": earfcn, "band": band, "pci": None, "status": "capture failed"}]
-    for attempt in range(2):
-        results = _decode_capture(args, freq_mhz, rate, x1, x2)
+    rates_done = {rate}
+    best = {}                                    # pci -> best result over all recordings of this carrier
+    args._done_pcis = set()
+    for attempt in range(3):
+        for r in _decode_capture(args, freq_mhz, rate, x1, x2):
+            old = best.get(r["pci"])
+            if old is None or (r["ident"] and not old["ident"]) or (not old["ident"] and r["mib"] and not old["mib"]):
+                best[r["pci"]] = r
+        args._done_pcis = {p for p, r in best.items() if r["ident"]}
+        results = list(best.values())
         need = [carrier_rate(r["mib"]) for r in results if not r["ident"] and r["mib"]]
-        need += [30.72e6 for r in results if not r["ident"] and r["mib_odd"] and rate < 30.72e6]
-        if attempt == 0 and need and max(need) != rate:
+        if not need:                             # MIB read but its width not understood: try the widest
+            need = [30.72e6 for r in results if not r["ident"] and r["mib_odd"]]
+        need = [n for n in need if n not in rates_done]
+        if need:
             rate = max(need)
+            rates_done.add(rate)
+            x1 = x2 = None                       # free the old recording first
+            import gc
+            gc.collect()
             if rate > 15.36e6:
                 C.info("  a cell is wider than this capture - recording again at %.2f Msps" % (rate / 1e6))
             else:
@@ -673,7 +702,10 @@ def _decode_capture(args, freq_mhz, rate, x1, x2):
             line = "  PCI %-3d %s" % (r["pci"], C.c(r["status"], "yellow" if "MIB only" in r["status"] else "red"))
         print(line + C.c("   [%s%s]" % (r["how"], ", " + r["rx"] if r.get("rx") else ""), "grey"), flush=True)
 
+    tried |= set(getattr(args, "_done_pcis", ()))     # decoded from an earlier recording of this carrier
     for h in hits:
+        if int(h["pci"]) in tried:
+            continue
         if x2 is not None:
             w1, w2, share = cell_weights(x1, x2, rate, int(h["pci"]), float(h.get("offset_hz", 0.0)))
             r = decode_cell((w1 * x1 + w2 * x2).astype(np.complex64), rate, h, args, freq_mhz)
@@ -683,6 +715,8 @@ def _decode_capture(args, freq_mhz, rate, x1, x2):
         r["how"] = "weak-cell search" if h.get("weak") else ("RX2 only" if h.get("rx2_only") else "cell search")
         if r["ident"]:
             PPM.append(float(h.get("offset_hz", 0.0)) / (freq_mhz * 1e6))
+        else:
+            r.pop("aligned", None)               # only decoded cells' timing is used again (memory)
         tried.add(r["pci"])
         results.append(r)
         show(r)
@@ -693,6 +727,16 @@ def _decode_capture(args, freq_mhz, rate, x1, x2):
         if pci in tried:
             continue
         tried.add(pci)
+        parent = next((p for p in results if p["ident"] and p.get("aligned") is not None
+                       and p["pci"] // 3 == pci // 3), None)
+        if parent is not None:                   # same mast as a decoded cell: use its frame timing first
+            r = decode_cell(None, rate, {"pci": pci, "width": parent.get("mib")}, args, freq_mhz,
+                            aligned=parent["aligned"])
+            if r["ident"]:
+                r["how"] = "looked for (--cells), timing of PCI %d" % parent["pci"]
+                results.append(r)
+                show(r)
+                continue
         if hits:
             off = float(hits[0].get("offset_hz", 0.0))
         else:                                    # no cell here to measure it: use the radio's error seen so far
@@ -705,6 +749,8 @@ def _decode_capture(args, freq_mhz, rate, x1, x2):
         else:
             r = decode_cell(x1, rate, h, args, freq_mhz)
         r["how"] = "looked for (--cells)"
+        if not r["ident"]:
+            r.pop("aligned", None)
         if r["status"] == "frame timing not found":
             r["status"] = "not found"
         results.append(r)

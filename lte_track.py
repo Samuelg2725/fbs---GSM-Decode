@@ -653,6 +653,7 @@ def main():
             C.info("radio kept open between recordings (libbladeRF)")
         except Exception as e:
             C.warn("could not keep the radio open (%s) - using bladeRF-cli" % e)
+    L.KEEP_RAW[0] = True                         # raw samples are needed for the IQ files
     C.stop_on_first_ctrl_c()
     track(args)
     return 0
