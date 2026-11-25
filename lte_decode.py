@@ -117,76 +117,88 @@ def _cli_raw(freq_hz, rate, secs, gain, dual):
     return raw[:raw.size // (2 * chans) * 2 * chans].reshape(-1, 2 * chans)
 
 
-class SoapyRadio(object):
-    """Keeps the BladeRF open between captures (SoapySDR), saving the 1-2 s bladeRF-cli needs to open the
-    radio and load its FPGA on every capture. Used by lte_track.py."""
+class LibRadio(object):
+    """Keeps the BladeRF open between captures, through libbladeRF itself (the same library bladeRF-cli uses),
+    saving the time bladeRF-cli needs to open the radio on every capture. Used by lte_track.py --radio lib."""
+
+    RX_X1, RX_X2, SC16_Q11, GAIN_MGC = 0, 2, 0, 1
 
     def __init__(self, dual):
-        import SoapySDR                                    # python3-soapysdr
-        self.S = SoapySDR
-        with C.quiet():
-            found = [dict(d) for d in SoapySDR.Device.enumerate()]
-        blades = [d for d in found if "bladerf" in " ".join("%s=%s" % kv for kv in d.items()).lower()]
-        if not blades:
-            raise RuntimeError("SoapySDR sees no BladeRF (devices: %s)" % (
-                "; ".join(d.get("label", d.get("driver", "?")) for d in found) or "none"))
-        with C.quiet():
-            self.dev = SoapySDR.Device(blades[0])
-        self.chans = [0, 1] if dual else [0]
-        self.stream, self.rate, self.freq, self.gain = None, None, None, None
-        self.scale = 2048.0
+        import ctypes
+        import ctypes.util
+        self.ct = ctypes
+        path = os.path.join(BLADE_LIBS, "libbladeRF.so")
+        if not os.path.exists(path):
+            path = ctypes.util.find_library("bladeRF") or "libbladeRF.so.2"
+        lib = self.lib = ctypes.CDLL(path)
+        lib.bladerf_open.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p]
+        lib.bladerf_close.argtypes = [ctypes.c_void_p]
+        lib.bladerf_close.restype = None
+        lib.bladerf_strerror.restype = ctypes.c_char_p
+        lib.bladerf_set_frequency.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint64]
+        lib.bladerf_set_sample_rate.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint32,
+                                                ctypes.POINTER(ctypes.c_uint32)]
+        lib.bladerf_set_bandwidth.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint32,
+                                              ctypes.POINTER(ctypes.c_uint32)]
+        lib.bladerf_set_gain_mode.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        lib.bladerf_set_gain.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        lib.bladerf_sync_config.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+                                            ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]
+        lib.bladerf_enable_module.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_bool]
+        lib.bladerf_sync_rx.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p,
+                                        ctypes.c_uint]
+        self.dev = ctypes.c_void_p()
+        self._ok(lib.bladerf_open(ctypes.byref(self.dev), None), "open")
+        self.chans = [0, 2] if dual else [0]                  # BLADERF_CHANNEL_RX(0), BLADERF_CHANNEL_RX(1)
+        self.rate = self.freq = None
+        self.configured = False
+
+    def _ok(self, ret, what):
+        if ret < 0:
+            raise RuntimeError("libbladeRF %s failed: %s" % (what, self.lib.bladerf_strerror(ret).decode()))
 
     def raw(self, freq_hz, rate, secs, gain):
-        S, dev = self.S, self.dev
-        if rate != self.rate:
-            if self.stream is not None:
-                dev.closeStream(self.stream)
-                self.stream = None
+        ct, lib, dev = self.ct, self.lib, self.dev
+        try:
+            if rate != self.rate:
+                for ch in self.chans:
+                    self._ok(lib.bladerf_set_sample_rate(dev, ch, int(rate), None), "set sample rate")
+                    self._ok(lib.bladerf_set_bandwidth(dev, ch, int(min(rate * 0.9, 56e6)), None), "set bandwidth")
+                self.rate = rate
+            if freq_hz != self.freq:
+                for ch in self.chans:
+                    self._ok(lib.bladerf_set_frequency(dev, ch, int(freq_hz)), "set frequency")
+                self.freq = freq_hz
+            if not self.configured:
+                self._ok(lib.bladerf_sync_config(dev, self.RX_X2 if len(self.chans) == 2 else self.RX_X1,
+                                                 self.SC16_Q11, 64, 16384, 16, 5000), "configure stream")
+                self.configured = True
             for ch in self.chans:
-                dev.setSampleRate(S.SOAPY_SDR_RX, ch, rate)
-                dev.setBandwidth(S.SOAPY_SDR_RX, ch, min(rate * 0.9, 56e6))
-            self.rate = rate
-        if freq_hz != self.freq:
+                self._ok(lib.bladerf_set_gain_mode(dev, ch, self.GAIN_MGC), "set manual gain")
+                self._ok(lib.bladerf_set_gain(dev, ch, int(gain)), "set gain")
+            n = int(rate * (secs + 0.01))
+            nch = len(self.chans)
+            buf = np.empty((n, 2 * nch), np.int16)             # with two channels: I1 Q1 I2 Q2 per sample
             for ch in self.chans:
-                dev.setFrequency(S.SOAPY_SDR_RX, ch, freq_hz)
-            self.freq = freq_hz
-        if gain != self.gain:
-            for ch in self.chans:
-                dev.setGainMode(S.SOAPY_SDR_RX, ch, False)
-                dev.setGain(S.SOAPY_SDR_RX, ch, gain)
-            self.gain = gain
-        if self.stream is None:
-            self.stream = dev.setupStream(S.SOAPY_SDR_RX, S.SOAPY_SDR_CS16, self.chans)
-        n = int(rate * (secs + 0.01))
-        bufs = [np.empty((n, 2), np.int16) for _ in self.chans]
-        for _try in range(3):
-            dev.activateStream(self.stream)
-            got, ok = 0, True
-            while got < n:
-                sr = dev.readStream(self.stream, [b[got:] for b in bufs], n - got, timeoutUs=2000000)
-                if sr.ret > 0:
-                    got += sr.ret
-                elif sr.ret == S.SOAPY_SDR_TIMEOUT:
-                    continue
-                else:                                      # overflow: samples lost, the timing would break
-                    ok = False
-                    break
-            dev.deactivateStream(self.stream)
-            if ok:
-                return np.hstack(bufs)
-        C.warn("  capture failed: the radio kept dropping samples")
-        return None
+                self._ok(lib.bladerf_enable_module(dev, ch, True), "start receiving")
+            try:
+                self._ok(lib.bladerf_sync_rx(dev, buf.ctypes.data_as(ct.c_void_p), n * nch, None,
+                                             int(secs * 1000 + 5000)), "receive")
+            finally:
+                for ch in self.chans:
+                    lib.bladerf_enable_module(dev, ch, False)
+            return buf
+        except RuntimeError as e:
+            C.warn("  capture failed: %s" % e)
+            return None
 
     def close(self):
-        try:
-            if self.stream is not None:
-                self.dev.closeStream(self.stream)
-        except Exception:
-            pass
-        self.dev = None
+        if self.dev:
+            self.lib.bladerf_close(self.dev)
+            self.dev = None
 
 
-RADIO = [None]           # a SoapyRadio when the radio is kept open, else bladeRF-cli is used
+RADIO = [None]           # a LibRadio when the radio is kept open, else bladeRF-cli is used
 LAST_RAW = [None]        # int16 samples of the last capture (tuning transient removed), for saving
 
 

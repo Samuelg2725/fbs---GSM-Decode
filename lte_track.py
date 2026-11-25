@@ -357,12 +357,19 @@ def track(args):
                 x1, x2 = L.auto_gain(args, args.freq_mhz_now, rate, x1, x2)
                 L.SHOW_LEVELS[0] = False
             if x1 is None:
+                cycles -= 1
                 fails += 1
-                if fails >= 3 and L.RADIO[0] is not None:
+                if fails >= 2 and L.RADIO[0] is not None:
                     C.warn("  the open radio keeps failing - switching to bladeRF-cli (slower) for the rest")
                     L.RADIO[0].close()
                     L.RADIO[0] = None
                     fails = 0
+                elif fails >= 5:
+                    C.warn("Stopping: the BladeRF could not be used 5 times in a row. Check that it is plugged in "
+                           "and that no other program is using it (bladeRF-cli -p lists it; "
+                           "ps aux | grep -i -e blade -e gsm -e lte shows other users).")
+                    break
+                time.sleep(1.0)
                 continue
             fails = 0
             peak = L.LAST_PEAK[0]
@@ -586,8 +593,9 @@ def main():
     ap.add_argument("--no-siblings", action="store_true", help="do not try the other sectors of each mast")
     ap.add_argument("--lost-after", type=int, default=3, help="report a PCI as not heard after N cycles")
     ap.add_argument("--table-every", type=int, default=20, help="print the table every N cycles (0 = only at the end)")
-    ap.add_argument("--radio", choices=("auto", "soapy", "cli"), default="auto",
-                    help="auto (default): keep the radio open with SoapySDR if available, else bladeRF-cli")
+    ap.add_argument("--radio", choices=("cli", "lib"), default="cli",
+                    help="cli (default): bladeRF-cli for every recording; lib: keep the radio open between "
+                         "recordings with libbladeRF (faster, newer)")
     ap.add_argument("--low-if-mhz", type=float, default=0.6, help="tune this far above the carrier (default 0.6)")
     ap.add_argument("--search-secs", type=float, default=0.08, help="recording length used for the search, s")
     ap.add_argument("--no-weak-search", action="store_true", help="skip the search for weaker cells")
@@ -616,15 +624,12 @@ def main():
         args.freq_mhz_now = args.freq_mhz
         args.earfcn_now, band = L.mhz_to_earfcn(args.freq_mhz)
     C.heading("LTE tracking   EARFCN %s   %.1f MHz   band %s" % (args.earfcn_now, args.freq_mhz_now, band or "?"))
-    if args.radio != "cli":
+    if args.radio == "lib":
         try:
-            L.RADIO[0] = L.SoapyRadio(args.dual)
-            C.info("radio kept open between recordings (SoapySDR)")
+            L.RADIO[0] = L.LibRadio(args.dual)
+            C.info("radio kept open between recordings (libbladeRF)")
         except Exception as e:
-            if args.radio == "soapy":
-                sys.exit("could not open the BladeRF with SoapySDR: %s" % e)
-            C.info("SoapySDR python module not usable (%s) - using bladeRF-cli (about 1-2 s slower per cycle; "
-                   "sudo apt install python3-soapysdr to speed up)" % (str(e).splitlines() or ["?"])[0])
+            C.warn("could not keep the radio open (%s) - using bladeRF-cli" % e)
     C.stop_on_first_ctrl_c()
     track(args)
     return 0

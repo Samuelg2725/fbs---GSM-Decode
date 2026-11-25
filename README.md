@@ -103,8 +103,8 @@ EARFCN carries many cells (different PCIs); this shows them all as they come and
   the oldest recordings are deleted above `--iq-max-gb` (default 20).
 - Cycles that only check which PCIs are present use a short 0.2 s recording (`--watch-secs`); a full 1 s
   recording is taken when something must be decoded or saved. Each line shows the record and search times.
-  Installing `python3-soapysdr` (`sudo apt install python3-soapysdr`) keeps the radio open between recordings
-  and saves 1–2 s per cycle; without it bladeRF-cli is used.
+  `--radio lib` keeps the radio open between recordings (through libbladeRF) instead of starting bladeRF-cli
+  each time, which saves about 1 s per cycle.
 - On Ctrl-C: a table of every PCI (identity, how often heard, strength, first/last seen), plus
   `~/field/lte_track_summary.csv` and a per-cycle log `~/field/lte_track_log.csv`.
 
