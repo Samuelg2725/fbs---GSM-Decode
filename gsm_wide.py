@@ -31,12 +31,15 @@ STOP_EARLY = False       # --stop-early: stop a channel as soon as its cell ID (
 PROBE_SECS = 2.0         # --probe-secs: give up on a channel if no sync within this much capture
 RETRIES = 0              # --retries: re-decode channels that synced but gave no cell ID
 HAVE_PROGRESS = True
-GAIN2 = None             # --gain2: bladerf RX2 at this gain, captured together with RX1 (two antennas)     # set False if this GNU Radio can't report samples processed
+GAIN2 = None             # --gain2: bladerf RX2 at this gain, captured together with RX1 (two antennas)
+EDGE = 1.0e6             # --edge-mhz: skip channels this close to the capture edge (analog filter roll-off)
+GATE = None              # --gate DB: skip channels whose power is less than DB above the noise floor
+POWER = {}               # arfcn -> dB above floor, from power_map()
 
 def channels():
     """Every UK GSM downlink channel inside the capture: E-GSM900 (Owen's list) + DCS1800."""
-    lo = CENTER - RATE / 2 + 0.3e6
-    hi = CENTER + RATE / 2 - 0.3e6
+    lo = CENTER - RATE / 2 + EDGE
+    hi = CENTER + RATE / 2 - EDGE
     found = []
     for n in range(975, 1024):
         freq = 935e6 + 0.2e6 * (n - 1024)
@@ -197,6 +200,68 @@ def capture_bladerf_dual(n):
         print("  %s level %.1f dBFS, peak %.2f%s" % (name, 10 * np.log10(np.mean(x * x) / 2048.0 ** 2 * 2 + 1e-20),
               pk, "  CLIPPING" if pk >= 0.99 else ""), flush=True)
     return size // 8
+
+
+def read_iq(path, start, count):
+    import numpy as np
+    if FMT == "sc16":
+        raw = np.fromfile(path, dtype=np.int16, count=2 * count, offset=4 * start).astype(np.float32) / 2048.0
+        return raw[0::2] + 1j * raw[1::2]
+    return np.fromfile(path, dtype=np.complex64, count=count, offset=8 * start)
+
+
+def power_map(path, n_in, chans):
+    """Average spectrum of the capture -> dB above the noise floor for every channel.
+    A GSM beacon (C0) transmits all the time, so a live cell always shows here."""
+    import numpy as np
+    nfft = 1 << int(np.ceil(np.log2(RATE / 7.5e3)))          # ~7.5 kHz bins
+    acc = np.zeros(nfft)
+    blocks_done = 0
+    for k in range(8):                                        # 8 slices spread over the capture
+        start = int(k * max(0, n_in - nfft * 64) / 8)
+        x = read_iq(path, start, nfft * 64)
+        if len(x) < nfft * 64:
+            continue
+        x = x.reshape(64, nfft) * np.hanning(nfft)
+        acc += (np.abs(np.fft.fftshift(np.fft.fft(x, axis=1), axes=1)) ** 2).mean(axis=0)
+        blocks_done += 1
+    if not blocks_done:
+        return {}
+    axis = (np.arange(nfft) - nfft / 2) * RATE / nfft
+    pw = {}
+    for a, f in chans:
+        sel = np.abs(axis - (f - CENTER)) <= 80e3
+        pw[a] = 10 * np.log10(acc[sel].mean() + 1e-30)
+    floor = np.percentile(list(pw.values()), 20) if pw else 0.0
+    return {a: v - floor for a, v in pw.items()}
+
+
+def auto_gain():
+    """Short test recording at gain 20; pick the gain that puts the strongest signal at ~-6 dBFS peak."""
+    import numpy as np
+    test = "/dev/shm/gsm_wide_gaintest.sc16"
+    n = int(RATE * 0.05)
+    cmd = ["bladeRF-cli", "-e", "set agc off", "-e", "set frequency rx %d" % int(CENTER),
+           "-e", "set samplerate rx %d" % int(RATE), "-e", "set bandwidth rx %d" % int(min(RATE * 0.9, 56e6)),
+           "-e", "set gain rx 20",
+           "-e", "rx config file=%s format=bin n=%d samples=16384 buffers=64 xfers=16 timeout=20000" % (test, n),
+           "-e", "rx start", "-e", "rx wait 15000"]
+    env = dict(os.environ)
+    env["LD_LIBRARY_PATH"] = BLADE_LIBS + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+    subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        x = np.fromfile(test, dtype=np.int16).astype(np.float32) / 2048.0
+        os.remove(test)
+    except OSError:
+        return 20.0
+    x = x[int(len(x) * 0.2):]                                  # skip the start-up transient
+    peak = float(np.percentile(np.abs(x), 99.99)) if len(x) else 0.0
+    if peak <= 0:
+        return 20.0
+    g = 20.0 + 20 * np.log10(0.5 / peak)
+    g = float(max(0.0, min(60.0, round(g))))
+    print("auto gain: test at 20 peaked %.2f of full scale -> gain %g" % (peak, g), flush=True)
+    return g
 
 
 def capture():
@@ -371,6 +436,42 @@ def decode(n_in, arfcn, freq):
             status = "decoded on retry"
     return lines, status
 
+def rescue(arfcns, gains, unique):
+    """Narrow, filtered, two-antenna retry (gsm_dual.py sweep) on channels with signal but no cell ID."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(here, "gsm_dual.py")
+    if not os.path.isfile(script):
+        script = os.path.expanduser("~/gsm_dual.py")
+    g1, g2 = (gains.split(",") + ["45"])[:2]
+    cmd = [sys.executable, script, "--arfcn"] + [str(a) for a in arfcns] + \
+          ["--gain1", g1, "--gain2", g2, "--bw", "300e3", "--dwell", "3"]
+    print("\n===== rescue: %d channel(s) with signal but no cell ID -> narrow 300 kHz filter, RX1 g%s + RX2 g%s ====="
+          % (len(arfcns), g1, g2), flush=True)
+    print("  " + " ".join(str(a) for a in arfcns), flush=True)
+    added = []
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    in_summary = False
+    for line in p.stdout:
+        line = line.rstrip("\n")
+        if "bladerf_close" in line:
+            continue
+        print("  | " + line, flush=True)
+        if line.startswith("====="):
+            in_summary = True
+        if in_summary and "ARFCN:" in line and "CID:" in line:
+            plain = re.sub("\x1b\\[[0-9;]*m", "", line.split("] ", 1)[-1]).strip()
+            try:
+                a = int(plain.split("ARFCN:")[1].split(",")[0])
+                cid = plain.split("CID:")[1].split(",")[0].strip()
+            except (IndexError, ValueError):
+                continue
+            if (a, cid) not in unique:
+                unique[(a, cid)] = plain
+                added.append((a, cid))
+    p.wait()
+    return added
+
+
 def decode_all(n_in, chans, tag=None):
     """Decode every channel in chans from PATH. Returns (unique, cells, status_count, status_time, synced_only)."""
     cells = 0
@@ -380,6 +481,12 @@ def decode_all(n_in, chans, tag=None):
         print("%s%d/%d  ARFCN %d  %.1f MHz" % ("[%s] " % tag if tag else "", index, len(chans), arfcn, freq / 1e6),
               flush=True)
         t0 = time.time()
+        if GATE is not None and POWER and POWER.get(arfcn, 99.0) < GATE:
+            status = "below power gate"
+            status_count[status] = status_count.get(status, 0) + 1
+            status_time[status] = status_time.get(status, 0.0)
+            print("  no signal (%.1f dB above floor < %g) - skipped" % (POWER.get(arfcn, 0.0), GATE), flush=True)
+            continue
         lines, status = decode(n_in, arfcn, freq)
         took = time.time() - t0
         status_count[status] = status_count.get(status, 0) + 1
@@ -415,10 +522,23 @@ def main():
     ap.add_argument("--rate", type=float, default=None, help="sample rate (default 40e6)")
     ap.add_argument("--center", type=float, default=None, help="centre MHz (default 942.5)")
     ap.add_argument("--secs", type=float, default=None, help="capture seconds (default 2)")
-    ap.add_argument("--gain", type=float, default=None, help="default 50 lime / 20 bladerf (40 overloaded strong cells at home)")
-    ap.add_argument("--gain2", type=float, default=None,
+    ap.add_argument("--gain", default=None,
+                    help="default 50 lime / 20 bladerf (40 overloaded strong cells at home); 'auto' = measured per slice")
+    ap.add_argument("--gain2", default=None,
                     help="bladerf: ALSO record RX2 (second antenna) at this gain; RX2 is decoded only on channels "
                          "where RX1 found no cell (e.g. --gain 20 --gain2 45)")
+    ap.add_argument("--edge-mhz", type=float, default=1.0,
+                    help="skip channels this close to the capture edge, where the radio filter weakens them "
+                         "(default 1.0; was 0.3). Slices 11.6 MHz apart at 15.36 Msps still overlap")
+    ap.add_argument("--gate", type=float, default=None,
+                    help="skip channels whose power is less than this many dB above the noise floor (e.g. 6)")
+    ap.add_argument("--rescue", action="store_true",
+                    help="after decoding, retry every channel that has signal but no cell ID with the narrow "
+                         "two-antenna method (gsm_dual.py, narrow filter)")
+    ap.add_argument("--rescue-db", type=float, default=6.0, help="--rescue: signal threshold above floor (default 6)")
+    ap.add_argument("--rescue-gains", default="20,45", help="--rescue: RX1,RX2 gains (default 20,45)")
+    ap.add_argument("--best", action="store_true",
+                    help="= --fast --gain auto --gate 6 --rescue (accuracy-first wideband)")
     ap.add_argument("--format", choices=["auto", "cfile", "sc16"], default="auto",
                     help="file format; auto = .sc16 extension -> sc16, else cfile")
     ap.add_argument("--skip-empty", action="store_true",
@@ -431,7 +551,15 @@ def main():
     ap.add_argument("--probe-secs", type=float, default=2.0,
                     help="--skip-empty gives up if no sync within this much capture (default 2.0)")
     args = ap.parse_args()
-    global SKIP_EMPTY, STOP_EARLY, PROBE_SECS, RETRIES, GAIN2
+    global SKIP_EMPTY, STOP_EARLY, PROBE_SECS, RETRIES, GAIN2, EDGE, GATE, POWER
+    if args.best:
+        args.fast, args.rescue = True, True
+        if args.gain is None:
+            args.gain = "auto"
+        if args.gate is None:
+            args.gate = 6.0
+    EDGE = args.edge_mhz * 1e6
+    GATE = args.gate
     GAIN2 = args.gain2 if (args.gain2 is not None and args.radio == "bladerf" and not args.file) else None
     SKIP_EMPTY = args.skip_empty or args.fast
     STOP_EARLY = args.stop_early or args.fast
@@ -444,7 +572,14 @@ def main():
         CENTER = args.center * 1e6
     if args.secs is not None:
         SECS = args.secs
-    GAIN = args.gain if args.gain is not None else (20.0 if RADIO == "bladerf" else 50.0)   # bladerf 40 overloads
+    auto = str(args.gain).lower() == "auto"
+    GAIN = 20.0 if (args.gain is None or auto) else float(args.gain)   # bladerf 40 overloads
+    if (args.gain is None or auto) and RADIO != "bladerf":
+        GAIN = 50.0
+    if auto and RADIO == "bladerf" and not args.file:
+        GAIN = auto_gain()
+    if GAIN2 is not None:
+        GAIN2 = min(60.0, GAIN + 20.0) if str(GAIN2).lower() == "auto" else float(GAIN2)
     if args.file:
         PATH = os.path.abspath(os.path.expanduser(args.file))
     elif RADIO == "bladerf":
@@ -464,7 +599,14 @@ def main():
         if not n_in:
             return 1
     chans = channels()
+    POWER = power_map(PATH, n_in, chans)
+    if POWER:
+        live = sorted((a for a in POWER if POWER[a] >= 6.0), key=lambda a: -POWER[a])
+        print("signal above floor (>=6 dB): " + ("  ".join("%d:%.0f" % (a, POWER[a]) for a in live[:30]) or "none"),
+              flush=True)
     mode = []
+    if GATE is not None:
+        mode.append("power gate %g dB" % GATE)
     if SKIP_EMPTY:
         mode.append("skip-empty (probe %.1fs)" % PROBE_SECS)
     if STOP_EARLY:
@@ -495,12 +637,23 @@ def main():
             status_time["RX2 " + k] = st2[k]
         synced_only = [x for x in synced_only if x[0] not in {a for a, _ in u2}] + \
             [x for x in so2 if x[0] not in {a for a, _ in synced_only}]
+    rescued = []
+    if args.rescue and RADIO == "bladerf" and not args.file:
+        have = {a for (a, _cid) in unique}
+        cand = sorted({a for a in POWER if POWER[a] >= args.rescue_db and a not in have} |
+                      {a for a, _f in synced_only if a not in have})
+        if cand:
+            rescued = rescue(cand, args.rescue_gains, unique)
+            synced_only = [x for x in synced_only if x[0] not in {a for a, _ in rescued}]
+        else:
+            print("\nrescue: no channel with signal is missing a cell ID", flush=True)
     dec_secs = time.time() - t_dec
     print("cells", cells, flush=True)
     print("")
     print("===== %d unique cell(s) =====" % len(unique), flush=True)
     for key in sorted(unique, key=lambda k: (k[0] < 900, k[0])):
-        print("  " + unique[key] + ("   <- RX2 only" if key in rx2_added else ""), flush=True)
+        print("  " + unique[key] + ("   <- RX2 only" if key in rx2_added else "") +
+              ("   <- narrow rescue" if key in rescued else ""), flush=True)
     if GAIN2 is not None:
         print("RX1 (gain %g) found %d, RX2 (gain %g) added %d" % (GAIN, len(unique) - len(rx2_added), GAIN2,
               len(rx2_added)), flush=True)
