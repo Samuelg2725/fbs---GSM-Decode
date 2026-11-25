@@ -54,6 +54,13 @@ LAST_PEAK = [0.0]
 UK_BANDS = (20, 8, 3, 1, 7, 28, 32, 38, 40)
 
 
+def carrier_rate(n_rb):
+    """Best recording rate once a carrier's width is known: just wide enough for it, so a stronger neighbouring
+    carrier is left outside the radio's filter and the gain can rise for weak cells. 5 MHz and narrower ->
+    7.68 Msps (with the 0.6 MHz low IF the cell still fits), 10 -> 15.36, 15 -> 23.04, 20 -> 30.72 Msps."""
+    return 7.68e6 if n_rb <= 25 else needed_rate(n_rb)
+
+
 def needed_rate(n_rb):
     for rate, max_rb in RATES:
         if n_rb <= max_rb:
@@ -495,7 +502,7 @@ def decode_cell(samples, rate, hit, args, freq_mhz, aligned=None):
     try:
         aligned.tofile(path)
         n_sf = max(40, len(aligned) // max(1, int(round(rate / 1000.0))))
-        own = {15360000: 50, 23040000: 75, 30720000: 100}.get(int(round(rate)), 50)
+        own = {7680000: 25, 15360000: 50, 23040000: 75, 30720000: 100}.get(int(round(rate)), 50)
         order = [own] + [w for w in (50, 25, 75, 100) if w != own]
         if hit.get("width") in order:                        # width already known from an earlier MIB
             order.remove(hit["width"])
@@ -616,12 +623,16 @@ def decode_carrier(args, freq_mhz):
         return [{"mhz": freq_mhz, "earfcn": earfcn, "band": band, "pci": None, "status": "capture failed"}]
     for attempt in range(2):
         results = _decode_capture(args, freq_mhz, rate, x1, x2)
-        need = [needed_rate(r["mib"]) for r in results if not r["ident"] and r["mib"] and r["mib"] > 50]
+        need = [carrier_rate(r["mib"]) for r in results if not r["ident"] and r["mib"]]
         need += [30.72e6 for r in results if not r["ident"] and r["mib_odd"] and rate < 30.72e6]
-        if attempt == 0 and need and max(need) > rate:
+        if attempt == 0 and need and max(need) != rate:
             rate = max(need)
-            C.info("  a cell is wider than this capture - recording again at %.2f Msps" % (rate / 1e6))
-            x1, x2 = record(args, freq_mhz, rate)
+            if rate > 15.36e6:
+                C.info("  a cell is wider than this capture - recording again at %.2f Msps" % (rate / 1e6))
+            else:
+                C.info("  the carrier is %s MHz wide - recording just that (%.2f Msps) so the gain can rise for it"
+                       % (BW_MHZ.get(min(r["mib"] for r in results if r["mib"]), "?"), rate / 1e6))
+            x1, x2 = auto_gain(args, freq_mhz, rate, *record(args, freq_mhz, rate))
             if x1 is None:
                 break
             continue
@@ -681,7 +692,7 @@ def _decode_capture(args, freq_mhz, rate, x1, x2):
                 if sib in tried:
                     continue
                 tried.add(sib)
-                r = decode_cell(None, rate, {"pci": sib}, args, freq_mhz, aligned=parent["aligned"])
+                r = decode_cell(None, rate, {"pci": sib, "width": parent.get("mib")}, args, freq_mhz, aligned=parent["aligned"])
                 r["how"] = "sector of PCI %d's mast" % parent["pci"]
                 if r["ident"] or args.show_failed_siblings:
                     results.append(r)

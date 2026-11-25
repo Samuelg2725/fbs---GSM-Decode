@@ -340,6 +340,7 @@ def track(args):
     writer = IQWriter(args.iq_dir, args.iq_max_gb) if args.save_iq != "none" else None
     log = CycleLog(args.log)
     fails = 0
+    regain = False
     C.info("Tracking EARFCN %s (%.1f MHz), %s, %.1f s recordings. IQ: %s. Ctrl-C to stop." % (
         args.earfcn_now, args.freq_mhz_now, "both antennas" if args.dual else "RX1",
         args.secs, {"new": "saved when a new PCI appears, in " + args.iq_dir, "all": "every recording saved, in " +
@@ -352,7 +353,8 @@ def track(args):
             C.status("  cycle %d: recording..." % cycles)
             t_capture = time.time()
             x1, x2 = recording(args, rate, args.secs if full else args.watch_secs)
-            if cycles == 1:
+            if cycles == 1 or regain:
+                regain = False
                 L.SHOW_LEVELS[0] = True
                 x1, x2 = L.auto_gain(args, args.freq_mhz_now, rate, x1, x2)
                 L.SHOW_LEVELS[0] = False
@@ -440,8 +442,8 @@ def track(args):
                     aligned[pci] = r["aligned"]
                 C.clear_status()
                 print(result_line(cell, ", try %d" % cell.tries if cell.tries > 1 else ""), flush=True)
-                if not cell.ident and cell.width and L.needed_rate(cell.width) > rate:
-                    want_rate = max(want_rate, L.needed_rate(cell.width))
+                if cell.width:
+                    want_rate = L.carrier_rate(cell.width)
 
             # the other sectors of each decoded mast (same frame timing) - new masts at once, then every
             # --sector-every cycles to confirm they are still there
@@ -470,7 +472,7 @@ def track(args):
                         if aligned[parent] is None:
                             continue
                         C.status("  cycle %d: trying PCI %d (sector of PCI %d's mast)..." % (cycles, sib, parent))
-                        r = L.decode_cell(None, rate, {"pci": sib}, args, args.freq_mhz_now, aligned=aligned[parent])
+                        r = L.decode_cell(None, rate, {"pci": sib, "width": cells[parent].width}, args, args.freq_mhz_now, aligned=aligned[parent])
                         if cell is None and not r["ident"]:
                             continue
                         if cell is None:
@@ -538,10 +540,12 @@ def track(args):
                 elif 0 < peak < 0.12 and args.gain_now < 60:
                     args.gain_now = min(60.0, args.gain_now + 6)
                     C.info("  signal low - gain raised to %g dB" % args.gain_now)
-            if want_rate > rate:
+            if want_rate != rate:
                 rate = want_rate
-                C.info("  a cell is %s MHz wide - recording at %.2f Msps from now on" % (
-                    max(L.BW_MHZ.get(c.width, 0) for c in cells.values()), rate / 1e6))
+                C.info("  the carrier is %s MHz wide - recording %.2f Msps from now on%s" % (
+                    L.BW_MHZ.get(max(c.width or 0 for c in cells.values()), "?"), rate / 1e6,
+                    " (only this carrier, so the gain can rise for weak cells)" if rate < 15.36e6 else ""))
+                regain = True
                 for cell in cells.values():
                     if not cell.ident:
                         cell.tries, cell.last_try = 0, -999
