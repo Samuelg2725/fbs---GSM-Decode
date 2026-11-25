@@ -202,6 +202,10 @@ Flash firmware v2.6.0. Copy gsm_arfcn_clean.py to /home/<user>/.
 
 
 ## LTE srsRAN (for lte_decode.py --engine srsran)
+*** LTE DECODE CONFIRMED 2026-11-25 10:57 (home): BladeRF capture at 806 MHz (15.36 Msps, low-IF 0.6)
+-> srsRAN pdsch_ue file mode -> SIB1 cell identity 4968724 = eNB 19409 sector 20, TAC 57379,
+PLMN 234-15 (Vodafone). eNB + TAC match the phone scanner exactly. 10 SIB1s in a 0.2 s capture
+(SIB1 every 20 ms) = every one decoded. The all-Python MIB decoder still fails by 3-5 bits on air.
 First on-air test 2026-11-25 (home, 800 MHz): survey found 10 MHz carriers at 801-811 (centre 806)
 and 811.5-821 (centre 816). Python engine found PCI 21 @806 and PCI 1 @816 but MIB failed by 3-5
 bits every time (also with --low-if-mhz 0.6). Owen's on-air HackRF path used srsRAN pdsch_ue for
