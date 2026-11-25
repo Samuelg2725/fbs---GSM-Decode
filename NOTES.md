@@ -50,6 +50,11 @@ Test location: home, November 2026. Reference: a phone network-monitor app at th
   793.5 MHz cells (−93 dBm on the phone) are at the detection limit; O2 2144.7 MHz syncs but its MIB does
   not decode (cause not found).
 
+- **Tracking one carrier (`lte_track.py`):** identities are decoded once per PCI; later cycles only run the
+  cell search (~1.5 s) to see which PCIs are present, so a cycle is ~2–4 s. Raw IQ is kept as SigMF with each
+  PCI's subframe-0 position, for re-decoding or direction finding (RX1/RX2 share one tuner, so `--dual`
+  recordings keep the phase between antennas).
+
 ## Tried and removed
 
 Wideband GSM with rescue pass, keep-open GSM retune, srsRAN live mode, the all-Python LTE MIB decoder,

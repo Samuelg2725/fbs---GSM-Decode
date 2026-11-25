@@ -30,6 +30,8 @@ export LD_LIBRARY_PATH=/usr/local/lib
 | Decode LTE carriers by frequency | `python3 lte_decode.py --freq-mhz 806 816 952.5` |
 | Decode LTE carriers by channel number | `python3 lte_decode.py --earfcn 6300 6400 3725 223` |
 | Decode LTE with both antennas | `python3 lte_decode.py --freq-mhz 816 --dual` |
+| Watch every LTE cell on one carrier, saving raw IQ | `python3 lte_track.py --earfcn 6400` |
+| …the same with both antennas (for direction finding) | `python3 lte_track.py --earfcn 6400 --dual` |
 
 Press **Ctrl-C** at any time: the tool stops cleanly and prints its summary table.
 Add `--help` to any command to see all options.
@@ -82,6 +84,29 @@ It automatically:
 Results go to `~/field/lte_cells.csv`. Useful options: `--dual` (both antennas), `--secs 2` (longer recording
 for weak sectors), `--no-auto-gain --gain N`.
 
+### Tracking one carrier (`lte_track.py`)
+Stays on one EARFCN and repeats: record → find every PCI → decode any PCI not identified yet. In a city one
+EARFCN carries many cells (different PCIs); this shows them all as they come and go:
+
+```
+14:02:11.120  NEW PCI 117 (strength 9, weak-cell search)
+           PCI 117 decoded  Cell ID 4968730 (eNB 19409, sector 26)  TAC 57379  Vodafone 234-15   [weak-cell search]
+14:02:11.400  #12   2.6s  gain 20 -21 dBFS  PCI 1 O2 138630264 [22]  PCI 117 Vodafone 4968730 [9]  PCI 0 O2 138630254 [sector]   IQ saved
+14:02:20.700  PCI 117 (Vodafone 4968730) not heard for 3 cycles
+```
+
+- **Raw IQ** is saved in `~/field/iq/` (SigMF: `.sigmf-data` 16-bit I/Q + `.sigmf-meta` JSON) whenever a new
+  PCI appears (`--save-iq all` saves every cycle, `none` saves nothing). The `.sigmf-meta` file lists every PCI
+  in the recording with its subframe-0 sample position, frame length, frequency offset and identity, so each
+  cell can be picked out of the shared channel later. With `--dual` each sample holds RX1 and RX2 together
+  (same tuner, so the phase between antennas is kept). One second is 61 MB (123 MB with two antennas);
+  the oldest recordings are deleted above `--iq-max-gb` (default 20).
+- A cycle takes about 2–4 s once the cells are known (longer when a new cell is being decoded).
+  Installing `python3-soapysdr` (`sudo apt install python3-soapysdr`) keeps the radio open between recordings
+  and saves 1–2 s per cycle; without it bladeRF-cli is used.
+- On Ctrl-C: a table of every PCI (identity, how often heard, strength, first/last seen), plus
+  `~/field/lte_track_summary.csv` and a per-cycle log `~/field/lte_track_log.csv`.
+
 UK carriers seen during testing (EARFCN → MHz): 6175 → 793.5, 6225 → 798.5, 6300 → 806, 6400 → 816,
 3501 → 930.1, 3725 → 952.5, 1363 → 1821.3, 1617 → 1846.7, 1815 → 1866.5, 76 → 2117.6, 223 → 2132.3,
 347 → 2144.7. A phone network-monitor app shows which ones are used where you are.
@@ -130,6 +155,7 @@ UK carriers seen during testing (EARFCN → MHz): 6175 → 793.5, 6225 → 798.5
 | `gsm_neigh.py` | GSM neighbour lists |
 | `gsm_freqlist.py` | Decoder for GSM frequency lists (used by `gsm_neigh.py`) |
 | `lte_decode.py` | LTE cell identity decoder |
+| `lte_track.py` | Tracks every LTE cell on one carrier and saves raw IQ |
 | `lte_fastsync.py` | Faster LTE cell search (identical results) |
 | `common.py` | Shared tables, colours and operator names |
 | `osprey 2/` | LTE signal-processing library and the srsRAN patch |

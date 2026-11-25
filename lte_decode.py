@@ -86,55 +86,142 @@ def _bladerf_cli(cmd):
     return subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
 
-def capture(freq_hz, rate, secs, gain, low_if_hz):
-    """One-antenna capture with bladeRF-cli -> conditioned complex baseband (or None)."""
+def _cli_raw(freq_hz, rate, secs, gain, dual):
+    """bladeRF-cli capture (opens the radio each time) -> int16 array, one row per sample:
+    [I1, Q1] or [I1, Q1, I2, Q2]. Includes the tuning transient. None on failure."""
     n = int(rate * (secs + 0.01))
+    chans = 2 if dual else 1
     if os.path.exists(SC16):
         os.remove(SC16)
-    p = _bladerf_cli(["bladeRF-cli", "-e", "set agc rx off",
-                      "-e", "set frequency rx %d" % int(freq_hz + low_if_hz),
-                      "-e", "set samplerate rx %d" % int(rate),
-                      "-e", "set bandwidth rx %d" % int(min(rate * 0.9, 56e6)),
-                      "-e", "set gain rx %d" % int(gain),
-                      "-e", "rx config file=%s format=bin n=%d samples=16384 buffers=64 xfers=16 timeout=20000"
-                      % (SC16, n),
-                      "-e", "rx start", "-e", "rx wait %d" % int(secs * 3000 + 15000)])
+    cmd = ["bladeRF-cli", "-e", "set agc off" if dual else "set agc rx off",
+           "-e", "set frequency rx %d" % int(freq_hz),
+           "-e", "set samplerate rx %d" % int(rate),
+           "-e", "set bandwidth rx %d" % int(min(rate * 0.9, 56e6))]
+    if dual:
+        # with two channels, n= counts the samples of both; gains must be set after 'rx config' to reach both
+        cmd += ["-e", "rx config file=%s format=bin n=%d channel=1,2 samples=16384 buffers=64 xfers=16 "
+                "timeout=20000" % (SC16, 2 * n),
+                "-e", "set gain rx1 %d" % int(gain), "-e", "set gain rx2 %d" % int(gain)]
+    else:
+        cmd += ["-e", "set gain rx %d" % int(gain),
+                "-e", "rx config file=%s format=bin n=%d samples=16384 buffers=64 xfers=16 timeout=20000"
+                % (SC16, n)]
+    p = _bladerf_cli(cmd + ["-e", "rx start", "-e", "rx wait %d" % int(secs * 3000 * chans + 15000)])
     size = os.path.getsize(SC16) if os.path.exists(SC16) else 0
-    if size < n * 4 * 0.9:
+    if size < n * 4 * chans * 0.9:
         C.warn("  capture failed (%d of %d bytes); bladeRF-cli said: %s" % (
-            size, n * 4, p.stdout.decode(errors="replace")[-300:]))
+            size, n * 4 * chans, p.stdout.decode(errors="replace")[-300:]))
         return None
-    raw = np.fromfile(SC16, np.int16).astype(np.float32) / 2048.0
-    iq = (raw[0::2] + 1j * raw[1::2]).astype(np.complex64)[int(rate * 0.01):]   # drop the tuning transient
-    LAST_PEAK[0] = float(np.max(np.abs(raw))) if raw.size else 0.0
+    raw = np.fromfile(SC16, np.int16)
+    os.remove(SC16)
+    return raw[:raw.size // (2 * chans) * 2 * chans].reshape(-1, 2 * chans)
+
+
+class SoapyRadio(object):
+    """Keeps the BladeRF open between captures (SoapySDR), saving the 1-2 s bladeRF-cli needs to open the
+    radio and load its FPGA on every capture. Used by lte_track.py."""
+
+    def __init__(self, dual):
+        import SoapySDR                                    # python3-soapysdr
+        self.S = SoapySDR
+        with C.quiet():
+            self.dev = SoapySDR.Device({"driver": "bladerf"})
+        self.chans = [0, 1] if dual else [0]
+        self.stream, self.rate, self.freq, self.gain = None, None, None, None
+        self.scale = 2048.0
+
+    def raw(self, freq_hz, rate, secs, gain):
+        S, dev = self.S, self.dev
+        if rate != self.rate:
+            if self.stream is not None:
+                dev.closeStream(self.stream)
+                self.stream = None
+            for ch in self.chans:
+                dev.setSampleRate(S.SOAPY_SDR_RX, ch, rate)
+                dev.setBandwidth(S.SOAPY_SDR_RX, ch, min(rate * 0.9, 56e6))
+            self.rate = rate
+        if freq_hz != self.freq:
+            for ch in self.chans:
+                dev.setFrequency(S.SOAPY_SDR_RX, ch, freq_hz)
+            self.freq = freq_hz
+        if gain != self.gain:
+            for ch in self.chans:
+                dev.setGainMode(S.SOAPY_SDR_RX, ch, False)
+                dev.setGain(S.SOAPY_SDR_RX, ch, gain)
+            self.gain = gain
+        if self.stream is None:
+            self.stream = dev.setupStream(S.SOAPY_SDR_RX, S.SOAPY_SDR_CS16, self.chans)
+        n = int(rate * (secs + 0.01))
+        bufs = [np.empty((n, 2), np.int16) for _ in self.chans]
+        for _try in range(3):
+            dev.activateStream(self.stream)
+            got, ok = 0, True
+            while got < n:
+                sr = dev.readStream(self.stream, [b[got:] for b in bufs], n - got, timeoutUs=2000000)
+                if sr.ret > 0:
+                    got += sr.ret
+                elif sr.ret == S.SOAPY_SDR_TIMEOUT:
+                    continue
+                else:                                      # overflow: samples lost, the timing would break
+                    ok = False
+                    break
+            dev.deactivateStream(self.stream)
+            if ok:
+                return np.hstack(bufs)
+        C.warn("  capture failed: the radio kept dropping samples")
+        return None
+
+    def close(self):
+        try:
+            if self.stream is not None:
+                self.dev.closeStream(self.stream)
+        except Exception:
+            pass
+        self.dev = None
+
+
+RADIO = [None]           # a SoapyRadio when the radio is kept open, else bladeRF-cli is used
+LAST_RAW = [None]        # int16 samples of the last capture (tuning transient removed), for saving
+
+
+def capture_raw(freq_hz, rate, secs, gain, dual):
+    """One capture -> int16 array [I1, Q1(, I2, Q2)] per row, tuning transient removed, or None."""
+    if RADIO[0] is not None:
+        raw = RADIO[0].raw(freq_hz, rate, secs, gain)
+    else:
+        raw = _cli_raw(freq_hz, rate, secs, gain, dual)
+    if raw is None:
+        return None
+    raw = raw[int(rate * 0.01):]
+    LAST_RAW[0] = raw
+    return raw
+
+
+def _to_iq(raw, col):
+    return ((raw[:, col].astype(np.float32) + 1j * raw[:, col + 1].astype(np.float32)) / 2048.0).astype(
+        np.complex64)
+
+
+def capture(freq_hz, rate, secs, gain, low_if_hz):
+    """One-antenna capture -> conditioned complex baseband (or None)."""
+    raw = capture_raw(freq_hz + low_if_hz, rate, secs, gain, False)
+    if raw is None:
+        return None
+    iq = _to_iq(raw, 0)
+    LAST_PEAK[0] = float(np.max(np.abs(raw[:, :2]))) / 2048.0 if raw.size else 0.0
     _level_line("RX1", iq, LAST_PEAK[0], gain)
     return condition(iq, rate, low_if_hz)
 
 
 def capture_dual(freq_hz, rate, secs, gain, low_if_hz):
     """RX1 + RX2 together (one tuner, same gain) -> (rx1, rx2) or None."""
-    n = int(rate * (secs + 0.01))
-    if os.path.exists(SC16):
-        os.remove(SC16)
-    # with two channels, n= counts the samples of both; gains must be set after 'rx config' to reach both
-    p = _bladerf_cli(["bladeRF-cli", "-e", "set agc off",
-                      "-e", "set frequency rx %d" % int(freq_hz + low_if_hz),
-                      "-e", "set samplerate rx %d" % int(rate),
-                      "-e", "set bandwidth rx %d" % int(min(rate * 0.9, 56e6)),
-                      "-e", "rx config file=%s format=bin n=%d channel=1,2 samples=16384 buffers=64 xfers=16 "
-                      "timeout=20000" % (SC16, 2 * n),
-                      "-e", "set gain rx1 %d" % int(gain), "-e", "set gain rx2 %d" % int(gain),
-                      "-e", "rx start", "-e", "rx wait %d" % int(secs * 6000 + 15000)])
-    size = os.path.getsize(SC16) if os.path.exists(SC16) else 0
-    if size < n * 8 * 0.9:
-        C.warn("  two-antenna capture failed (%d of %d bytes); bladeRF-cli said: %s" % (
-            size, n * 8, p.stdout.decode(errors="replace")[-300:]))
+    raw = capture_raw(freq_hz + low_if_hz, rate, secs, gain, True)
+    if raw is None:
         return None
-    raw = np.fromfile(SC16, np.int16).astype(np.float32).reshape(-1, 4) / 2048.0
     out, peak = [], 0.0
-    for i, name in ((0, "RX1"), (2, "RX2")):
-        iq = (raw[:, i] + 1j * raw[:, i + 1]).astype(np.complex64)[int(rate * 0.01):]
-        pk = float(np.max(np.abs(raw[:, i:i + 2])))
+    for col, name in ((0, "RX1"), (2, "RX2")):
+        iq = _to_iq(raw, col)
+        pk = float(np.max(np.abs(raw[:, col:col + 2]))) / 2048.0
         peak = max(peak, pk)
         _level_line(name, iq, pk, gain)
         out.append(condition(iq, rate, low_if_hz))
@@ -142,8 +229,15 @@ def capture_dual(freq_hz, rate, secs, gain, low_if_hz):
     return out[0], out[1]
 
 
+LAST_LEVEL = [0.0]
+SHOW_LEVELS = [True]
+
+
 def _level_line(name, iq, peak, gain):
     lvl = 10 * np.log10(float(np.mean(np.abs(iq) ** 2)) + 1e-20)
+    LAST_LEVEL[0] = lvl
+    if not SHOW_LEVELS[0]:
+        return
     tag = C.c("  CLIPPING", "red") if peak >= 0.99 else ""
     C.info("  %s level %.1f dBFS, peak %.2f of full scale, gain %g%s" % (name, lvl, peak, gain, tag))
 
@@ -431,15 +525,9 @@ def record(args, freq_mhz, rate):
     return capture(freq_mhz * 1e6, rate, args.secs, args.gain_now, lif), None
 
 
-def decode_carrier(args, freq_mhz):
-    """Everything for one carrier. Returns a list of result rows (decoded and not decoded)."""
-    earfcn, band = mhz_to_earfcn(freq_mhz)
-    C.heading("%.1f MHz   EARFCN %s   band %s" % (freq_mhz, earfcn if earfcn is not None else "?", band or "?"))
-    t0 = time.time()
-    rate = 15.36e6
-    args.gain_now = args.gain
-    x1, x2 = record(args, freq_mhz, rate)
-    for _round in range(0 if args.no_auto_gain else 3):        # aim for a peak of about half full scale
+def auto_gain(args, freq_mhz, rate, x1, x2, rounds=3):
+    """Re-record at a better gain (aiming for a peak of about half full scale) up to `rounds` times."""
+    for _round in range(0 if args.no_auto_gain else rounds):
         if x1 is None:
             break
         pk, new = LAST_PEAK[0], None
@@ -452,6 +540,17 @@ def decode_carrier(args, freq_mhz):
         C.info("  auto gain: %g -> %g dB" % (args.gain_now, new))
         args.gain_now = new
         x1, x2 = record(args, freq_mhz, rate)
+    return x1, x2
+
+
+def decode_carrier(args, freq_mhz):
+    """Everything for one carrier. Returns a list of result rows (decoded and not decoded)."""
+    earfcn, band = mhz_to_earfcn(freq_mhz)
+    C.heading("%.1f MHz   EARFCN %s   band %s" % (freq_mhz, earfcn if earfcn is not None else "?", band or "?"))
+    t0 = time.time()
+    rate = 15.36e6
+    args.gain_now = args.gain
+    x1, x2 = auto_gain(args, freq_mhz, rate, *record(args, freq_mhz, rate))
     rows = []
     if x1 is None:
         return [{"mhz": freq_mhz, "earfcn": earfcn, "band": band, "pci": None, "status": "capture failed"}]
