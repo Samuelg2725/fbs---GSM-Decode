@@ -151,7 +151,6 @@ class LibRadio(object):
         self._ok(lib.bladerf_open(ctypes.byref(self.dev), None), "open")
         self.chans = [0, 2] if dual else [0]                  # BLADERF_CHANNEL_RX(0), BLADERF_CHANNEL_RX(1)
         self.rate = self.freq = None
-        self.configured = False
 
     def _ok(self, ret, what):
         if ret < 0:
@@ -169,10 +168,10 @@ class LibRadio(object):
                 for ch in self.chans:
                     self._ok(lib.bladerf_set_frequency(dev, ch, int(freq_hz)), "set frequency")
                 self.freq = freq_hz
-            if not self.configured:
-                self._ok(lib.bladerf_sync_config(dev, self.RX_X2 if len(self.chans) == 2 else self.RX_X1,
-                                                 self.SC16_Q11, 64, 16384, 16, 5000), "configure stream")
-                self.configured = True
+            # turning the receiver off at the end of a capture also releases the stream, so it is set up again
+            # for every capture (cheap compared with re-opening the radio)
+            self._ok(lib.bladerf_sync_config(dev, self.RX_X2 if len(self.chans) == 2 else self.RX_X1,
+                                             self.SC16_Q11, 64, 16384, 16, 5000), "configure stream")
             for ch in self.chans:
                 self._ok(lib.bladerf_set_gain_mode(dev, ch, self.GAIN_MGC), "set manual gain")
                 self._ok(lib.bladerf_set_gain(dev, ch, int(gain)), "set gain")
