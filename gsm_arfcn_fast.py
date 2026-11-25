@@ -18,20 +18,34 @@ spec = importlib.util.spec_from_file_location("gsm_clean", "/home/revector/gsm_a
 clean = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(clean)
 
+def my_ancestors():
+    """This process and every parent above it (timeout, tee's shell, sudo...). Never kill these:
+    'timeout 120 python3 gsm_arfcn_fast.py' has gsm_arfcn in its command line too."""
+    keep = set()
+    pid = os.getpid()
+    while pid > 1 and pid not in keep:
+        keep.add(pid)
+        try:
+            with open("/proc/%d/stat" % pid) as fh:
+                pid = int(fh.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return keep
+
 def other_scanners():
-    me = os.getpid()
+    keep = my_ancestors()
     found = []
     for name in os.listdir("/proc"):
         if not name.isdigit():
             continue
         pid = int(name)
-        if pid == me:
+        if pid in keep:
             continue
         try:
             cmd = open("/proc/%d/cmdline" % pid, "rb").read().replace(b"\x00", b" ").decode(errors="replace")
         except OSError:
             continue
-        if "gsm_arfcn" in cmd or "grgsm_scanner" in cmd or "gsm_sweep.py" in cmd:
+        if "python" in cmd and ("gsm_arfcn" in cmd or "grgsm_scanner" in cmd or "gsm_sweep.py" in cmd):
             found.append(pid)
     return found
 
