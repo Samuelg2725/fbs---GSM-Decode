@@ -235,8 +235,8 @@ WIDEBAND --best RESULT 2026-11-25 13:32-13:42: decode itself found 6,13,22 (942.
   (5/5, 33.5 s vs 39 s) but retune failed: disconnect_all() leaves gsm_input's inner FIR behind
   ('insufficient connected'); per-edge disconnect then failed on msg_disconnect ('Port does not exist').
   NOW: --quick keeps decoders connected (Owen-style retune: set_fc on gsm_input/clock, reset() where the
-  block has it, message counts re-based). Test = does the 9-channel list still find 5/5 (old retune bug
-  was only ever seen at gain 40).
+  block has it, message counts re-based). RESULT 13:48: 9 channels 5/5 in 12.5 s (was 39 s) -> the old
+  'retune bug' was the gain-40 overload, not decoder state. --quick is the sweep to use.
 Also LTE: O2 816 MHz decoded = eNB 541524 sector 120 TAC 50496 PLMN 234-10 (matches phone).
 Next decode-rate candidates: restart threshold (2 s fixed now), fixed --ppm, gain/overload,
 unbounded message_debug memory on long runs.
