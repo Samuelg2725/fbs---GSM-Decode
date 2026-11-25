@@ -5,8 +5,8 @@ and use them to find cells without sweeping the whole band.
   LD_LIBRARY_PATH=/usr/local/lib python3 ~/gsm_neigh.py --arfcn 13            # one cell: ID + neighbours
   LD_LIBRARY_PATH=/usr/local/lib python3 ~/gsm_neigh.py --arfcn 13 119 --follow
         # start at 13 and 119, then visit every neighbour they list, then those cells' neighbours ...
-  LD_LIBRARY_PATH=/usr/local/lib python3 ~/gsm_neigh.py --seed-sweep --follow
-        # no starting cell known: check every 4th 900 channel, follow every cell found, retry weak ones
+  (no starting cell known? run the full sweep - gsm_arfcn_fast --fresh --sync-secs 1.2 - it is the
+   reliable way; a shortcut that skipped channels missed a whole operator in testing, so it was removed)
 
 Each channel gets a fresh decoder (same as gsm_arfcn_fast --fresh), gain 20 by default.
 A channel is left after --sync-secs without GSM sync; with sync it waits up to --dwell for the cell ID
@@ -32,7 +32,6 @@ BAND900 = list(range(975, 1024)) + list(range(1, 125))
 # open BladeRF instead of closing + reopening it (~0.3 s per channel instead of ~2.8 s). This is what
 # gsm_arfcn_fast --fresh does implicitly.
 _PREV = [None]
-BAND_SET = set(BAND900)
 
 
 def quietly(fn):
@@ -117,8 +116,6 @@ def main():
     ap = argparse.ArgumentParser(description="GSM neighbour lists (SI2/2bis/2ter) + neighbour-guided cell search.",
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--arfcn", type=int, nargs="+", help="cell(s) to read / start from")
-    ap.add_argument("--seed-sweep", action="store_true",
-                    help="no start cell: check every --stride'th channel of the 900 band, follow each cell found")
     ap.add_argument("--follow", action="store_true", help="visit every listed neighbour, then theirs, ...")
     ap.add_argument("--gain", type=float, default=20.0)
     ap.add_argument("--dwell", type=float, default=5.0,
@@ -126,25 +123,17 @@ def main():
     ap.add_argument("--min-secs", type=float, default=2.5,
                     help="stay at least this long on a cell to catch SI2bis/2ter (default 2.5)")
     ap.add_argument("--sync-secs", type=float, default=1.2, help="leave a channel without GSM sync after this")
-    ap.add_argument("--stride", type=int, default=4,
-                    help="--seed-sweep: check every Nth channel for starting cells (default 4; 1 = every channel)")
     ap.add_argument("--retry-dwell", type=float, default=8.0,
                     help="channels that synced without a cell ID get one more try this long (0 = off)")
     args = ap.parse_args()
-    if not args.arfcn and not args.seed_sweep:
-        sys.exit("give --arfcn N [N ...] or --seed-sweep")
+    if not args.arfcn:
+        sys.exit("give --arfcn N [N ...] (cells to read / start from)")
 
     F.kill_other_scanners()
     signal.signal(signal.SIGINT, F._first_ctrl_c_only)
     t_all = time.time()
     queue = list(args.arfcn or [])
     done, cells, listed_by = {}, {}, {}
-    # seed sweep: every --stride'th channel of the band; each cell found is followed straight away,
-    # then the stride pass carries on (so every operator's block gets a starting cell)
-    seeds = BAND900[::max(1, args.stride)] if args.seed_sweep else []
-    if seeds:
-        print("seed sweep: every %d%s channel of the 900 band (%d channels), following each cell found"
-              % (args.stride, {1: "st", 2: "nd", 3: "rd"}.get(args.stride, "th"), len(seeds)), flush=True)
 
     def handle(a, r, retry=False):
         allnb = sorted(set(x for lst in r["lists"].values() for x in lst))
@@ -170,16 +159,10 @@ def main():
         else:
             why = "synced, no cell ID" if r["synced"] else "no GSM sync"
             print("%s  %4.1fs  ARFCN %d  %s%s" % (F.clean.now_stamp(), r["secs"], a, why, tag), flush=True)
-            if r["synced"] and not retry:
-                # GSM energy here but no ID: usually the spill-over of a real cell 1-2 channels away
-                near = [x for x in (a - 1, a + 1, a - 2, a + 2) if x in BAND_SET and x not in done and x not in queue]
-                if near:
-                    print("        -> sync without ID, checking next to it: %s" % fmt_list(near), flush=True)
-                    queue.extend(near)
 
     try:
-        while queue or seeds:
-            a = queue.pop(0) if queue else seeds.pop(0)
+        while queue:
+            a = queue.pop(0)
             if a in done:
                 continue
             r = visit(args, a)
