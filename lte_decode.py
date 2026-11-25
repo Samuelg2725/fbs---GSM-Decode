@@ -124,23 +124,14 @@ class SoapyRadio(object):
     def __init__(self, dual):
         import SoapySDR                                    # python3-soapysdr
         self.S = SoapySDR
-        try:
-            with C.quiet():
-                self.dev = SoapySDR.Device({"driver": "bladerf"})
-        except Exception:
-            # the python module may come from a different SoapySDR install than the BladeRF module (e.g. apt
-            # python3-soapysdr and a BladeRF module built into /usr/local): load the module files directly
-            import glob
-            for mod in sorted(glob.glob("/usr/local/lib/SoapySDR/modules*/libbladeRFSupport.so") +
-                              glob.glob("/usr/local/lib/*/SoapySDR/modules*/libbladeRFSupport.so") +
-                              glob.glob("/usr/lib/*/SoapySDR/modules*/libbladeRFSupport.so")):
-                try:
-                    with C.quiet():
-                        SoapySDR.loadModule(mod)
-                except Exception:
-                    pass
-            with C.quiet():
-                self.dev = SoapySDR.Device({"driver": "bladerf"})
+        with C.quiet():
+            found = [dict(d) for d in SoapySDR.Device.enumerate()]
+        blades = [d for d in found if "bladerf" in " ".join("%s=%s" % kv for kv in d.items()).lower()]
+        if not blades:
+            raise RuntimeError("SoapySDR sees no BladeRF (devices: %s)" % (
+                "; ".join(d.get("label", d.get("driver", "?")) for d in found) or "none"))
+        with C.quiet():
+            self.dev = SoapySDR.Device(blades[0])
         self.chans = [0, 1] if dual else [0]
         self.stream, self.rate, self.freq, self.gain = None, None, None, None
         self.scale = 2048.0
