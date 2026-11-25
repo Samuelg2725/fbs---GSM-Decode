@@ -146,6 +146,10 @@ SWEEP BUG SUSPECT (2026-11-25): long multi-ARFCN sweeps starting on empty channe
 yet single-channel ARFCN 8 decoded instantly 1 min after the 15:12 field sweep called it "no cell".
 Short lists starting on a real cell work. Hypothesis: clock_offset_control learns a bogus correction
 on empty channels and retune() keeps it. Test: --fresh (rebuilds decoder per channel) vs default.
+HOME REFERENCE (phone, 2026-11-25 11:40): GSM ARFCN 13 CID 942 (-55), 119 CID 22679 (-63),
+116 CID 12679 (-79), 6 CID 941 (-82), 22 CID 943 (-83), 660 EE CID 51861 (-99), 9 CID 30669 (-106).
+gsm_wide --fast found 13, 22, 116, 119 (all CIDs match). The narrow 900 sweep (old retune) found
+NOTHING, not even ARFCN 13 (-19 on BladeRF) -> sweep retune bug confirmed; --fresh is the fix candidate.
 Also LTE: O2 816 MHz decoded = eNB 541524 sector 120 TAC 50496 PLMN 234-10 (matches phone).
 Next decode-rate candidates: restart threshold (2 s fixed now), fixed --ppm, gain/overload,
 unbounded message_debug memory on long runs.
