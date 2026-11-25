@@ -434,7 +434,7 @@ def track(args):
                 C.status("  cycle %d: decoding PCI %d with srsRAN..." % (cycles, pci))
                 cell.last_try = cycles
                 r = L.decode_cell(signal_for(args, rate, x1, x2, pci, offset), rate,
-                                  {"pci": pci, "pss_ratio": strength, "offset_hz": offset}, args, args.freq_mhz_now)
+                                  {"pci": pci, "pss_ratio": strength, "offset_hz": offset, "width": cell.width}, args, args.freq_mhz_now)
                 apply_result(cell, r)
                 if r.get("aligned") is not None:
                     aligned[pci] = r["aligned"]
@@ -593,9 +593,9 @@ def main():
     ap.add_argument("--no-siblings", action="store_true", help="do not try the other sectors of each mast")
     ap.add_argument("--lost-after", type=int, default=3, help="report a PCI as not heard after N cycles")
     ap.add_argument("--table-every", type=int, default=20, help="print the table every N cycles (0 = only at the end)")
-    ap.add_argument("--radio", choices=("cli", "lib"), default="cli",
-                    help="cli (default): bladeRF-cli for every recording; lib: keep the radio open between "
-                         "recordings with libbladeRF (faster, newer)")
+    ap.add_argument("--radio", choices=("lib", "cli"), default="lib",
+                    help="lib (default): keep the radio open between recordings (libbladeRF); cli: start "
+                         "bladeRF-cli for every recording (slower; used automatically if lib fails)")
     ap.add_argument("--low-if-mhz", type=float, default=0.6, help="tune this far above the carrier (default 0.6)")
     ap.add_argument("--search-secs", type=float, default=0.08, help="recording length used for the search, s")
     ap.add_argument("--no-weak-search", action="store_true", help="skip the search for weaker cells")

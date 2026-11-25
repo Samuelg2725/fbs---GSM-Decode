@@ -103,8 +103,10 @@ EARFCN carries many cells (different PCIs); this shows them all as they come and
   the oldest recordings are deleted above `--iq-max-gb` (default 20).
 - Cycles that only check which PCIs are present use a short 0.2 s recording (`--watch-secs`); a full 1 s
   recording is taken when something must be decoded or saved. Each line shows the record and search times.
-  `--radio lib` keeps the radio open between recordings (through libbladeRF) instead of starting bladeRF-cli
-  each time, which saves about 1 s per cycle.
+  The radio is kept open between recordings (libbladeRF), so a watch cycle takes about 2 s; `--radio cli`
+  starts bladeRF-cli for each recording instead (slower, used automatically if the radio cannot be kept open).
+- 5 MHz cells (e.g. Three on 800 MHz) are decoded from a recording reduced to 7.68 Msps, the rate srsRAN
+  expects for that width.
 - On Ctrl-C: a table of every PCI (identity, how often heard, strength, first/last seen), plus
   `~/field/lte_track_summary.csv` and a per-cycle log `~/field/lte_track_log.csv`.
 

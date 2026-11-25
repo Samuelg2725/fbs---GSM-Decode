@@ -46,6 +46,7 @@ SC16 = "/dev/shm/_lte.sc16"
 # capture rate needed for a cell width (resource blocks): 10 MHz -> 15.36, 15 MHz -> 23.04, 20 MHz -> 30.72 Msps
 RATES = [(15.36e6, 50), (23.04e6, 75), (30.72e6, 100)]
 BW_MHZ = {6: 1.4, 15: 3, 25: 5, 50: 10, 75: 15, 100: 20}
+NATIVE_RATE = {6: 1.92e6, 15: 3.84e6, 25: 7.68e6, 50: 15.36e6, 75: 23.04e6, 100: 30.72e6}   # srsRAN file rates
 SIB1_RE = re.compile(
     r"SIB1 cell identity (\d+)\s+eNB (\d+)\s+sector (\d+)\s+TAC (\d+)((?:[ \t]+PLMN \d+-\d+)*)[ \t]*\r?\n")
 MIB_PRB_RE = re.compile(r"PRB:\s+(\d+)")
@@ -259,16 +260,42 @@ def _level_line(name, iq, peak, gain):
     C.info("  %s level %.1f dBFS, peak %.2f of full scale, gain %g%s" % (name, lvl, peak, gain, tag))
 
 
+def _tone_period(rate, freq_hz):
+    """Samples after which exp(j*2*pi*freq*n/rate) repeats exactly (e.g. 0.6 MHz at 15.36 Msps -> 128), or None."""
+    from math import gcd
+    r, f = int(round(rate)), int(round(freq_hz))
+    if r != rate or f != freq_hz or f == 0:
+        return None
+    p = r // gcd(r, abs(f))
+    return p if p <= 8192 else None
+
+
 def condition(samples, rate, low_if_hz):
     """Remove DC. The radio is tuned low_if_hz above the carrier to keep its DC spike off the cell's centre;
     shift the cell back to baseband and notch the spike."""
+    samples = np.asarray(samples, dtype=np.complex64)
     samples = samples - np.mean(samples)
-    if low_if_hz:
+    if not low_if_hz:
+        return samples.astype(np.complex64)
+    p = _tone_period(rate, low_if_hz)
+    if p is None:                                             # general (slower) path
         idx = np.arange(len(samples))
         samples = samples * np.exp(1j * 2 * np.pi * float(low_if_hz) * idx / float(rate))
         from hackrf_capture import notch_tone
-        samples = notch_tone(samples, float(low_if_hz), rate)
-    return samples.astype(np.complex64)
+        return notch_tone(samples, float(low_if_hz), rate)
+    # fast path: the shifting tone repeats every p samples, so one period is tiled over the recording
+    n = len(samples)
+    full = n // p * p
+    tone = np.exp(1j * 2 * np.pi * float(low_if_hz) * np.arange(p) / float(rate)).astype(np.complex64)
+    out = np.empty(n, np.complex64)
+    out[:full] = (samples[:full].reshape(-1, p) * tone).ravel()
+    out[full:] = samples[full:] * tone[:n - full]
+    # notch: after the shift the DC spike is a tone at +low_if_hz, i.e. the same tone; remove its projection
+    blocks = out[:full].reshape(-1, p)
+    coef = (np.vdot(tone, blocks.sum(axis=0)) + np.vdot(tone[:n - full], out[full:])) / n
+    blocks -= (coef * tone).astype(np.complex64)
+    out[full:] -= (coef * tone[:n - full]).astype(np.complex64)
+    return out
 
 
 # -------------------------------------------------------------------------------------------- search
@@ -469,8 +496,24 @@ def decode_cell(samples, rate, hit, args, freq_mhz, aligned=None):
         aligned.tofile(path)
         n_sf = max(40, len(aligned) // max(1, int(round(rate / 1000.0))))
         own = {15360000: 50, 23040000: 75, 30720000: 100}.get(int(round(rate)), 50)
-        for n_prb in [own] + [w for w in (50, 25, 75, 100) if w != own]:
-            text = run_pdsch(path, pci, n_prb, n_sf, args.srsran_timeout)
+        order = [own] + [w for w in (50, 25, 75, 100) if w != own]
+        if hit.get("width") in order:                        # width already known from an earlier MIB
+            order.remove(hit["width"])
+            order.insert(0, hit["width"])
+        for n_prb in order:
+            # srsRAN reads a file at the standard rate for the width it is told (5 MHz = 7.68 Msps, ...): give a
+            # narrower cell a recording reduced to its own rate
+            k = rate / NATIVE_RATE[n_prb]
+            if k > 1.01 and abs(k - round(k)) < 1e-6:
+                from scipy.signal import resample_poly
+                small = path.with_name(path.stem + "_%d.cf32" % n_prb)
+                resample_poly(aligned, 1, int(round(k))).astype(np.complex64).tofile(small)
+                try:
+                    text = run_pdsch(small, pci, n_prb, n_sf, args.srsran_timeout)
+                finally:
+                    small.unlink(missing_ok=True)
+            else:
+                text = run_pdsch(path, pci, n_prb, n_sf, args.srsran_timeout)
             if args.srsran_log:
                 d = os.path.expanduser(args.srsran_log)
                 os.makedirs(d, exist_ok=True)
