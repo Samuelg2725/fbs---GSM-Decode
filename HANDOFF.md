@@ -237,6 +237,11 @@ WIDEBAND --best RESULT 2026-11-25 13:32-13:42: decode itself found 6,13,22 (942.
   NOW: --quick keeps decoders connected (Owen-style retune: set_fc on gsm_input/clock, reset() where the
   block has it, message counts re-based). RESULT 13:48: 9 channels 5/5 in 12.5 s (was 39 s) -> the old
   'retune bug' was the gain-40 overload, not decoder state. --quick is the sweep to use.
+  WRONG - FULL BAND 13:50 (173 ch, 220 s): only 6 and 119 found; 13, 22, 116 'no GSM sync'. After ~50
+  empty channels the kept decoders' frequency correction has drifted (9-ch test had only 3 empties first).
+  Decoder carry-over IS real. Now: gsm_dual --quick = fresh radio+decoders per channel + sync skip
+  (--keep-open = the unreliable retune). gsm_arfcn_fast --fresh --sync-secs 1.2 = single-antenna sweep with
+  fresh decoders (~0.3 s rebuild) + sync skip. Phone at 14:07: 1(-97) 6 13 22 114(-90) 116 119 + EE 649.
 Also LTE: O2 816 MHz decoded = eNB 541524 sector 120 TAC 50496 PLMN 234-10 (matches phone).
 Next decode-rate candidates: restart threshold (2 s fixed now), fixed --ppm, gain/overload,
 unbounded message_debug memory on long runs.

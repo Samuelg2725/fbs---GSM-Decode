@@ -229,7 +229,7 @@ def sweep(args):
             passes += 1
             t_pass = time.time()
             for a, f in chans:
-                if tb is not None and args.quick:
+                if tb is not None and args.keep_open:
                     try:
                         tb.retune(f)
                     except Exception as exc:
@@ -272,7 +272,7 @@ def sweep(args):
                                 text = text or t
                     if got == {0, 1} or (got and time.time() - t0 > 1.0):
                         break                     # both have it, or one has it and we gave the other 1 s
-                    if (args.quick and not got and time.time() - t0 > args.sync_secs
+                    if ((args.quick or args.keep_open) and not got and time.time() - t0 > args.sync_secs
                             and not tb.synced(0) and not tb.synced(1)):
                         nosync = True
                         break                     # no GSM sync on either antenna: nothing to wait for
@@ -324,8 +324,11 @@ def main():
     ap.add_argument("--dwell", type=float, default=2.5, help="sweep: seconds per channel (default 2.5)")
     ap.add_argument("--passes", type=int, default=1, help="sweep: rounds (default 1, 0 = forever)")
     ap.add_argument("--quick", action="store_true",
-                    help="sweep: keep the radio open between channels (fresh decoders each time) and move on "
-                         "after --sync-secs if neither antenna gets GSM sync")
+                    help="sweep: move on after --sync-secs if neither antenna gets GSM sync (radio + decoders "
+                         "still rebuilt fresh per channel: 9 test channels 5/5 in 33 s vs 39 s)")
+    ap.add_argument("--keep-open", action="store_true",
+                    help="EXPERIMENTAL, UNRELIABLE: keep radio + decoders between channels (Owen-style retune). "
+                         "Full-band test 13:50 missed 13/22/116: decoder frequency correction drifts on empty channels")
     ap.add_argument("--sync-secs", type=float, default=1.2,
                     help="--quick: seconds to wait for GSM sync before moving on (default 1.2)")
     ap.add_argument("--gain1", type=float, default=20.0, help="RX1 gain (default 20: strong cells)")

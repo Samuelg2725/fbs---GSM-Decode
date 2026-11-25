@@ -181,6 +181,15 @@ class top(gr.top_block):
         self.msg_connect(self.gsm_receiver, "measurements", self.gsm_clock, "measurements")
         self.msg_connect(self.demapper, "bursts", self.decoder, "bursts")
         self.msg_connect(self.decoder, "msgs", self.dbg, "store")
+        # receiver emits C0 bursts only once locked to a cell's FCCH+SCH -> GSM sync indicator
+        self.sync = blocks.message_debug()
+        self.msg_connect(self.gsm_receiver, "C0", self.sync, "store")
+
+    def synced_since(self, base):
+        try:
+            return self.sync.num_messages() > base
+        except Exception:
+            return True
 
     def retune(self, freq):
         try:
@@ -426,6 +435,9 @@ def main():
                         help="multi-channel: seconds to wait for a cell ID per channel (default 1.5)")
     parser.add_argument("--passes", type=int, default=0,
                         help="multi-channel: stop after this many rounds (default 0 = forever)")
+    parser.add_argument("--sync-secs", type=float, default=0,
+                        help="multi-channel: leave a channel after this many seconds if the receiver has no GSM "
+                             "sync (e.g. 1.2; 0 = off, always full --dwell). Use with --fresh")
     parser.add_argument("--fresh", action="store_true",
                         help="rebuild the decoder on every retune/restart (no carried-over frequency "
                              "correction); test against the default when long sweeps miss cells")
@@ -570,7 +582,15 @@ def main():
                         pass
                     t0 = time.time()
                     text = None
+                    nosync = False
+                    try:
+                        sync_base = tb.sync.num_messages()
+                    except Exception:
+                        sync_base = 0
                     while time.time() - t0 < args.dwell:
+                        if args.sync_secs and time.time() - t0 > args.sync_secs and not tb.synced_since(sync_base):
+                            nosync = True
+                            break
                         try:
                             n = tb.dbg.num_messages()
                         except Exception:
@@ -591,7 +611,8 @@ def main():
                         print("%s  %6.1fs  %s" % (clean.now_stamp(), took, text), flush=True)
                         found_cells[arfcn] = __import__("re").sub("\x1b\\[[0-9;]*m", "", text).split(", Pwr")[0]
                     else:
-                        print("%s  %6.1fs  ARFCN %d  no cell" % (clean.now_stamp(), took, arfcn), flush=True)
+                        print("%s  %6.1fs  ARFCN %d  %s" % (clean.now_stamp(), took, arfcn,
+                              "no GSM sync" if nosync else "no cell"), flush=True)
                 done_passes += 1
                 print("pass %d done in %.1fs, %d cell(s) so far"
                       % (done_passes, time.time() - pass_start, len(found_cells)), flush=True)
