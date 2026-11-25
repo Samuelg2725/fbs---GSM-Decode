@@ -212,3 +212,8 @@ MIB+SIB1, so build it (paths are hard-coded to /home/revector):
   python3 ~/fbs-upload/"osprey 2"/srsran_watch/print_sib1.py      # adds the SIB1 cell-ID print
   mkdir -p ~/srsRAN_4G/build && cd ~/srsRAN_4G/build && cmake .. && make -j3 pdsch_ue
 Then: python3 ~/fbs-upload/lte_decode.py --freq-mhz 806 --low-if-mhz 0.6 --engine srsran
+Built OK on the Pi 2026-11-25 incl. srsRAN's own BladeRF driver (libsrsran_rf_blade.so). Live:
+  LD_LIBRARY_PATH=/usr/local/lib:$HOME/srsRAN_4G/build/lib/src/phy/rf ~/srsRAN_4G/build/lib/examples/pdsch_ue -f 806000000 -g 40
+  (NO -a "device_name=bladerf": srsRAN passes it to bladerf_open -> "Invalid operation or parameter").
+  Cell ID lines go to ~/sib1_cell.txt. Phone scanner reference at home: Vodafone PCI 21 eNB 19409
+  TAC 57379; O2 PCI 1 eNB 541524 TAC 50496; B20 EARFCN 6175 (793.5) PCI 272/216.

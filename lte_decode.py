@@ -131,7 +131,30 @@ def srsran_decode(samples, rate, freq_mhz, args):
     cell_txt = os.path.expanduser("~/sib1_cell.txt")
     before = os.path.getsize(cell_txt) if os.path.exists(cell_txt) else 0
     t0 = time.time()
-    text = H.decode_capture(samples, rate, freq_mhz, args.earfcn, args.pci, None, None)
+    # pdsch_ue can wait forever on a file it never locks to: cap each attempt (Owen tries 4 widths)
+    import types
+    real_run = H.subprocess.run
+
+    def limited_run(cmd, **kw):
+        kw.setdefault("timeout", args.srsran_timeout)
+        print("  srsRAN attempt: %s" % " ".join(str(c) for c in cmd[1:]), flush=True)
+        try:
+            return real_run(cmd, **kw)
+        except H.subprocess.TimeoutExpired as exc:
+            print("    (gave up after %ds)" % args.srsran_timeout, flush=True)
+            out = exc.stdout or ""
+            err = exc.stderr or ""
+            if isinstance(out, bytes):
+                out = out.decode(errors="replace")
+            if isinstance(err, bytes):
+                err = err.decode(errors="replace")
+            return types.SimpleNamespace(stdout=out, stderr=err, returncode=-1)
+
+    H.subprocess.run = limited_run
+    try:
+        text = H.decode_capture(samples, rate, freq_mhz, args.earfcn, args.pci, None, None)
+    finally:
+        H.subprocess.run = real_run
     print(text, flush=True)
     if os.path.exists(cell_txt) and os.path.getsize(cell_txt) > before:
         with open(cell_txt) as fh:
@@ -271,6 +294,8 @@ def main():
     ap.add_argument("--engine", choices=["python", "srsran"], default="python",
                     help="python = all-Python decoder (default); srsran = Owen's HackRF path: srsRAN pdsch_ue "
                          "reads MIB + SIB1 from the capture (needs ~/srsRAN_4G built)")
+    ap.add_argument("--srsran-timeout", type=int, default=30,
+                    help="--engine srsran: seconds per pdsch_ue attempt before giving up (default 30)")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
 
