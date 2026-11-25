@@ -155,7 +155,7 @@ def radio_args(radio):
     return "numchan=1 " + dev_args
 
 class top(gr.top_block):
-    def __init__(self, freq, gain=50, radio="lime"):
+    def __init__(self, freq, gain=50, radio="lime", agc=False):
         gr.top_block.__init__(self, "fast")
         samp_rate = 2e6
         self.src = osmosdr.source(args=radio_args(radio))
@@ -163,8 +163,10 @@ class top(gr.top_block):
         self.src.set_center_freq(freq, 0)
         self.src.set_freq_corr(0, 0)
         # Lime: AGC on (Owen's setting). BladeRF: manual gain (40 clean, ~45+ clips).
-        self.src.set_gain_mode(radio != "bladerf", 0)
-        self.src.set_gain(gain, 0)
+        # --agc: BladeRF uses the AD9361 hardware AGC instead (test: gain 40 overloads strong cells).
+        self.src.set_gain_mode(radio != "bladerf" or agc, 0)
+        if radio != "bladerf" or not agc:
+            self.src.set_gain(gain, 0)
         self.src.set_bandwidth(samp_rate, 0)
         self.gsm_input = gsm.gsm_input(ppm=0, osr=4, fc=freq, samp_rate_in=samp_rate)
         self.gsm_receiver = gsm.receiver(4, ([0]), ([]))
@@ -374,9 +376,9 @@ class TrackStats(object):
             if new:
                 fh.write("start_utc,label,arfcn,radio,gain,runtime_s,decoded,expected,rate_pct,missed,"
                          "longest_gap_s,restarts,first_decode_s,pwr_avg,pwr_min,pwr_max,cids,wrong_cid\n")
-            fh.write("%s,%s,%d,%s,%g,%.1f,%d,%d,%.1f,%d,%.2f,%d,%s,%s,%s,%s,%s,%d\n" % (
+            fh.write("%s,%s,%d,%s,%s,%.1f,%d,%d,%.1f,%d,%.2f,%d,%s,%s,%s,%s,%s,%d\n" % (
                 time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(self.t_listen)), self.args.label, self.arfcn,
-                self.args.radio, self.args.gain, n["runtime"], self.decodes, n["expected"], n["rate"],
+                self.args.radio, "agc" if self.args.agc else "%g" % self.args.gain, n["runtime"], self.decodes, n["expected"], n["rate"],
                 self.missed, self.longest, self.restarts,
                 "" if n["first"] is None else "%.2f" % n["first"],
                 "%.1f" % (sum(self.pwr) / len(self.pwr)) if self.pwr else "",
@@ -406,7 +408,9 @@ def main():
     parser.add_argument("--radio", choices=["lime", "bladerf"], default="lime",
                         help="lime (default, Owen's rig) or bladerf")
     parser.add_argument("--gain", type=float, default=None,
-                        help="default 50 for lime, 40 for bladerf")
+                        help="default 50 for lime, 40 for bladerf (home test: 40 overloads, 20 = 100%% decode)")
+    parser.add_argument("--agc", action="store_true",
+                        help="bladerf: use the radio's hardware AGC instead of the fixed --gain")
     parser.add_argument("--dwell", type=float, default=1.5,
                         help="multi-channel: seconds to wait for a cell ID per channel (default 1.5)")
     parser.add_argument("--passes", type=int, default=0,
@@ -446,11 +450,12 @@ def main():
             print("ARFCN %d is not a downlink channel" % arfcn)
             return 1
         freqs.append(freq)
-    print("opening ARFCN %s  radio %s  gain %g" % (" ".join(str(a) for a in arfcns), args.radio, args.gain), flush=True)
+    print("opening ARFCN %s  radio %s  gain %s" % (" ".join(str(a) for a in arfcns), args.radio,
+          "AGC" if args.agc else "%g" % args.gain), flush=True)
     muted = clean.silence()
     tb = None
     try:
-        tb = top(freqs[0], args.gain, args.radio)
+        tb = top(freqs[0], args.gain, args.radio, args.agc)
         tb.start()
     finally:
         clean.restore(*muted)
@@ -477,7 +482,7 @@ def main():
         del tb
         muted = clean.silence()
         try:
-            new = top(freq, args.gain, args.radio)
+            new = top(freq, args.gain, args.radio, args.agc)
             new.start()
         finally:
             clean.restore(*muted)

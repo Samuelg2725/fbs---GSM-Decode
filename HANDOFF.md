@@ -158,6 +158,14 @@ RESULTS 2026-11-25 11:32-11:46 (home, gain 40, after self-kill fix 1bc323a):
 - Full 900 sweep --fresh (173 ch, 477 s): 6, 13, 22. Still misses 116/119 (gsm_wide finds them) and 9 (-106).
 - Ctrl-C under timeout|tee sent SIGINT twice and killed tee -> summary lost. Fixed: CSV written first,
   2nd SIGINT ignored, BrokenPipe tolerated.
+GAIN TEST 2026-11-25 11:51-12:03 (home, ARFCN 13 = strongest cell, 2 min each):
+  g20 124/124 = 100%, 0 restarts | g30 47/123 = 38% | g40 39/120 = 32%.  -> GAIN 40 OVERLOADS.
+  Pwr barely moves (-19.7 @20, -16.5 @40) for +20 dB gain = front end compressed at 30/40.
+  ARFCN 119 @40: 21.5%, 8 restarts. ARFCN 116 @40: 0 (52 restarts) though gsm_wide decodes it.
+  Sweep --fresh --dwell 6: 6, 13, 22, 119 found (119 newly found vs 2.5 s dwell); 116, 9 still missed.
+  Added --agc (AD9361 hardware AGC on bladerf) to test against fixed gains.
+  RX1/RX2: AD9361 shares LO + sample rate + bandwidth, but GAIN IS PER CHANNEL -> RX1 low gain for
+  strong cells, RX2 high gain for weak ones, same frequency, is possible (needs 2-ch streaming).
 Also LTE: O2 816 MHz decoded = eNB 541524 sector 120 TAC 50496 PLMN 234-10 (matches phone).
 Next decode-rate candidates: restart threshold (2 s fixed now), fixed --ppm, gain/overload,
 unbounded message_debug memory on long runs.
