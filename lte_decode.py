@@ -593,8 +593,8 @@ def decode_cell(samples, rate, hit, args, freq_mhz, aligned=None):
                         if got_mib(text):
                             ports = p
                             break
-                if not got_mib(text):
-                    break                            # the MIB does not depend on the width: stop here
+            if i == 0 and not got_mib(text):
+                break                                # the MIB does not depend on the width: stop here
             if "Decoded MIB" in text and out["mib"] is None:
                 vals = [int(v) for v in MIB_PRB_RE.findall(text) if int(v) in BW_MHZ]
                 if vals:
