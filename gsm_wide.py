@@ -22,6 +22,7 @@ CENTER = 942.5e6
 SECS = 2.0
 GAIN = 50.0
 PATH = os.path.expanduser("~/gsm_wide.cfile")
+PATH2 = "/dev/shm/gsm_wide_rx2.sc16"
 RADIO = "lime"
 FMT = "cfile"            # cfile = complex float32 (Lime/osmosdr), sc16 = int16 I/Q (bladeRF-cli)
 BLADE_LIBS = "/usr/local/lib"
@@ -29,7 +30,8 @@ SKIP_EMPTY = False       # --skip-empty: short sync probe first, skip channels w
 STOP_EARLY = False       # --stop-early: stop a channel as soon as its cell ID (SI3) is decoded
 PROBE_SECS = 2.0         # --probe-secs: give up on a channel if no sync within this much capture
 RETRIES = 0              # --retries: re-decode channels that synced but gave no cell ID
-HAVE_PROGRESS = True     # set False if this GNU Radio can't report samples processed
+HAVE_PROGRESS = True
+GAIN2 = None             # --gain2: bladerf RX2 at this gain, captured together with RX1 (two antennas)     # set False if this GNU Radio can't report samples processed
 
 def channels():
     """Every UK GSM downlink channel inside the capture: E-GSM900 (Owen's list) + DCS1800."""
@@ -129,6 +131,8 @@ def capture_bladerf():
     n = int(RATE * SECS)
     if os.path.exists(PATH):
         os.remove(PATH)
+    if GAIN2 is not None:
+        return capture_bladerf_dual(n)
     cmd = ["bladeRF-cli", "-e", "set agc rx off",
            "-e", "set frequency rx %d" % int(CENTER),
            "-e", "set samplerate rx %d" % int(RATE),
@@ -150,6 +154,48 @@ def capture_bladerf():
         print(p.stdout.decode(errors="replace")[-800:], flush=True)
         return 0
     return size // 4
+
+def capture_bladerf_dual(n):
+    """RX1 + RX2 together (shared tuner, separate gains). bladeRF-cli writes them interleaved;
+    split into PATH (RX1) and PATH2 (RX2). Gains are set after 'rx config' so both channels get them."""
+    raw = PATH + ".dual"
+    cmd = ["bladeRF-cli", "-e", "set agc rx off",
+           "-e", "set frequency rx %d" % int(CENTER),
+           "-e", "set samplerate rx %d" % int(RATE),
+           "-e", "set bandwidth rx %d" % int(min(RATE * 0.9, 56e6)),
+           "-e", "rx config file=%s format=bin n=%d channel=1,2 samples=16384 buffers=64 xfers=16 timeout=20000"
+           % (raw, n),
+           "-e", "set gain rx1 %d" % int(GAIN), "-e", "set gain rx2 %d" % int(GAIN2),
+           "-e", "rx start", "-e", "rx wait %d" % int(SECS * 3000 + 15000)]
+    env = dict(os.environ)
+    env["LD_LIBRARY_PATH"] = BLADE_LIBS + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+    print("capturing %.1fs at %.1f MS/s, centre %.1f MHz, RX1 gain %g + RX2 gain %g (bladeRF-cli, two antennas)"
+          % (SECS, RATE / 1e6, CENTER / 1e6, GAIN, GAIN2), flush=True)
+    started = time.time()
+    p = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    size = os.path.getsize(raw) if os.path.exists(raw) else 0
+    print("wrote %d bytes in %.1fs" % (size, time.time() - started), flush=True)
+    if size < n * 8 * 0.9:
+        print("capture is short - bladeRF-cli said:", flush=True)
+        print(p.stdout.decode(errors="replace")[-800:], flush=True)
+        return 0
+    import numpy as np
+    d = np.memmap(raw, dtype=np.int16, mode="r")
+    d = d[:(len(d) // 4) * 4].reshape(-1, 4)
+    step = 1 << 20
+    with open(PATH, "wb") as f1, open(PATH2, "wb") as f2:
+        for i in range(0, len(d), step):
+            f1.write(np.ascontiguousarray(d[i:i + step, 0:2]).tobytes())
+            f2.write(np.ascontiguousarray(d[i:i + step, 2:4]).tobytes())
+    del d
+    os.remove(raw)
+    for name, path in (("RX1", PATH), ("RX2", PATH2)):
+        x = np.memmap(path, dtype=np.int16, mode="r")[:2000000].astype(np.float32)
+        pk = np.abs(x).max() / 2048.0
+        print("  %s level %.1f dBFS, peak %.2f%s" % (name, 10 * np.log10(np.mean(x * x) / 2048.0 ** 2 * 2 + 1e-20),
+              pk, "  CLIPPING" if pk >= 0.99 else ""), flush=True)
+    return size // 8
+
 
 def capture():
     if RADIO == "bladerf":
@@ -323,6 +369,38 @@ def decode(n_in, arfcn, freq):
             status = "decoded on retry"
     return lines, status
 
+def decode_all(n_in, chans, tag=None):
+    """Decode every channel in chans from PATH. Returns (unique, cells, status_count, status_time, synced_only)."""
+    cells = 0
+    unique = {}
+    status_count, status_time, synced_only = {}, {}, []
+    for index, (arfcn, freq) in enumerate(chans, 1):
+        print("%s%d/%d  ARFCN %d  %.1f MHz" % ("[%s] " % tag if tag else "", index, len(chans), arfcn, freq / 1e6),
+              flush=True)
+        t0 = time.time()
+        lines, status = decode(n_in, arfcn, freq)
+        took = time.time() - t0
+        status_count[status] = status_count.get(status, 0) + 1
+        status_time[status] = status_time.get(status, 0.0) + took
+        if not lines:
+            if status == "synced, no cell ID":
+                synced_only.append((arfcn, freq))
+                print("  SYNCED but no cell ID decoded  (%.1fs)" % took, flush=True)
+            elif status == "no sync":
+                print("  nothing on this channel  (no sync, %.1fs)" % took, flush=True)
+            else:
+                print("  nothing on this channel  (%.1fs)" % took, flush=True)
+            continue
+        for text in lines:
+            cells += 1
+            print(text, flush=True)
+            plain = re.sub("\x1b\\[[0-9;]*m", "", text)
+            cid = plain.split("CID:")[1].split(",")[0].strip() if "CID:" in plain else "?"
+            unique.setdefault((arfcn, cid), plain.split(", Pwr")[0])
+        print("  (%.1fs)" % took, flush=True)
+    return unique, cells, status_count, status_time, synced_only
+
+
 def main():
     global PATH, RADIO, FMT, RATE, CENTER, SECS, GAIN
     import argparse
@@ -335,7 +413,10 @@ def main():
     ap.add_argument("--rate", type=float, default=None, help="sample rate (default 40e6)")
     ap.add_argument("--center", type=float, default=None, help="centre MHz (default 942.5)")
     ap.add_argument("--secs", type=float, default=None, help="capture seconds (default 2)")
-    ap.add_argument("--gain", type=float, default=None, help="default 50 lime / 40 bladerf")
+    ap.add_argument("--gain", type=float, default=None, help="default 50 lime / 20 bladerf (40 overloaded strong cells at home)")
+    ap.add_argument("--gain2", type=float, default=None,
+                    help="bladerf: ALSO record RX2 (second antenna) at this gain; RX2 is decoded only on channels "
+                         "where RX1 found no cell (e.g. --gain 20 --gain2 45)")
     ap.add_argument("--format", choices=["auto", "cfile", "sc16"], default="auto",
                     help="file format; auto = .sc16 extension -> sc16, else cfile")
     ap.add_argument("--skip-empty", action="store_true",
@@ -348,7 +429,8 @@ def main():
     ap.add_argument("--probe-secs", type=float, default=2.0,
                     help="--skip-empty gives up if no sync within this much capture (default 2.0)")
     args = ap.parse_args()
-    global SKIP_EMPTY, STOP_EARLY, PROBE_SECS, RETRIES
+    global SKIP_EMPTY, STOP_EARLY, PROBE_SECS, RETRIES, GAIN2
+    GAIN2 = args.gain2 if (args.gain2 is not None and args.radio == "bladerf" and not args.file) else None
     SKIP_EMPTY = args.skip_empty or args.fast
     STOP_EARLY = args.stop_early or args.fast
     PROBE_SECS = args.probe_secs
@@ -360,7 +442,7 @@ def main():
         CENTER = args.center * 1e6
     if args.secs is not None:
         SECS = args.secs
-    GAIN = args.gain if args.gain is not None else (40.0 if RADIO == "bladerf" else 50.0)
+    GAIN = args.gain if args.gain is not None else (20.0 if RADIO == "bladerf" else 50.0)   # bladerf 40 overloads
     if args.file:
         PATH = os.path.abspath(os.path.expanduser(args.file))
     elif RADIO == "bladerf":
@@ -389,39 +471,37 @@ def main():
         mode.append("retries %d" % RETRIES)
     print("decode mode: %s" % (" + ".join(mode) if mode else "full (Owen's original)"), flush=True)
     print("%d channels in the %.0f MS/s capture, one after another on this Pi" % (len(chans), RATE / 1e6), flush=True)
-    cells = 0
-    unique = {}
-    status_count, status_time, synced_only = {}, {}, []
     t_dec = time.time()
-    for index, (arfcn, freq) in enumerate(chans, 1):
-        print("%d/%d  ARFCN %d  %.1f MHz" % (index, len(chans), arfcn, freq / 1e6), flush=True)
-        t0 = time.time()
-        lines, status = decode(n_in, arfcn, freq)
-        took = time.time() - t0
-        status_count[status] = status_count.get(status, 0) + 1
-        status_time[status] = status_time.get(status, 0.0) + took
-        if not lines:
-            if status == "synced, no cell ID":
-                synced_only.append((arfcn, freq))
-                print("  SYNCED but no cell ID decoded  (%.1fs)" % took, flush=True)
-            elif status == "no sync":
-                print("  nothing on this channel  (no sync, %.1fs)" % took, flush=True)
-            else:
-                print("  nothing on this channel  (%.1fs)" % took, flush=True)
-            continue
-        for text in lines:
-            cells += 1
-            print(text, flush=True)
-            plain = re.sub("\x1b\\[[0-9;]*m", "", text)
-            cid = plain.split("CID:")[1].split(",")[0].strip() if "CID:" in plain else "?"
-            unique.setdefault((arfcn, cid), plain.split(", Pwr")[0])
-        print("  (%.1fs)" % took, flush=True)
+    unique, cells, status_count, status_time, synced_only = decode_all(n_in, chans, "RX1" if GAIN2 is not None else None)
+    rx2_added = []
+    if GAIN2 is not None:
+        done = {a for (a, _cid) in unique}
+        todo = [(a, f) for (a, f) in chans if a not in done]
+        print("", flush=True)
+        print("===== RX2 (gain %g): %d channel(s) RX1 found nothing on =====" % (GAIN2, len(todo)), flush=True)
+        keep_path = PATH
+        PATH = PATH2
+        u2, c2, sc2, st2, so2 = decode_all(n_in, todo, "RX2")
+        PATH = keep_path
+        cells += c2
+        for k, v in u2.items():
+            if k not in unique:
+                unique[k] = v
+                rx2_added.append(k)
+        for k in sc2:
+            status_count["RX2 " + k] = sc2[k]
+            status_time["RX2 " + k] = st2[k]
+        synced_only = [x for x in synced_only if x[0] not in {a for a, _ in u2}] + \
+            [x for x in so2 if x[0] not in {a for a, _ in synced_only}]
     dec_secs = time.time() - t_dec
     print("cells", cells, flush=True)
     print("")
     print("===== %d unique cell(s) =====" % len(unique), flush=True)
     for key in sorted(unique, key=lambda k: (k[0] < 900, k[0])):
-        print("  " + unique[key], flush=True)
+        print("  " + unique[key] + ("   <- RX2 only" if key in rx2_added else ""), flush=True)
+    if GAIN2 is not None:
+        print("RX1 (gain %g) found %d, RX2 (gain %g) added %d" % (GAIN, len(unique) - len(rx2_added), GAIN2,
+              len(rx2_added)), flush=True)
     if synced_only:
         print("")
         print("GSM carrier present but no cell ID decoded (try longer --secs / other gain):", flush=True)

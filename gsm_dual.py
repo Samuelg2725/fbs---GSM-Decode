@@ -109,7 +109,7 @@ class dual(gr.top_block):
         return (10 * math.log10(p) if p > 0 else -999.0), peak
 
 
-def build(args, freq):
+def build(args, freq, check=True, quiet=False):
     kinds = SOURCES if args.src == "auto" else [args.src]
     gains, agcs = (args.gain1, args.gain2), (args.agc1, args.agc2)
     last_err = None
@@ -127,6 +127,8 @@ def build(args, freq):
             continue
         if muted:
             F.clean.restore(*muted)
+        if not check:
+            return tb, kind
         # both channels must actually deliver samples
         time.sleep(1.5)
         lv = [tb.level(0)[0], tb.level(1)[0]]
@@ -145,6 +147,98 @@ def build(args, freq):
              "Try: --src soapy --verbose  to see the full error." % last_err)
 
 
+def sweep(args):
+    """Both antennas on each channel in turn; a channel counts as found if EITHER decodes its cell ID.
+    The decoder is rebuilt per channel (same as gsm_arfcn_fast --fresh)."""
+    BW[0] = max(200e3, float(args.bw))
+    names = (tag("RX1", args.agc1, args.gain1), tag("RX2", args.agc2, args.gain2))
+    chans = []
+    for a in args.arfcn:
+        f = gsm.arfcn.arfcn2downlink(a)
+        if f is None or f < 100e6:
+            sys.exit("ARFCN %d is not a downlink channel" % a)
+        chans.append((a, f))
+    print("dual sweep %d channels  %s  |  %s  |  dwell %.1fs  filter %.0f kHz" % (
+        len(chans), names[0], names[1], args.dwell, BW[0] / 1e3), flush=True)
+    for pid in F.other_scanners():
+        try:
+            os.kill(pid, signal.SIGINT)
+        except OSError:
+            pass
+    signal.signal(signal.SIGINT, F._first_ctrl_c_only)
+    found = {}          # arfcn -> [text, set(channels that ever decoded it)]
+    tb, kind = None, None
+    t_all = time.time()
+    passes = 0
+    try:
+        while args.passes == 0 or passes < args.passes:
+            passes += 1
+            t_pass = time.time()
+            for a, f in chans:
+                if tb is not None:
+                    try:
+                        tb.stop()
+                        tb.wait()
+                    except Exception:
+                        pass
+                    del tb
+                tb, kind = build(args, f, check=(kind is None))
+                if kind and passes == 1 and a == chans[0][0]:
+                    print("streaming via %s" % kind, flush=True)
+                if kind and args.src == "auto":
+                    args.src = kind              # keep the route that worked
+                t0 = time.time()
+                seen, got, text = [0, 0], set(), None
+                while time.time() - t0 < args.dwell:
+                    for ch in (0, 1):
+                        try:
+                            n = tb.dbg[ch].num_messages()
+                        except Exception:
+                            continue
+                        while seen[ch] < n:
+                            msg = tb.dbg[ch].get_message(seen[ch])
+                            seen[ch] += 1
+                            t = F.si3_text(F.blob_of(msg), a, f)
+                            if t:
+                                got.add(ch)
+                                text = text or t
+                    if got == {0, 1} or (got and time.time() - t0 > 1.0):
+                        break                     # both have it, or one has it and we gave the other 1 s
+                    time.sleep(0.02)
+                took = time.time() - t0
+                if got:
+                    who = "RX1+RX2" if got == {0, 1} else ("RX1 only" if got == {0} else "RX2 only")
+                    print("%s  %5.1fs  [%-8s] %s" % (F.clean.now_stamp(), took, who, text), flush=True)
+                    plain = re.sub("\x1b\\[[0-9;]*m", "", text).split(", Pwr")[0]
+                    found.setdefault(a, [plain, set()])[1].update(got)
+                else:
+                    print("%s  %5.1fs  ARFCN %d  no cell" % (F.clean.now_stamp(), took, a), flush=True)
+            print("pass %d done in %.1fs, %d cell(s) so far" % (passes, time.time() - t_pass, len(found)), flush=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except KeyboardInterrupt:
+            pass
+        if tb is not None:
+            try:
+                tb.stop()
+            except Exception:
+                pass
+    r1 = sum(1 for v in found.values() if 0 in v[1])
+    r2 = sum(1 for v in found.values() if 1 in v[1])
+    only2 = sum(1 for v in found.values() if v[1] == {1})
+    only1 = sum(1 for v in found.values() if v[1] == {0})
+    print("\n===== %d unique cell(s) in %.0fs =====" % (len(found), time.time() - t_all))
+    for a in sorted(found, key=lambda k: (k < 900 and k > 500, k < 900, k)):
+        v = found[a]
+        who = "RX1+RX2" if v[1] == {0, 1} else ("RX1 only" if v[1] == {0} else "RX2 only")
+        print("  [%-8s] %s" % (who, v[0]))
+    print("%s found %d   %s found %d   (RX1 only %d, RX2 only %d)" % (names[0], r1, names[1], r2, only1, only2))
+    return 0
+
+
 def tag(name, agc, gain):
     return "%s %s" % (name, "AGC" if agc else "g%g" % gain)
 
@@ -152,7 +246,10 @@ def tag(name, agc, gain):
 def main():
     ap = argparse.ArgumentParser(description="Two-antenna GSM tracking (BladeRF RX1+RX2, different gains).",
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
-    ap.add_argument("--arfcn", type=int, required=True)
+    ap.add_argument("--arfcn", type=int, nargs="+", required=True,
+                    help="one ARFCN = track it; several = sweep them (both antennas on every channel)")
+    ap.add_argument("--dwell", type=float, default=2.5, help="sweep: seconds per channel (default 2.5)")
+    ap.add_argument("--passes", type=int, default=1, help="sweep: rounds (default 1, 0 = forever)")
     ap.add_argument("--gain1", type=float, default=20.0, help="RX1 gain (default 20: strong cells)")
     ap.add_argument("--gain2", type=float, default=45.0, help="RX2 gain (default 45: weak cells)")
     ap.add_argument("--agc1", action="store_true", help="RX1 uses the radio's AGC instead of --gain1")
@@ -169,6 +266,9 @@ def main():
     args = ap.parse_args()
 
     BW[0] = max(200e3, float(args.bw))
+    if len(args.arfcn) > 1:
+        return sweep(args)
+    args.arfcn = args.arfcn[0]
     freq = gsm.arfcn.arfcn2downlink(args.arfcn)
     if freq is None or freq < 100e6:
         sys.exit("ARFCN %d is not a downlink channel" % args.arfcn)

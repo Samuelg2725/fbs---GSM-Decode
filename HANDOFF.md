@@ -210,6 +210,12 @@ DUAL RESULT 2026-11-25 13:10 (home): gr-soapy streams both channels ("streaming 
   13 clips the ADC and buries 9; at g20 9 (-106) is below noise. Added --bw (analog filter, min 200 kHz)
   to gsm_dual.py and gsm_arfcn_fast.py to filter the neighbour out before the ADC. Merge fix: a 2nd decode
   from the same channel within 0.3 s is a new broadcast (COMBINED was 1 below RX1).
+DUAL PROVEN 2026-11-25 13:18: both g20 -> RX1 100%, RX2 100%, every broadcast on both. Swapped (RX1 g45,
+  RX2 g20) -> RX1 32% (clipping), RX2 100%, combined 100%. RX2 decode path works; earlier zeros = clipping.
+  Added two-antenna DISCOVERY: gsm_dual.py --arfcn A B C ... = sweep (both antennas per channel, rebuilt per
+  channel, found if either decodes, summary says RX1/RX2 only); gsm_wide.py --gain2 G = record RX1+RX2
+  together (bladeRF-cli channel=1,2), decode RX1, then RX2 only on channels RX1 found nothing on.
+  gsm_wide bladerf default gain 40 -> 20.
 Also LTE: O2 816 MHz decoded = eNB 541524 sector 120 TAC 50496 PLMN 234-10 (matches phone).
 Next decode-rate candidates: restart threshold (2 s fixed now), fixed --ppm, gain/overload,
 unbounded message_debug memory on long runs.
