@@ -641,6 +641,7 @@ def main():
     if not L.pdsch_ue().is_file():
         sys.exit("srsRAN pdsch_ue was not found at %s - build it first (see README)." % L.pdsch_ue())
     lte_fastsync.install()
+    L.clean_leftovers()
     if args.earfcn is not None:
         args.freq_mhz_now = L.earfcn_to_mhz(args.earfcn)
         if args.freq_mhz_now is None:

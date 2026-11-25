@@ -460,6 +460,33 @@ def pdsch_ue():
     return H._pdsch()
 
 
+def _srsran_child():
+    """In the srsRAN process before it starts: its own process group (so it can be stopped as a whole) and
+    stopped automatically if this tool ends for any reason, even when killed for lack of memory."""
+    os.setsid()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, 9)     # PR_SET_PDEATHSIG = SIGKILL
+    except Exception:
+        pass
+
+
+def clean_leftovers():
+    """Stop srsRAN / LTE / GSM tools left running by an earlier run and delete their temporary files."""
+    import glob
+    n = C.stop_leftovers(("lte_decode", "lte_track", "gsm_arfcn_fast", "gsm_dual", "gsm_neigh"), ("pdsch_ue",))
+    freed = 0
+    for f in glob.glob("/dev/shm/lte_dec_*") + glob.glob("/dev/shm/tmp*.cf32") + [SC16]:
+        try:
+            freed += os.path.getsize(f)
+            os.remove(f)
+        except OSError:
+            pass
+    if n or freed > 50e6:
+        C.warn("Cleaned up after an earlier run: stopped %d leftover process(es), freed %.0f MB of memory."
+               % (n, freed / 1e6))
+
+
 def run_pdsch(path, pci, n_prb, n_sf, timeout, ports=2):
     """srsRAN pdsch_ue on an aligned capture file; stopped as soon as it prints the SIB1 identity line.
     ports: the cell's number of transmit antennas (1, 2 or 4) - in file mode srsRAN only tries this one."""
@@ -467,7 +494,7 @@ def run_pdsch(path, pci, n_prb, n_sf, timeout, ports=2):
            "-n", str(n_sf)]
     if shutil.which("stdbuf"):
         cmd = ["stdbuf", "-oL", "-eL"] + cmd
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, preexec_fn=_srsran_child)
     buf = b""
     deadline = time.time() + timeout
     try:
@@ -514,7 +541,7 @@ def decode_cell(samples, rate, hit, args, freq_mhz, aligned=None):
         out["status"] = "frame timing not found"
         return out
     out["aligned"] = aligned
-    with tempfile.NamedTemporaryFile(suffix=".cf32", delete=False, dir="/dev/shm") as fh:
+    with tempfile.NamedTemporaryFile(prefix="lte_dec_", suffix=".cf32", delete=False, dir="/dev/shm") as fh:
         path = Path(fh.name)
     try:
         aligned.tofile(path)
@@ -912,6 +939,7 @@ def main():
     if not pdsch_ue().is_file():
         sys.exit("srsRAN pdsch_ue was not found at %s - build it first (see README)." % pdsch_ue())
     lte_fastsync.install()
+    clean_leftovers()
     freqs = list(args.freq_mhz or [])
     args.targets = {}
     for item in args.cells or []:

@@ -197,5 +197,42 @@ def ignore_ctrl_c():
         pass
 
 
+def stop_leftovers(script_names=(), program_names=()):
+    """Stop processes left from earlier runs: python scripts with one of script_names in their command line, and
+    programs named in program_names (e.g. srsRAN's pdsch_ue left running after its tool was killed - they keep
+    the CPU at 100% and slow every new run down). This process and its parents are never touched.
+    Returns the number stopped."""
+    import signal
+    keep, pid = set(), os.getpid()
+    while pid > 1:                                   # this process and its ancestors
+        keep.add(pid)
+        try:
+            pid = int(open("/proc/%d/stat" % pid).read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    found = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit() or int(name) in keep:
+            continue
+        try:
+            cmd = open("/proc/%s/cmdline" % name, "rb").read().replace(b"\x00", b" ").decode(errors="replace")
+        except OSError:
+            continue
+        if not cmd:
+            continue
+        exe = os.path.basename(cmd.split()[0])
+        if exe in program_names or ("python" in exe and any(t in cmd for t in script_names)):
+            found.append(int(name))
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for p in found:
+            try:
+                os.kill(p, sig)
+            except OSError:
+                pass
+        if found and sig == signal.SIGTERM:
+            time.sleep(1.0)
+    return len(found)
+
+
 def rate_colour(pct):
     return "green" if pct >= 95 else ("yellow" if pct >= 70 else "red")
