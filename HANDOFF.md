@@ -372,6 +372,11 @@ finds can be decoded. New options:
   806 run also lost SIB1). Best known LTE command = --gain 20 --auto-gain --all-pci --fast-srsran
   --weak-search --search-secs 0.08 --siblings (6/13 phone cells). Open: 2144.7 MIB; EE 1800 + Three 2100
   no sync even at g53-55 (antenna?); 793.5 too weak.
+  16:5x: 816 PCI 0 DECODED with --secs 1.0 + --siblings = 541524:110 (phone match) -> 7/13.
+  Added: align_wide searches the first 40 ms (full capture fallback) - 1 s captures were slow (11 s).
+  --dual: capture_dual() (bladeRF-cli channel=1,2, n=2N, gains after rx config, 'set agc off'), search on
+  both antennas (union), per-cell MRC weights from that cell's PSS on its 5 ms comb (cell_weights), decode
+  w1*x1+w2*x2. Synthetic: equal antennas +3 dB; always >= best single antenna; naive sum is worse.
 
 ## LTE srsRAN (for lte_decode.py --engine srsran)
 *** LTE DECODE CONFIRMED 2026-11-25 10:57 (home): BladeRF capture at 806 MHz (15.36 Msps, low-IF 0.6)

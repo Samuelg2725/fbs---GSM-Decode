@@ -49,6 +49,7 @@ def earfcn_to_mhz(earfcn):
 
 
 LAST_PEAK = [0.0]
+X2 = [None]          # --dual: RX2's capture
 CUR_FREQ = [0.0]
 
 
@@ -84,6 +85,77 @@ def capture(freq_hz, rate, secs, gain, low_if_hz=0.0):
     print("  capture level %.1f dBFS, peak %.2f of full scale%s (gain %g)" % (
         lvl, pk, "  CLIPPING - use a lower --gain" if pk >= 0.99 else "", gain), flush=True)
     return condition(iq, rate, low_if_hz), took
+
+
+def capture_dual(freq_hz, rate, secs, gain, low_if_hz=0.0):
+    """RX1 + RX2 together (shared tuner, same gain). Returns ((x1, x2), capture_seconds) or (None, s)."""
+    n = int(rate * (secs + 0.01))
+    if os.path.exists(SC16):
+        os.remove(SC16)
+    tune = freq_hz + low_if_hz
+    cmd = ["bladeRF-cli", "-e", "set agc off",
+           "-e", "set frequency rx %d" % int(tune),
+           "-e", "set samplerate rx %d" % int(rate),
+           "-e", "set bandwidth rx %d" % int(min(rate * 0.9, 56e6)),
+           # two channels: n= counts samples of both together; gains after 'rx config' reach both channels
+           "-e", "rx config file=%s format=bin n=%d channel=1,2 samples=16384 buffers=64 xfers=16 timeout=20000"
+           % (SC16, 2 * n),
+           "-e", "set gain rx1 %d" % int(gain), "-e", "set gain rx2 %d" % int(gain),
+           "-e", "rx start", "-e", "rx wait %d" % int(secs * 6000 + 15000)]
+    env = dict(os.environ)
+    env["LD_LIBRARY_PATH"] = BLADE_LIBS + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+    t0 = time.time()
+    p = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    took = time.time() - t0
+    size = os.path.getsize(SC16) if os.path.exists(SC16) else 0
+    if size < n * 8 * 0.9:
+        print("dual capture is short (%d of %d bytes). bladeRF-cli said:" % (size, n * 8), flush=True)
+        print(p.stdout.decode(errors="replace")[-600:], flush=True)
+        return None, took
+    raw = np.fromfile(SC16, np.int16).astype(np.float32).reshape(-1, 4) / 2048.0
+    out = []
+    pk_all = 0.0
+    for i, name in ((0, "RX1"), (2, "RX2")):
+        iq = (raw[:, i] + 1j * raw[:, i + 1]).astype(np.complex64)[int(rate * 0.01):]
+        pk = float(np.max(np.abs(raw[:, i:i + 2])))
+        pk_all = max(pk_all, pk)
+        lvl = 10 * np.log10(float(np.mean(np.abs(iq) ** 2)) + 1e-20)
+        print("  %s level %.1f dBFS, peak %.2f%s (gain %g)" % (name, lvl, pk,
+              "  CLIPPING" if pk >= 0.99 else "", gain), flush=True)
+        out.append(condition(iq, rate, low_if_hz))
+    LAST_PEAK[0] = pk_all
+    return (out[0], out[1]), took
+
+
+def cell_weights(x1, x2, rate, pci, cfo_hz):
+    """Per-cell maximum-ratio combining weights for two antennas, from THIS cell's PSS: correlate each
+    antenna's narrowband signal with the cell's PSS on its 5 ms comb and average the complex peaks; the
+    weights are their conjugates (co-phase + favour the antenna that hears this cell better).
+    Returns (w1, w2, h1, h2)."""
+    import lte_sync as S
+    from lte_pci_search import resample_to_lte
+    tpl = S.pss_time(pci % 3)
+    tpl = tpl / np.linalg.norm(tpl)
+    hs = []
+    folds = []
+    ys = []
+    for x in (x1, x2):
+        y = np.asarray(resample_to_lte(np.asarray(x[:int(rate * 0.2)]), rate), dtype=np.complex128)
+        if cfo_hz:
+            y = y * np.exp(-2j * np.pi * cfo_hz * np.arange(len(y)) / S.FS)
+        n = len(y) + len(tpl) - 1
+        nf = 1 << (n - 1).bit_length()
+        c = np.fft.ifft(np.fft.fft(y, nf) * np.conj(np.fft.fft(tpl, nf)))[:len(y)]
+        ys.append(c)
+        per = len(c) // S._PERIOD
+        folds.append((np.abs(c[:per * S._PERIOD]) ** 2).reshape(per, S._PERIOD).sum(axis=0))
+    phase = int(np.argmax(folds[0] + folds[1]))           # same timing on both antennas
+    for c in ys:
+        idx = np.arange(phase, len(c), S._PERIOD)
+        hs.append(complex(np.mean(c[idx])) if len(idx) else 0j)
+    h1, h2 = hs
+    norm = np.sqrt(abs(h1) ** 2 + abs(h2) ** 2) + 1e-20
+    return np.conj(h1) / norm, np.conj(h2) / norm, h1, h2
 
 
 def condition(samples, rate, low_if_hz):
@@ -234,7 +306,10 @@ def align_wide(samples, rate, pci, cfo_hz):
     1024 = 15.36 Msps; 23.04/30.72 Msps captures for 15/20 MHz cells need 1536/2048)."""
     from lte_cellid import _derotate, _locate_wide
     corrected = _derotate(np.asarray(samples), cfo_hz, rate)
-    start = _locate_wide(corrected, pci, int(round(rate / 15000.0)))
+    nfft = int(round(rate / 15000.0))
+    start = _locate_wide(corrected[:int(rate * 0.04)], pci, nfft)      # 4 frames are plenty, much faster
+    if start is None and len(corrected) > int(rate * 0.04):
+        start = _locate_wide(corrected, pci, nfft)
     if start is None:
         return None
     return np.asarray(corrected[start:], dtype=np.complex64)
@@ -476,24 +551,40 @@ def srsran_strongest_fast(samples, rate, freq_mhz, args):
     return None
 
 
-def srsran_all(samples, rate, freq_mhz, args):
-    """--all-pci: every cell the sync search hears on this carrier, each decoded by srsRAN."""
+def srsran_all(samples, rate, freq_mhz, args, x2=None):
+    """--all-pci: every cell the sync search hears on this carrier, each decoded by srsRAN.
+    x2 (with --dual): RX2's capture; search runs on both antennas, each cell is decoded from the two
+    antennas combined with that cell's own maximum-ratio weights."""
     import hackrf_lte_decode as H
     if not H._pdsch().is_file():
         print("  srsRAN pdsch_ue not found at %s - see HANDOFF 'LTE srsRAN' to build it" % H._pdsch(), flush=True)
         return None
     t0 = time.time()
-    s_in = samples[:int(rate * args.search_secs)] if args.search_secs else samples
-    if args.weak_search:
-        report = search_all_cells(s_in, rate, args.pss_min, args.debug_search)
-    else:
-        report = search_samples(s_in, rate)
+    def one_search(x):
+        s_in = x[:int(rate * args.search_secs)] if args.search_secs else x
+        if args.weak_search:
+            return search_all_cells(s_in, rate, args.pss_min, args.debug_search)
+        return search_samples(s_in, rate)
+    report = one_search(samples)
+    if x2 is not None:
+        # union of what each antenna hears (a cell can be strong on one antenna and missed on the other)
+        rep2 = one_search(x2)
+        have = {h["pci"] for h in report["hits"]}
+        for h in rep2["hits"]:
+            if h["pci"] not in have:
+                h = dict(h)
+                h["rx2_only"] = True
+                report["hits"].append(h)
+        report["hits"].sort(key=lambda h: h["pss_ratio"], reverse=True)
+        s_in = samples[:int(rate * args.search_secs)] if args.search_secs else samples
     if args.debug_search and not args.weak_search:
-        search_all_cells(s_in, rate, args.pss_min, True)
+        search_all_cells(samples[:int(rate * args.search_secs)] if args.search_secs else samples,
+                         rate, args.pss_min, True)
     hits = report["hits"]
     print("  sync search %.1fs: %d cell(s) heard on %.1f MHz: %s" % (
         time.time() - t0, len(hits), freq_mhz,
-        ", ".join("PCI %d (strength %.0f)%s" % (h["pci"], h["pss_ratio"], "*" if h.get("second_pass") else "")
+        ", ".join("PCI %d (strength %.0f)%s%s" % (h["pci"], h["pss_ratio"], "*" if h.get("second_pass") else "",
+                                                 " [RX2 only]" if h.get("rx2_only") else "")
                   for h in hits) or "none"), flush=True)
     if any(h.get("second_pass") for h in hits):
         print("  (* = found only by --weak-search)", flush=True)
@@ -502,9 +593,17 @@ def srsran_all(samples, rate, freq_mhz, args):
     tried = {}
     for h in hits:
         t1 = time.time()
-        res = srsran_cell(samples, rate, h, args)
+        extra = ""
+        if x2 is not None:
+            w1, w2, h1, h2 = cell_weights(samples, x2, rate, int(h["pci"]), float(h.get("offset_hz", 0.0)))
+            comb = (w1 * samples + w2 * x2).astype(np.complex64)
+            share = abs(h1) ** 2 / (abs(h1) ** 2 + abs(h2) ** 2 + 1e-30)
+            extra = "  [RX1 %.0f%% / RX2 %.0f%% of this cell]" % (100 * share, 100 * (1 - share))
+            res = srsran_cell(comb, rate, h, args)
+        else:
+            res = srsran_cell(samples, rate, h, args)
         tried[res["pci"]] = res
-        line = res["ident"] if res["ident"] else res["status"]
+        line = (res["ident"] if res["ident"] else res["status"]) + extra
         print("  PCI %-3d strength %4.0f  %s  (%.1fs)" % (res["pci"], res["strength"], line, time.time() - t1),
               flush=True)
     if args.siblings:
@@ -557,6 +656,11 @@ def run_once(args, freq_mhz, rate):
     CUR_FREQ[0] = freq_mhz
     if args.file:
         samples = condition(load_file(args.file, rate), rate, args.low_if_mhz * 1e6)
+    elif args.dual:
+        pair, timing["capture"] = capture_dual(freq_mhz * 1e6, rate, args.secs, args.gain, args.low_if_mhz * 1e6)
+        if pair is None:
+            return None, timing, rate
+        samples, X2[0] = pair
     else:
         samples, timing["capture"] = capture(freq_mhz * 1e6, rate, args.secs, args.gain, args.low_if_mhz * 1e6)
         if samples is None:
@@ -574,7 +678,11 @@ def run_once(args, freq_mhz, rate):
         if True:
             print("  auto gain: %g -> %g and capturing again" % (args.gain, new_gain), flush=True)
             args.gain = new_gain
-            samples, tc = capture(freq_mhz * 1e6, rate, args.secs, args.gain, args.low_if_mhz * 1e6)
+            if args.dual:
+                pair, tc = capture_dual(freq_mhz * 1e6, rate, args.secs, args.gain, args.low_if_mhz * 1e6)
+                samples, X2[0] = pair if pair is not None else (None, None)
+            else:
+                samples, tc = capture(freq_mhz * 1e6, rate, args.secs, args.gain, args.low_if_mhz * 1e6)
             timing["capture"] = timing.get("capture", 0) + tc
             if samples is None:
                 return None, timing, rate
@@ -582,16 +690,20 @@ def run_once(args, freq_mhz, rate):
         if args.all_pci or args.fast_srsran:
             if not args.all_pci:
                 return srsran_strongest_fast(samples, rate, freq_mhz, args), timing, rate
-            res = srsran_all(samples, rate, freq_mhz, args)
+            res = srsran_all(samples, rate, freq_mhz, args, X2[0] if args.dual else None)
             need = res.get("need_rate") if res else None
             if need and need > rate and args.rate == "auto" and not args.file:
                 print("  a cell is wider than this %.2f Msps capture - capturing again at %.2f Msps"
                       % (rate / 1e6, need / 1e6), flush=True)
-                samples, tc = capture(freq_mhz * 1e6, need, args.secs, args.gain, args.low_if_mhz * 1e6)
+                if args.dual:
+                    pair, tc = capture_dual(freq_mhz * 1e6, need, args.secs, args.gain, args.low_if_mhz * 1e6)
+                    samples, X2[0] = pair if pair is not None else (None, None)
+                else:
+                    samples, tc = capture(freq_mhz * 1e6, need, args.secs, args.gain, args.low_if_mhz * 1e6)
                 timing["capture"] = timing.get("capture", 0) + tc
                 if samples is not None:
                     rate = need
-                    srsran_all(samples, rate, freq_mhz, args)
+                    srsran_all(samples, rate, freq_mhz, args, X2[0] if args.dual else None)
             return None, timing, rate
         return srsran_decode(samples, rate, freq_mhz, args), timing, rate
     results, t, report = decode(samples, rate, args.pci, args.all_pci)
@@ -707,6 +819,10 @@ def main():
     ap.add_argument("--try-ports", action="store_true",
                     help="if the MIB fails with 2 antenna ports (Owen's fixed -P 2), retry with 4 and 1 "
                          "(srsRAN file mode must be told the port count; many 1800/2100 cells use 4)")
+    ap.add_argument("--dual", action="store_true",
+                    help="record RX1 + RX2 together (both antennas, same gain); search both, decode each cell from "
+                         "the two antennas combined with that cell's own weights (up to ~3 dB, more when one "
+                         "antenna sits in a weak spot). Needs --all-pci")
     ap.add_argument("--fast-srsran", action="store_true",
                     help="srsran engine: stop pdsch_ue as soon as the cell identity is printed instead of also "
                          "running the other 3 bandwidth attempts (default = old behaviour)")
