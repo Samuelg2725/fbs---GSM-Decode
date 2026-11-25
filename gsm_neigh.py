@@ -6,7 +6,7 @@ and use them to find cells without sweeping the whole band.
   LD_LIBRARY_PATH=/usr/local/lib python3 ~/gsm_neigh.py --arfcn 13 119 --follow
         # start at 13 and 119, then visit every neighbour they list, then those cells' neighbours ...
   LD_LIBRARY_PATH=/usr/local/lib python3 ~/gsm_neigh.py --seed-sweep --follow
-        # no starting cell known: sweep 900 (fresh, sync-skip) only until the first cell, then follow
+        # no starting cell known: check every 4th 900 channel, follow every cell found, retry weak ones
 
 Each channel gets a fresh decoder (same as gsm_arfcn_fast --fresh), gain 20 by default.
 A channel is left after --sync-secs without GSM sync; with sync it waits up to --dwell for the cell ID
@@ -32,6 +32,7 @@ BAND900 = list(range(975, 1024)) + list(range(1, 125))
 # open BladeRF instead of closing + reopening it (~0.3 s per channel instead of ~2.8 s). This is what
 # gsm_arfcn_fast --fresh does implicitly.
 _PREV = [None]
+BAND_SET = set(BAND900)
 
 
 def quietly(fn):
@@ -117,7 +118,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--arfcn", type=int, nargs="+", help="cell(s) to read / start from")
     ap.add_argument("--seed-sweep", action="store_true",
-                    help="no start cell: sweep the 900 band until the first cell decodes, start from it")
+                    help="no start cell: check every --stride'th channel of the 900 band, follow each cell found")
     ap.add_argument("--follow", action="store_true", help="visit every listed neighbour, then theirs, ...")
     ap.add_argument("--gain", type=float, default=20.0)
     ap.add_argument("--dwell", type=float, default=5.0,
@@ -125,6 +126,10 @@ def main():
     ap.add_argument("--min-secs", type=float, default=2.5,
                     help="stay at least this long on a cell to catch SI2bis/2ter (default 2.5)")
     ap.add_argument("--sync-secs", type=float, default=1.2, help="leave a channel without GSM sync after this")
+    ap.add_argument("--stride", type=int, default=4,
+                    help="--seed-sweep: check every Nth channel for starting cells (default 4; 1 = every channel)")
+    ap.add_argument("--retry-dwell", type=float, default=8.0,
+                    help="channels that synced without a cell ID get one more try this long (0 = off)")
     args = ap.parse_args()
     if not args.arfcn and not args.seed_sweep:
         sys.exit("give --arfcn N [N ...] or --seed-sweep")
@@ -134,51 +139,67 @@ def main():
     t_all = time.time()
     queue = list(args.arfcn or [])
     done, cells, listed_by = {}, {}, {}
+    # seed sweep: every --stride'th channel of the band; each cell found is followed straight away,
+    # then the stride pass carries on (so every operator's block gets a starting cell)
+    seeds = BAND900[::max(1, args.stride)] if args.seed_sweep else []
+    if seeds:
+        print("seed sweep: every %d%s channel of the 900 band (%d channels), following each cell found"
+              % (args.stride, {1: "st", 2: "nd", 3: "rd"}.get(args.stride, "th"), len(seeds)), flush=True)
+
+    def handle(a, r, retry=False):
+        allnb = sorted(set(x for lst in r["lists"].values() for x in lst))
+        tag = " (retry)" if retry else ""
+        if r["cell"]:
+            cells[a] = r
+            print("%s  %4.1fs  %s%s" % (F.clean.now_stamp(), r["secs"], r["cell"], tag), flush=True)
+            for name in ("SI2", "SI2bis", "SI2ter"):
+                if name in r["lists"]:
+                    print("        %-6s (%s): %s" % (name, r["formats"][name], fmt_list(r["lists"][name])),
+                          flush=True)
+            if not r["lists"]:
+                print("        no neighbour list decoded in %.1fs (try --dwell 8)" % r["secs"], flush=True)
+            if r["si2quater"]:
+                print("        SI2quater present (3G/LTE neighbours - not decoded yet)", flush=True)
+            for x in allnb:
+                listed_by.setdefault(x, set()).add(a)
+            if args.follow:
+                new = [x for x in allnb if x not in done and x not in queue]
+                if new:
+                    print("        -> queue %d new: %s" % (len(new), fmt_list(new)), flush=True)
+                queue.extend(new)
+        else:
+            why = "synced, no cell ID" if r["synced"] else "no GSM sync"
+            print("%s  %4.1fs  ARFCN %d  %s%s" % (F.clean.now_stamp(), r["secs"], a, why, tag), flush=True)
+            if r["synced"] and not retry:
+                # GSM energy here but no ID: usually the spill-over of a real cell 1-2 channels away
+                near = [x for x in (a - 1, a + 1, a - 2, a + 2) if x in BAND_SET and x not in done and x not in queue]
+                if near:
+                    print("        -> sync without ID, checking next to it: %s" % fmt_list(near), flush=True)
+                    queue.extend(near)
+
     try:
-        if not queue:
-            print("seed sweep: looking for a first cell in the 900 band ...", flush=True)
-            for a in BAND900:
-                r = visit(args, a)
-                done[a] = r
-                if not r["cell"]:
-                    print("%s  %4.1fs  ARFCN %d  %s" % (F.clean.now_stamp(), r["secs"], a,
-                          "synced, no cell ID" if r["synced"] else "no GSM sync"), flush=True)
-                if r["cell"]:
-                    print("  first cell after %.0fs: %s" % (time.time() - t_all, r["cell"]), flush=True)
-                    queue = [a]
-                    del done[a]
-                    break
-            if not queue:
-                print("no cell found in the 900 band", flush=True)
-                return 1
-        while queue:
-            a = queue.pop(0)
+        while queue or seeds:
+            a = queue.pop(0) if queue else seeds.pop(0)
             if a in done:
                 continue
             r = visit(args, a)
             done[a] = r
-            allnb = sorted(set(x for lst in r["lists"].values() for x in lst))
-            if r["cell"]:
-                cells[a] = r
-                print("%s  %4.1fs  %s" % (F.clean.now_stamp(), r["secs"], r["cell"]), flush=True)
-                for name in ("SI2", "SI2bis", "SI2ter"):
-                    if name in r["lists"]:
-                        print("        %-6s (%s): %s" % (name, r["formats"][name], fmt_list(r["lists"][name])),
-                              flush=True)
-                if not r["lists"]:
-                    print("        no neighbour list decoded in %.1fs (try --dwell 8)" % r["secs"], flush=True)
-                if r["si2quater"]:
-                    print("        SI2quater present (3G/LTE neighbours - not decoded yet)", flush=True)
-                for x in allnb:
-                    listed_by.setdefault(x, set()).add(a)
-                if args.follow:
-                    new = [x for x in allnb if x not in done and x not in queue]
-                    if new:
-                        print("        -> queue %d new: %s" % (len(new), fmt_list(new)), flush=True)
-                    queue += new
-            else:
-                why = "synced, no cell ID" if r["synced"] else "no GSM sync"
-                print("%s  %4.1fs  ARFCN %d  %s" % (F.clean.now_stamp(), r["secs"], a, why), flush=True)
+            handle(a, r)
+        # second chance for channels that locked but gave no cell ID (weak cells, e.g. ARFCN 1)
+        # (only channels a cell lists as a neighbour, and not right next to a decoded cell - those are spill-over)
+        again = [a for a, r in done.items() if r["synced"] and not r["cell"] and a in listed_by
+                 and not any(abs(a - c) == 1 for c in cells)]
+        if again and args.retry_dwell > 0:
+            print("retrying %d channel(s) that synced without a cell ID (dwell %.0fs): %s"
+                  % (len(again), args.retry_dwell, fmt_list(again)), flush=True)
+            keep = args.dwell
+            args.dwell = args.retry_dwell
+            for a in again:
+                r = visit(args, a)
+                if r["cell"]:
+                    done[a] = r
+                handle(a, r, retry=True)
+            args.dwell = keep
     except KeyboardInterrupt:
         pass
     finally:

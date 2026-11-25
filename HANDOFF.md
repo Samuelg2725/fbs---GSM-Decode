@@ -75,7 +75,12 @@ Lime (live, Owen's rig): python3 gsm_arfcn_fast.py --arfcn 13 --df   (osmosdr dr
                      range 1024/512/256/128, variable bitmap; range decoder checked against libosmocore's
                      explicit formulas). --follow visits neighbours of neighbours; --seed-sweep finds a first
                      cell itself. Flags SI2quater (3G/LTE neighbours) as present - decoding it = next step.
-                     Untested on air. Sanity check: Vodafone cells should list 1/6/13/22.
+                     PI 14:30: --arfcn 13 119 --follow = 7/7 in 147 s, 33 ch (Vodafone SI2 lists 1-22, O2
+                     113-123 = whole operator blocks, bitmap0; every cell has SI2quater). Seed sweep that
+                     stopped at the first cell found only Vodafone (lists never cross operators) -> now:
+                     every --stride (4) channel, follow each cell, 'synced no ID' -> also check +-1/+-2
+                     (spill-over from a real cell), retry listed weak channels once (8 s). Re-uses the open
+                     BladeRF (old flowgraph kept until the new one runs) ~1.4 s/empty channel.
 - lte_track.py       LTE TRACKING. Default = CAPTURE MODE: lock once (probe PCI/CFO, MIB -> RB), then loop
                      0.1 s capture -> align (first 30 ms only) -> pdsch_ue stopped at first SIB1; re-lock
                      after 3 misses. --live = srsRAN live receiver: FAILED at home 12:5x (endless cell search,
