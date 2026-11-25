@@ -231,7 +231,9 @@ WIDEBAND --best RESULT 2026-11-25 13:32-13:42: decode itself found 6,13,22 (942.
   LTE 930.1, 64-72 = O2 LTE 952.5 -> rescue spent ~7 min on LTE. DECISION (user): stick with NARROW.
   Narrow sweep cost was ~5.6 s/channel for a 3 s dwell (2.6 s = reopening the radio). Added
   gsm_dual.py --quick: radio stays open (retune + disconnect_all + fresh decoder chains), and a channel is
-  left after --sync-secs (1.2) if neither antenna has GSM sync (receiver C0 bursts). Stub-tested only.
+  left after --sync-secs (1.2) if neither antenna has GSM sync (receiver C0 bursts). Pi 13:44: sync skip works
+  (5/5, 33.5 s vs 39 s) but retune failed: disconnect_all() leaves gsm_input's inner FIR behind
+  ('insufficient connected') -> now disconnects each recorded edge; falls back to reopening if it fails.
 Also LTE: O2 816 MHz decoded = eNB 541524 sector 120 TAC 50496 PLMN 234-10 (matches phone).
 Next decode-rate candidates: restart threshold (2 s fixed now), fixed --ppm, gain/overload,
 unbounded message_debug memory on long runs.

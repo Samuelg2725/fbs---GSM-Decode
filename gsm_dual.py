@@ -77,6 +77,15 @@ class dual(gr.top_block):
     def _chains(self, freq):
         """Two fresh decoder chains (+ level meters) behind the source."""
         self.dbg, self.probe, self.keep, self.sync = [], [], [], []
+        self.edges, self.msg_edges = [], []
+
+        def conn(*bl):
+            self.connect(*bl)
+            self.edges.append(bl)
+
+        def mconn(a, pa, b, pb):
+            self.msg_connect(a, pa, b, pb)
+            self.msg_edges.append((a, pa, b, pb))
         for ch in (0, 1):
             gi = gsm.gsm_input(ppm=0, osr=4, fc=freq, samp_rate_in=SAMP)
             rx = gsm.receiver(4, ([0]), ([]))
@@ -84,16 +93,16 @@ class dual(gr.top_block):
             dm = gsm.gsm_bcch_ccch_demapper(0)
             dec = gsm.control_channels_decoder()
             dbg = blocks.message_debug()
-            self.connect((self.src, ch), (gi, 0))
-            self.connect((gi, 0), (rx, 0))
-            self.msg_connect(clk, "ctrl", gi, "ctrl_in")
-            self.msg_connect(rx, "C0", dm, "bursts")
-            self.msg_connect(rx, "measurements", clk, "measurements")
-            self.msg_connect(dm, "bursts", dec, "bursts")
-            self.msg_connect(dec, "msgs", dbg, "store")
+            conn((self.src, ch), (gi, 0))
+            conn((gi, 0), (rx, 0))
+            mconn(clk, "ctrl", gi, "ctrl_in")
+            mconn(rx, "C0", dm, "bursts")
+            mconn(rx, "measurements", clk, "measurements")
+            mconn(dm, "bursts", dec, "bursts")
+            mconn(dec, "msgs", dbg, "store")
             # the receiver only emits C0 bursts once it has locked to a cell's FCCH+SCH
             syn = blocks.message_debug()
-            self.msg_connect(rx, "C0", syn, "store")
+            mconn(rx, "C0", syn, "store")
             self.sync.append(syn)
             # level meter: mean |x|^2 over ~0.1 s, and peak |x| (clipping check)
             mag = blocks.complex_to_mag_squared(1)
@@ -104,8 +113,8 @@ class dual(gr.top_block):
             st = blocks.stream_to_vector(gr.sizeof_float, 20000)
             mxv = blocks.max_ff(20000, 1)
             prp = blocks.probe_signal_f()
-            self.connect((self.src, ch), mag, avg, pr)
-            self.connect((self.src, ch), pk, st, mxv, prp)
+            conn((self.src, ch), mag, avg, pr)
+            conn((self.src, ch), pk, st, mxv, prp)
             self.dbg.append(dbg)
             self.probe.append((pr, prp))
             self.keep += [gi, rx, clk, dm, dec, mag, avg, pk, st, mxv]
@@ -123,7 +132,12 @@ class dual(gr.top_block):
             self.wait()
         except Exception:
             pass
-        self.disconnect_all()
+        # remove our connections one by one: disconnect_all() leaves gsm_input's inner filter behind
+        # ("fir_filter_blk ... insufficient connected")
+        for e in self.msg_edges:
+            self.msg_disconnect(*e)
+        for e in self.edges:
+            self.disconnect(*e)
         for ch in (0, 1):
             if self.kind == "soapy":
                 self.src.set_frequency(ch, freq)
