@@ -83,6 +83,9 @@ def condition(samples, rate, low_if_hz):
     if low_if_hz:
         idx = np.arange(len(samples))
         samples = samples * np.exp(1j * 2 * np.pi * float(low_if_hz) * idx / float(rate))
+        # the radio's DC spike is now at +low_if: notch it out (same as Owen's HackRF path)
+        from hackrf_capture import notch_tone
+        samples = notch_tone(samples, float(low_if_hz), rate)
     return samples.astype(np.complex64)
 
 
