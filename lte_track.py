@@ -10,9 +10,11 @@ with the raw IQ recordings saved for later decoding or direction finding.
   Save every recording instead of only those with a new cell:
       python3 lte_track.py --earfcn 6400 --save-iq all
 
-Every cycle (about 2-4 s once the cells are known) it:
-  1. records --secs of the carrier (the radio is kept open between recordings);
-  2. searches the recording for every PCI, including weaker cells under a strong one;
+Every cycle it:
+  1. records the carrier: a short --watch-secs recording when it only needs to see which PCIs are present,
+     the full --secs when something must be decoded or saved;
+  2. searches the recording for every PCI, including weaker cells under a strong one (and searches a second
+     window if a cell heard before is missing from the first);
   3. decodes with srsRAN any PCI it has not identified yet (Cell ID, eNB, sector, TAC, operator), and from
      time to time tries the other sectors of each decoded mast (they can be decoded with the mast's timing
      even when their own sync signal is too weak to be found);
@@ -264,14 +266,54 @@ class CycleLog(object):
 
 
 # ---------------------------------------------------------------------------------------------- track
-def search(args, rate, x1, x2):
-    hits = list(L.search_cells(x1, rate, args)["hits"])
+def _search_at(args, rate, x1, x2, start):
+    hits = list(L.search_cells(x1[start:], rate, args)["hits"])
     if x2 is not None:
         have = {h["pci"] for h in hits}
-        for h in L.search_cells(x2, rate, args)["hits"]:
+        for h in L.search_cells(x2[start:], rate, args)["hits"]:
             if h["pci"] not in have:
                 hits.append(dict(h, rx2_only=True))
     return hits
+
+
+def search(args, rate, x1, x2, expect=()):
+    """Cell search on the start of the recording. If a cell heard before is missing (one short search window
+    can miss a cell that is there), search a second window later in the same recording."""
+    hits = _search_at(args, rate, x1, x2, 0)
+    have = {int(h["pci"]) for h in hits}
+    if set(expect) - have and len(x1) >= int(rate * args.search_secs * 2):
+        for h in _search_at(args, rate, x1, x2, len(x1) // 2):
+            if int(h["pci"]) not in have:
+                have.add(int(h["pci"]))
+                hits.append(h)
+    return hits
+
+
+def recording(args, rate, secs):
+    keep, args.secs = args.secs, secs
+    try:
+        return L.record(args, args.freq_mhz_now, rate)
+    finally:
+        args.secs = keep
+
+
+def work_due(args, cells, cycles):
+    """True when this cycle needs a full-length recording: an unidentified PCI is due another srsRAN try,
+    or the other sectors of a mast are due a check."""
+    for cell in cells.values():
+        if cell.missing or cell.sector_only:
+            continue
+        if not cell.ident and cell.tries < args.max_tries and cycles - cell.last_try >= args.retry_every:
+            return True
+        if cell.ident and not args.no_siblings:
+            g = cell.pci // 3
+            for sib in (3 * g, 3 * g + 1, 3 * g + 2):
+                other = cells.get(sib)
+                if other is not None and not other.sector_only:
+                    continue
+                if cycles - args._sector_tried.get(sib, -999) >= args.sector_every:
+                    return True
+    return False
 
 
 def signal_for(args, rate, x1, x2, pci, offset):
@@ -306,9 +348,10 @@ def track(args):
         while args.cycles == 0 or cycles < args.cycles:
             cycles += 1
             t0 = time.time()
+            full = cycles == 1 or args.save_iq == "all" or work_due(args, cells, cycles)
             C.status("  cycle %d: recording..." % cycles)
             t_capture = time.time()
-            x1, x2 = L.record(args, args.freq_mhz_now, rate)
+            x1, x2 = recording(args, rate, args.secs if full else args.watch_secs)
             if cycles == 1:
                 L.SHOW_LEVELS[0] = True
                 x1, x2 = L.auto_gain(args, args.freq_mhz_now, rate, x1, x2)
@@ -324,8 +367,19 @@ def track(args):
             fails = 0
             peak = L.LAST_PEAK[0]
             raw = L.LAST_RAW[0]
+            t_rec = time.time() - t0
             C.status("  cycle %d: searching for cells..." % cycles)
-            hits = search(args, rate, x1, x2)
+            t1 = time.time()
+            hits = search(args, rate, x1, x2, [c.pci for c in cells.values() if not c.sector_only and not c.missing])
+            t_search = time.time() - t1
+            if not full and ({int(h["pci"]) for h in hits} - set(cells)):
+                # a new PCI: record the full length so it can be decoded and saved
+                C.status("  cycle %d: new PCI - recording %.1f s to decode it..." % (cycles, args.secs))
+                t_capture = time.time()
+                y1, y2 = recording(args, rate, args.secs)
+                if y1 is not None:
+                    x1, x2, full = y1, y2, True
+                    raw, peak = L.LAST_RAW[0], max(peak, L.LAST_PEAK[0])
             now = time.time()
             heard = {}                                          # pci -> (cell, offset, strength, how)
             new_pcis = []
@@ -366,7 +420,7 @@ def track(args):
             aligned = {}
             want_rate = rate
             for pci, (cell, offset, strength, how) in sorted(heard.items(), key=lambda kv: -kv[1][2]):
-                if cell.ident:
+                if cell.ident or not full:
                     continue
                 if cell.tries and (cell.tries >= args.max_tries or cycles - cell.last_try < args.retry_every):
                     continue
@@ -384,7 +438,7 @@ def track(args):
 
             # the other sectors of each decoded mast (same frame timing) - new masts at once, then every
             # --sector-every cycles to confirm they are still there
-            if not args.no_siblings:
+            if full and not args.no_siblings:
                 groups = {}
                 for pci, (cell, offset, _s, _h) in heard.items():
                     if cell.ident:
@@ -435,7 +489,7 @@ def track(args):
 
             # save the raw IQ
             iq_file = None
-            if writer and raw is not None and (args.save_iq == "all" or new_pcis):
+            if writer and raw is not None and full and (args.save_iq == "all" or new_pcis):
                 in_file = []
                 for pci, (cell, offset, strength, _how) in heard.items():
                     a = aligned.get(pci)
@@ -464,7 +518,8 @@ def track(args):
                                                 "red" if peak >= 0.99 else "grey"),
                 "  ".join(parts) if parts else C.c("no LTE cell heard", "red"),
                 C.c("   IQ saved" if iq_file else "", "grey"),
-                ""), flush=True)
+                C.c("   (record %.1fs, search %.1fs%s)" % (t_rec, t_search, ", full" if full else ""), "grey")
+                ), flush=True)
             for pci, (cell, _o, strength, how) in heard.items():
                 log.add(args, cycles, cell, "search" if strength else "sector check", strength, iq_file)
 
@@ -513,7 +568,10 @@ def main():
     ap.add_argument("--dual", action="store_true", help="use both antennas (RX1 + RX2); recordings hold both")
     ap.add_argument("--gain", type=float, default=20.0, help="starting gain in dB (default 20, then automatic)")
     ap.add_argument("--no-auto-gain", action="store_true", help="keep --gain fixed")
-    ap.add_argument("--secs", type=float, default=1.0, help="recording length per cycle, s (default 1.0)")
+    ap.add_argument("--secs", type=float, default=1.0,
+                    help="recording length for decoding and for saved IQ, s (default 1.0)")
+    ap.add_argument("--watch-secs", type=float, default=0.2,
+                    help="recording length on cycles that only check which PCIs are present, s (default 0.2)")
     ap.add_argument("--cycles", type=int, default=0, help="stop after this many cycles (default 0 = until Ctrl-C)")
     ap.add_argument("--save-iq", choices=("new", "all", "none"), default="new",
                     help="save recordings: 'new' = when a new PCI appears (default), 'all' = every cycle, 'none'")

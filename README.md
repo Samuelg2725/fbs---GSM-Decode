@@ -101,7 +101,8 @@ EARFCN carries many cells (different PCIs); this shows them all as they come and
   cell can be picked out of the shared channel later. With `--dual` each sample holds RX1 and RX2 together
   (same tuner, so the phase between antennas is kept). One second is 61 MB (123 MB with two antennas);
   the oldest recordings are deleted above `--iq-max-gb` (default 20).
-- A cycle takes about 2–4 s once the cells are known (longer when a new cell is being decoded).
+- Cycles that only check which PCIs are present use a short 0.2 s recording (`--watch-secs`); a full 1 s
+  recording is taken when something must be decoded or saved. Each line shows the record and search times.
   Installing `python3-soapysdr` (`sudo apt install python3-soapysdr`) keeps the radio open between recordings
   and saves 1–2 s per cycle; without it bladeRF-cli is used.
 - On Ctrl-C: a table of every PCI (identity, how often heard, strength, first/last seen), plus
