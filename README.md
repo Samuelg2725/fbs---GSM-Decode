@@ -1,0 +1,138 @@
+# GSM and LTE cell identity decoder (BladeRF 2.0 + Raspberry Pi 5)
+
+Finds the mobile-network cells around you and decodes their identity:
+
+- **GSM (2G):** channel (ARFCN), operator, LAC and Cell ID — scan a whole band, or track one cell continuously.
+- **LTE (4G):** carrier, PCI, operator, TAC, eNB, sector and Cell ID — every cell the radio can hear on each
+  carrier, not only the strongest.
+
+Results are printed as colour-coded tables, and saved to CSV files in `~/field/`.
+
+---
+
+## Quick start
+
+Run everything from the repository folder, with the BladeRF library on the path:
+
+```bash
+cd ~/fbs-upload
+export LD_LIBRARY_PATH=/usr/local/lib
+```
+
+| I want to… | Command |
+|---|---|
+| Find every GSM cell in the 900 MHz band (~4 min) | `python3 gsm_arfcn_fast.py --band 900` |
+| Find every GSM cell in the 1800 MHz band | `python3 gsm_arfcn_fast.py --band 1800` |
+| Check some GSM channels | `python3 gsm_arfcn_fast.py --arfcn 1 6 13 22 114 116 119` |
+| Track one GSM cell continuously | `python3 gsm_arfcn_fast.py --arfcn 13` |
+| Track one GSM cell with both antennas | `python3 gsm_dual.py --arfcn 13` |
+| Read a GSM cell's neighbour list | `python3 gsm_neigh.py --arfcn 13` |
+| Decode LTE carriers by frequency | `python3 lte_decode.py --freq-mhz 806 816 952.5` |
+| Decode LTE carriers by channel number | `python3 lte_decode.py --earfcn 6300 6400 3725 223` |
+| Decode LTE with both antennas | `python3 lte_decode.py --freq-mhz 816 --dual` |
+
+Press **Ctrl-C** at any time: the tool stops cleanly and prints its summary table.
+Add `--help` to any command to see all options.
+
+Only one tool can use the BladeRF at a time.
+
+---
+
+## GSM
+
+### Scan (`gsm_arfcn_fast.py --band …` or several `--arfcn`)
+Visits each channel in turn. Channels with no GSM signal are left after 1.2 s; a channel with a cell is held
+until its Cell ID is decoded (up to 2.5 s). Every channel gets a fresh decoder, which keeps the scan reliable.
+
+Useful options: `--passes 0` (repeat until Ctrl-C), `--verbose` (also list empty channels),
+`--csv ~/field/scan.csv` (save the results).
+
+### Track one cell (`gsm_arfcn_fast.py --arfcn N`)
+Prints every Cell-ID broadcast (a cell sends it about once a second) and, on exit, a summary: broadcasts
+decoded and missed, percentage caught, longest gap and signal level. The summary is also added to
+`~/field/track_summary.csv`. Use `--label NAME` to name the run.
+
+### Two antennas (`gsm_dual.py`)
+RX1 and RX2 listen to the same channel at different gains (default 20 dB and 40 dB). A strong cell that
+overloads the high-gain antenna is still decoded on the low-gain one, and a weak cell is picked up by the
+high-gain one. Each decode is tagged **[RX1+RX2]**, **[RX1 only]** or **[RX2 only]**.
+`--levels` shows both antennas' signal levels (and warns about clipping).
+
+### Neighbour lists (`gsm_neigh.py`)
+Shows the channels each cell tells phones to measure. `--follow` visits every listed channel in turn.
+Operators usually list their whole channel block, so most listed channels have no cell.
+
+### Gain
+The default gain is **20 dB**. Higher gain (e.g. 40) overloads the radio near strong cells and loses decodes.
+If a strong neighbouring channel causes trouble, `--bw 300e3` narrows the radio's filter.
+
+---
+
+## LTE
+
+`lte_decode.py` records each carrier, searches for every cell (PCI) on it, and decodes each one with srsRAN.
+It automatically:
+
+- adjusts the gain for each band (800 MHz and 2100 MHz need very different gains);
+- searches again for weaker cells on the same carrier;
+- tries the other sectors of every mast it decodes (they share the mast's timing, so they can be decoded
+  even when their own sync signal is too weak to detect);
+- records again at a higher sample rate for 15 MHz and 20 MHz wide cells.
+
+Results go to `~/field/lte_cells.csv`. Useful options: `--dual` (both antennas), `--secs 2` (longer recording
+for weak sectors), `--no-auto-gain --gain N`.
+
+UK carriers seen during testing (EARFCN → MHz): 6175 → 793.5, 6225 → 798.5, 6300 → 806, 6400 → 816,
+3501 → 930.1, 3725 → 952.5, 1363 → 1821.3, 1617 → 1846.7, 1815 → 1866.5, 76 → 2117.6, 223 → 2132.3,
+347 → 2144.7. A phone network-monitor app shows which ones are used where you are.
+
+---
+
+## Example output
+
+```
+== GSM cells found: 7   (1 pass(es), 257 s) ==========================
++-------+-------+----------+---------+-------+---------+-------+------+
+| ARFCN |   MHz | Operator | MCC-MNC |   LAC | Cell ID | Power | Seen |
++-------+-------+----------+---------+-------+---------+-------+------+
+|     1 | 935.2 | Vodafone | 234-15  |    98 |   16631 |   -66 |  1/1 |
+|    13 | 937.6 | Vodafone | 234-15  |    98 |     942 |   -29 |  1/1 |
+|   119 | 958.8 | O2       | 234-10  | 22860 |   22679 |   -33 |  1/1 |
+...
+```
+
+---
+
+## Setup (once)
+
+1. **BladeRF library** (libbladeRF 2.x and `bladeRF-cli`) installed in `/usr/local/lib`.
+2. **GNU Radio 3.10, gr-gsm, gr-osmosdr and gr-soapy** with the SoapySDR BladeRF module
+   (`SoapySDRUtil --find` should list the BladeRF).
+3. **srsRAN 4G** (for LTE), built with the small patch in `osprey 2/srsran_watch` that prints the SIB1 cell
+   identity:
+   ```bash
+   sudo apt install -y build-essential cmake libfftw3-dev libmbedtls-dev libboost-program-options-dev libconfig++-dev libsctp-dev
+   cd ~ && git clone --depth 1 https://github.com/srsran/srsRAN_4G.git
+   python3 ~/fbs-upload/"osprey 2"/srsran_watch/print_sib1.py
+   mkdir -p ~/srsRAN_4G/build && cd ~/srsRAN_4G/build && cmake .. && make -j3 pdsch_ue
+   ```
+4. Optional check that the fast LTE search gives the same answers as the original code:
+   `python3 lte_fastsync.py` (ends with `OK`).
+
+---
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `gsm_arfcn_fast.py` | GSM band / channel scan and single-cell tracking |
+| `gsm_dual.py` | GSM with both antennas (tracking and scan) |
+| `gsm_neigh.py` | GSM neighbour lists |
+| `gsm_freqlist.py` | Decoder for GSM frequency lists (used by `gsm_neigh.py`) |
+| `lte_decode.py` | LTE cell identity decoder |
+| `lte_fastsync.py` | Faster LTE cell search (identical results) |
+| `common.py` | Shared tables, colours and operator names |
+| `osprey 2/` | LTE signal-processing library and the srsRAN patch |
+| `NOTES.md` | Technical notes and test findings |
+
+Set `NO_COLOR=1` (or pass `--no-color`) for plain text output.

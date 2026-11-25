@@ -7,7 +7,7 @@ Same maths, same answers (checked against the originals: python3 lte_fastsync.py
                  hypotheses are scored with one matrix product per (gap, delta).
   _correlate_mag the original uses numpy's single-threaded FFT; here scipy.fft on all CPU cores.
 
-Owen's file is not edited: install() swaps the functions in at runtime (lte_decode.py --slow-search skips it).
+The "osprey 2" files are not edited: install() swaps the functions in at runtime (lte_decode.py calls it).
 """
 import numpy as np
 
@@ -108,7 +108,7 @@ def correlate_mag_fast(spectrum, template, length):
 
 
 class _FFTProxy(object):
-    """np.fft stand-in for lte_sync: the one big zero-padded FFT in search_cell (power-of-2 size, e.g. 262144
+    """numpy.fft stand-in for lte_sync: the one big zero-padded FFT in search_cell (power-of-2 size, e.g. 262144
     for 153600 samples) is done at the smallest fast size that still holds the full linear correlation
     (~154k) on all cores. Every other np.fft call passes straight through to numpy."""
     def __getattr__(self, name):

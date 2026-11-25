@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Decode GSM frequency lists (3GPP TS 44.018 10.5.2.1b / 10.5.2.13 / 10.5.2.22 / 10.5.2.22a).
+"""Decoder for GSM frequency lists (3GPP TS 44.018 sections 10.5.2.1b, 10.5.2.13, 10.5.2.22, 10.5.2.22a).
 
-Used for the neighbour lists a cell broadcasts:
+Used by gsm_neigh.py for the neighbour lists a cell broadcasts:
   SI2    (type 0x1a)  Neighbour Cell Description          -> BCCH frequencies of neighbour cells
   SI2bis (type 0x02)  Neighbour Cell Description (ext.)   -> more of them (when SI2 has EXT-IND set)
   SI2ter (type 0x03)  Neighbour Cell Description 2        -> other-band neighbours (e.g. 1800 from 900)
@@ -152,7 +152,7 @@ def neighbours(raw):
 
 
 if __name__ == "__main__":
-    # bit map 0 self-check: ARFCNs 1, 6, 13, 22, 124
+    # self-check with a bit map 0 list containing ARFCNs 1, 6, 13, 22 and 124
     data = bytearray(16)
     for a in (1, 6, 13, 22, 124):
         data[15 - ((a - 1) >> 3)] |= 1 << ((a - 1) & 7)

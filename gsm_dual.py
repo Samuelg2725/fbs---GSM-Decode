@@ -1,439 +1,153 @@
 #!/usr/bin/env python3
-"""Two-antenna GSM tracking on the BladeRF: RX1 and RX2 on the SAME ARFCN at DIFFERENT gains,
-one decoder each, results merged. Gain stops being a guess: a strong cell is caught by the
-low-gain channel, a weak one by the high-gain channel.
+"""Two-antenna GSM on the BladeRF: RX1 and RX2 on the same channel at different gains, one decoder each.
+A cell that overloads the high-gain antenna is still decoded by the low-gain one, and a weak cell that is
+lost on the low-gain antenna is picked up by the high-gain one, so no single gain has to be guessed.
 
-  LD_LIBRARY_PATH=/usr/local/lib python3 ~/gsm_dual.py --arfcn 13
-  LD_LIBRARY_PATH=/usr/local/lib python3 ~/gsm_dual.py --arfcn 9 --gain1 20 --gain2 50
-  LD_LIBRARY_PATH=/usr/local/lib python3 ~/gsm_dual.py --arfcn 13 --agc1 --gain2 45
-  LD_LIBRARY_PATH=/usr/local/lib python3 ~/gsm_dual.py --arfcn 13 --levels      # only show signal levels
+  Track one channel (both antennas):
+      python3 gsm_dual.py --arfcn 13
+      python3 gsm_dual.py --arfcn 13 --gain1 20 --gain2 45
+  Scan channels or a band with both antennas:
+      python3 gsm_dual.py --band 900
+      python3 gsm_dual.py --arfcn 1 6 13 22 114 116 119
+  Show both antennas' signal levels only (checks the gains / clipping):
+      python3 gsm_dual.py --arfcn 13 --levels
 
-Every broadcast prints once, tagged with who decoded it: [RX1+RX2], [RX1 only], [RX2 only].
-The summary (every --stats-every s and on Ctrl-C, also a row in --summary-csv) gives decoded/missed
-for RX1 alone, RX2 alone and both combined, so the second antenna's value is measured, not assumed.
-level = signal level in dB below full scale per channel: near 0 dBFS = clipping (gain too high).
-
-The two channels share one tuner (same frequency, same sample rate) but have separate gains.
---src picks how both channels are streamed (auto tries them in order until both deliver samples).
+Each decoded cell ID is tagged with which antenna decoded it: [RX1+RX2], [RX1 only] or [RX2 only].
+The radio's two receive channels share one tuner (same frequency) but have independent gains.
+Run with LD_LIBRARY_PATH=/usr/local/lib.
 """
 import argparse
+import math
 import os
-import re
-import signal
 import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-sys.path.insert(1, os.path.expanduser("~"))
-import gsm_arfcn_fast as F            # noqa: E402  (decoder helpers + clean output module)
-from gnuradio import blocks, gr, gsm  # noqa: E402
+import common as C                     # noqa: E402
+import gsm_arfcn_fast as G             # noqa: E402
+from gnuradio import blocks, gr, gsm   # noqa: E402
 
-SAMP = 2e6
-SOURCES = ["soapy", "osmo-soapy", "osmo-numchan", "osmo-nchan"]
-
-
-BW = [SAMP]   # analog filter bandwidth (shared by RX1/RX2), set from --bw
+SAMPLE_RATE = 2e6
 
 
-def make_source(kind, freq, gains, agcs):
-    """Return a block with 2 outputs (RX1, RX2), already configured."""
-    if kind == "soapy":
+class DualReceiver(gr.top_block):
+    """SoapySDR BladeRF source with two channels -> one gr-gsm decoder per channel + level meters."""
+
+    def __init__(self, freq, gains, agcs, bandwidth):
+        gr.top_block.__init__(self, "gsm_dual")
         from gnuradio import soapy
-        src = soapy.source("driver=bladerf", "fc32", 2, "", "", ["", ""], ["", ""])
+        self.src = soapy.source("driver=bladerf", "fc32", 2, "", "", ["", ""], ["", ""])
         for ch in (0, 1):
-            src.set_sample_rate(ch, SAMP)
-            src.set_frequency(ch, freq)
-            src.set_bandwidth(ch, BW[0])
-            src.set_gain_mode(ch, bool(agcs[ch]))
+            self.src.set_sample_rate(ch, SAMPLE_RATE)
+            self.src.set_frequency(ch, freq)
+            self.src.set_bandwidth(ch, bandwidth)
+            self.src.set_gain_mode(ch, bool(agcs[ch]))
             if not agcs[ch]:
-                src.set_gain(ch, float(gains[ch]))
-        return src
-    import osmosdr
-    args = {"osmo-soapy": "numchan=2 soapy=0,driver=bladerf",
-            "osmo-numchan": "numchan=2 bladerf=0",
-            "osmo-nchan": "bladerf=0,nchan=2"}[kind]
-    src = osmosdr.source(args=args)
-    if src.get_num_channels() < 2:
-        raise RuntimeError("only %d channel(s)" % src.get_num_channels())
-    src.set_sample_rate(SAMP)
-    for ch in (0, 1):
-        src.set_center_freq(freq, ch)
-        src.set_freq_corr(0, ch)
-        src.set_bandwidth(BW[0], ch)
-        src.set_gain_mode(bool(agcs[ch]), ch)
-        if not agcs[ch]:
-            src.set_gain(float(gains[ch]), ch)
-    return src
-
-
-class dual(gr.top_block):
-    def __init__(self, kind, freq, gains, agcs):
-        gr.top_block.__init__(self, "dual")
-        self.kind = kind
-        self.src = make_source(kind, freq, gains, agcs)
-        self._chains(freq)
-
-    def _chains(self, freq):
-        """Two fresh decoder chains (+ level meters) behind the source."""
-        self.dbg, self.probe, self.keep, self.sync, self.parts = [], [], [], [], []
-        self.dbg_base, self.sync_base = [0, 0], [0, 0]
-        self.edges, self.msg_edges = [], []
-
-        def conn(*bl):
-            self.connect(*bl)
-            self.edges.append(bl)
-
-        def mconn(a, pa, b, pb):
-            self.msg_connect(a, pa, b, pb)
-            self.msg_edges.append((a, pa, b, pb))
+                self.src.set_gain(ch, float(gains[ch]))
+        self.dbg, self.sync, self.meters, self._keep = [], [], [], []
         for ch in (0, 1):
-            gi = gsm.gsm_input(ppm=0, osr=4, fc=freq, samp_rate_in=SAMP)
+            gi = gsm.gsm_input(ppm=0, osr=4, fc=freq, samp_rate_in=SAMPLE_RATE)
             rx = gsm.receiver(4, ([0]), ([]))
-            clk = gsm.clock_offset_control(freq, SAMP, osr=4)
+            clk = gsm.clock_offset_control(freq, SAMPLE_RATE, osr=4)
             dm = gsm.gsm_bcch_ccch_demapper(0)
             dec = gsm.control_channels_decoder()
             dbg = blocks.message_debug()
-            conn((self.src, ch), (gi, 0))
-            conn((gi, 0), (rx, 0))
-            mconn(clk, "ctrl", gi, "ctrl_in")
-            mconn(rx, "C0", dm, "bursts")
-            mconn(rx, "measurements", clk, "measurements")
-            mconn(dm, "bursts", dec, "bursts")
-            mconn(dec, "msgs", dbg, "store")
-            # the receiver only emits C0 bursts once it has locked to a cell's FCCH+SCH
             syn = blocks.message_debug()
-            mconn(rx, "C0", syn, "store")
-            self.sync.append(syn)
-            self.parts.append((gi, rx, clk))
-            # level meter: mean |x|^2 over ~0.1 s, and peak |x| (clipping check)
-            mag = blocks.complex_to_mag_squared(1)
-            avg = blocks.moving_average_ff(int(SAMP * 0.1), 1.0 / (SAMP * 0.1), 4000, 1)
-            pr = blocks.probe_signal_f()
-            pk = blocks.complex_to_mag(1)
-            # peak |x| over blocks of 4096 samples (2 ms; power-of-two size avoids GNU Radio buffer warnings)
-            st = blocks.stream_to_vector(gr.sizeof_float, 4096)
-            mxv = blocks.max_ff(4096, 1)
-            prp = blocks.probe_signal_f()
-            conn((self.src, ch), mag, avg, pr)
-            conn((self.src, ch), pk, st, mxv, prp)
+            self.connect((self.src, ch), (gi, 0))
+            self.connect((gi, 0), (rx, 0))
+            self.msg_connect(clk, "ctrl", gi, "ctrl_in")
+            self.msg_connect(rx, "C0", dm, "bursts")
+            self.msg_connect(rx, "measurements", clk, "measurements")
+            self.msg_connect(dm, "bursts", dec, "bursts")
+            self.msg_connect(dec, "msgs", dbg, "store")
+            self.msg_connect(rx, "C0", syn, "store")
+            # level meter: mean power over 0.1 s, and peak magnitude over 2 ms blocks (clipping check)
+            mag2 = blocks.complex_to_mag_squared(1)
+            avg = blocks.moving_average_ff(int(SAMPLE_RATE * 0.1), 1.0 / (SAMPLE_RATE * 0.1), 4000, 1)
+            p_avg = blocks.probe_signal_f()
+            mag = blocks.complex_to_mag(1)
+            vec = blocks.stream_to_vector(gr.sizeof_float, 4096)
+            peak = blocks.max_ff(4096, 1)
+            p_peak = blocks.probe_signal_f()
+            self.connect((self.src, ch), mag2, avg, p_avg)
+            self.connect((self.src, ch), mag, vec, peak, p_peak)
             self.dbg.append(dbg)
-            self.probe.append((pr, prp))
-            self.keep += [gi, rx, clk, dm, dec, mag, avg, pk, st, mxv]
+            self.sync.append(syn)
+            self.meters.append((p_avg, p_peak))
+            self._keep += [gi, rx, clk, dm, dec, mag2, avg, mag, vec, peak]
+
+    def level(self, ch):
+        """(power dBFS, peak 0..1.4) for channel ch."""
+        p_avg, p_peak = self.meters[ch]
+        p = p_avg.level()
+        return (10 * math.log10(p) if p > 0 else -999.0), p_peak.level()
 
     def synced(self, ch):
         try:
-            return self.sync[ch].num_messages() > self.sync_base[ch]
+            return self.sync[ch].num_messages() > 0
         except Exception:
             return False
 
-    def retune(self, freq):
-        """Keep the radio open and the decoders connected; give them the new frequency and reset them
-        (Owen's retune). Message counts are re-based so old messages are ignored."""
+
+def open_dual(args, freq):
+    with C.quiet():
+        tb = DualReceiver(freq, (args.gain1, args.gain2), (args.agc1, args.agc2), args.bw)
+        tb.start()
+    return tb
+
+
+def close_dual(tb):
+    if tb is None:
+        return
+    with C.quiet():
         try:
-            self.stop()
-            self.wait()
+            tb.stop()
+            tb.wait()
         except Exception:
             pass
-        for ch in (0, 1):
-            if self.kind == "soapy":
-                self.src.set_frequency(ch, freq)
-            else:
-                self.src.set_center_freq(freq, ch)
-        for gi, rx, clk in self.parts:
-            for blk, calls in ((gi, (("set_fc", freq),)), (clk, (("set_fc", freq), ("reset", None))),
-                               (rx, (("reset", None),))):
-                for name, arg in calls:
-                    fn = getattr(blk, name, None)
-                    if fn is None:
-                        continue
-                    try:
-                        fn() if arg is None else fn(arg)
-                    except Exception:
-                        pass
-        self.dbg_base = [d.num_messages() for d in self.dbg]
-        self.sync_base = [d.num_messages() for d in self.sync]
-        self.start()
-
-    def level(self, ch):
-        import math
-        pr, prp = self.probe[ch]
-        p = pr.level()
-        peak = prp.level()
-        return (10 * math.log10(p) if p > 0 else -999.0), peak
 
 
-def build(args, freq, check=True, quiet=False):
-    kinds = SOURCES if args.src == "auto" else [args.src]
-    gains, agcs = (args.gain1, args.gain2), (args.agc1, args.agc2)
-    last_err = None
-    for kind in kinds:
-        muted = F.clean.silence() if not args.verbose else None
-        tb = None
-        try:
-            tb = dual(kind, freq, gains, agcs)
-            tb.start()
-        except Exception as exc:
-            last_err = "%s: %s" % (kind, exc)
-            if muted:
-                F.clean.restore(*muted)
-            print("  source %-12s failed to open (%s)" % (kind, str(exc).splitlines()[0][:80]), flush=True)
-            continue
-        if muted:
-            F.clean.restore(*muted)
-        if not check:
-            return tb, kind
-        # both channels must actually deliver samples
-        time.sleep(1.5)
-        lv = [tb.level(0)[0], tb.level(1)[0]]
-        if min(lv) <= -998:
-            print("  source %-12s opened but channel(s) silent (levels %s) - trying next" % (
-                kind, ", ".join("%.0f" % x for x in lv)), flush=True)
-            try:
-                tb.stop()
-                tb.wait()
-            except Exception:
-                pass
-            del tb
-            continue
-        return tb, kind
-    sys.exit("no source could stream both channels. Last error: %s\n"
-             "Try: --src soapy --verbose  to see the full error." % last_err)
+def gain_name(n, agc, gain):
+    return "RX%d %s" % (n, "AGC" if agc else "gain %g" % gain)
 
 
-def sweep(args):
-    """Both antennas on each channel in turn; a channel counts as found if EITHER decodes its cell ID.
-    The decoder is rebuilt per channel (same as gsm_arfcn_fast --fresh)."""
-    BW[0] = max(200e3, float(args.bw))
-    names = (tag("RX1", args.agc1, args.gain1), tag("RX2", args.agc2, args.gain2))
-    chans = []
-    for a in args.arfcn:
-        f = gsm.arfcn.arfcn2downlink(a)
-        if f is None or f < 100e6:
-            sys.exit("ARFCN %d is not a downlink channel" % a)
-        chans.append((a, f))
-    print("dual sweep %d channels  %s  |  %s  |  dwell %.1fs  filter %.0f kHz" % (
-        len(chans), names[0], names[1], args.dwell, BW[0] / 1e3), flush=True)
-    for pid in F.other_scanners():
-        try:
-            os.kill(pid, signal.SIGINT)
-        except OSError:
-            pass
-    signal.signal(signal.SIGINT, F._first_ctrl_c_only)
-    found = {}          # arfcn -> [text, set(channels that ever decoded it)]
-    tb, kind = None, None
-    t_all = time.time()
-    passes = 0
-    try:
-        while args.passes == 0 or passes < args.passes:
-            passes += 1
-            t_pass = time.time()
-            for a, f in chans:
-                if tb is not None and args.keep_open:
-                    try:
-                        tb.retune(f)
-                    except Exception as exc:
-                        print("  retune failed (%s) - reopening the radio" % str(exc)[:60], flush=True)
-                        try:
-                            tb.stop()
-                            tb.wait()
-                        except Exception:
-                            pass
-                        tb = None
-                elif tb is not None:
-                    try:
-                        tb.stop()
-                        tb.wait()
-                    except Exception:
-                        pass
-                    del tb
-                    tb = None
-                if tb is None:
-                    tb, kind = build(args, f, check=(kind is None))
-                if kind and passes == 1 and a == chans[0][0]:
-                    print("streaming via %s" % kind, flush=True)
-                if kind and args.src == "auto":
-                    args.src = kind              # keep the route that worked
-                t0 = time.time()
-                seen, got, text = list(getattr(tb, "dbg_base", [0, 0])), set(), None
-                nosync = False
-                while time.time() - t0 < args.dwell:
-                    for ch in (0, 1):
-                        try:
-                            n = tb.dbg[ch].num_messages()
-                        except Exception:
-                            continue
-                        while seen[ch] < n:
-                            msg = tb.dbg[ch].get_message(seen[ch])
-                            seen[ch] += 1
-                            t = F.si3_text(F.blob_of(msg), a, f)
-                            if t:
-                                got.add(ch)
-                                text = text or t
-                    if got == {0, 1} or (got and time.time() - t0 > 1.0):
-                        break                     # both have it, or one has it and we gave the other 1 s
-                    if ((args.quick or args.keep_open) and not got and time.time() - t0 > args.sync_secs
-                            and not tb.synced(0) and not tb.synced(1)):
-                        nosync = True
-                        break                     # no GSM sync on either antenna: nothing to wait for
-                    time.sleep(0.02)
-                took = time.time() - t0
-                if got:
-                    who = "RX1+RX2" if got == {0, 1} else ("RX1 only" if got == {0} else "RX2 only")
-                    print("%s  %5.1fs  [%-8s] %s" % (F.clean.now_stamp(), took, who, text), flush=True)
-                    plain = re.sub("\x1b\\[[0-9;]*m", "", text).split(", Pwr")[0]
-                    found.setdefault(a, [plain, set()])[1].update(got)
-                else:
-                    print("%s  %5.1fs  ARFCN %d  %s" % (F.clean.now_stamp(), took, a,
-                          "no GSM sync" if nosync else "no cell"), flush=True)
-            print("pass %d done in %.1fs, %d cell(s) so far" % (passes, time.time() - t_pass, len(found)), flush=True)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        try:
-            signal.signal(signal.SIGINT, signal.SIG_IGN)
-        except KeyboardInterrupt:
-            pass
-        if tb is not None:
-            try:
-                tb.stop()
-            except Exception:
-                pass
-    r1 = sum(1 for v in found.values() if 0 in v[1])
-    r2 = sum(1 for v in found.values() if 1 in v[1])
-    only2 = sum(1 for v in found.values() if v[1] == {1})
-    only1 = sum(1 for v in found.values() if v[1] == {0})
-    print("\n===== %d unique cell(s) in %.0fs =====" % (len(found), time.time() - t_all))
-    for a in sorted(found, key=lambda k: (k < 900 and k > 500, k < 900, k)):
-        v = found[a]
-        who = "RX1+RX2" if v[1] == {0, 1} else ("RX1 only" if v[1] == {0} else "RX2 only")
-        print("  [%-8s] %s" % (who, v[0]))
-    print("%s found %d   %s found %d   (RX1 only %d, RX2 only %d)" % (names[0], r1, names[1], r2, only1, only2))
-    return 0
+def who(chans):
+    return {frozenset({0, 1}): ("RX1+RX2", "green"), frozenset({0}): ("RX1 only", "cyan"),
+            frozenset({1}): ("RX2 only", "magenta")}[frozenset(chans)]
 
 
-def tag(name, agc, gain):
-    return "%s %s" % (name, "AGC" if agc else "g%g" % gain)
-
-
-def main():
-    ap = argparse.ArgumentParser(description="Two-antenna GSM tracking (BladeRF RX1+RX2, different gains).",
-                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
-    ap.add_argument("--arfcn", type=int, nargs="+", required=True,
-                    help="one ARFCN = track it; several = sweep them (both antennas on every channel)")
-    ap.add_argument("--dwell", type=float, default=2.5, help="sweep: seconds per channel (default 2.5)")
-    ap.add_argument("--passes", type=int, default=1, help="sweep: rounds (default 1, 0 = forever)")
-    ap.add_argument("--quick", action="store_true",
-                    help="sweep: move on after --sync-secs if neither antenna gets GSM sync (radio + decoders "
-                         "still rebuilt fresh per channel: 9 test channels 5/5 in 33 s vs 39 s)")
-    ap.add_argument("--keep-open", action="store_true",
-                    help="EXPERIMENTAL, UNRELIABLE: keep radio + decoders between channels (Owen-style retune). "
-                         "Full-band test 13:50 missed 13/22/116: decoder frequency correction drifts on empty channels")
-    ap.add_argument("--sync-secs", type=float, default=1.2,
-                    help="--quick: seconds to wait for GSM sync before moving on (default 1.2)")
-    ap.add_argument("--gain1", type=float, default=20.0, help="RX1 gain (default 20: strong cells)")
-    ap.add_argument("--gain2", type=float, default=45.0, help="RX2 gain (default 45: weak cells)")
-    ap.add_argument("--agc1", action="store_true", help="RX1 uses the radio's AGC instead of --gain1")
-    ap.add_argument("--agc2", action="store_true", help="RX2 uses the radio's AGC instead of --gain2")
-    ap.add_argument("--src", default="auto", choices=["auto"] + SOURCES)
-    ap.add_argument("--bw", type=float, default=2e6,
-                    help="analog filter bandwidth in Hz (default 2e6, min 200e3). Narrow it (e.g. 400e3) so a strong "
-                         "neighbouring cell is filtered out before the converter and high gain can work")
-    ap.add_argument("--levels", action="store_true", help="only print both channels' signal levels")
-    ap.add_argument("--label", default=None)
-    ap.add_argument("--stats-every", type=float, default=60.0)
-    ap.add_argument("--summary-csv", default="~/field/dual_summary.csv")
-    ap.add_argument("--verbose", action="store_true", help="show radio driver messages")
-    args = ap.parse_args()
-
-    BW[0] = max(200e3, float(args.bw))
-    if len(args.arfcn) > 1:
-        return sweep(args)
-    args.arfcn = args.arfcn[0]
-    freq = gsm.arfcn.arfcn2downlink(args.arfcn)
-    if freq is None or freq < 100e6:
-        sys.exit("ARFCN %d is not a downlink channel" % args.arfcn)
-    names = (tag("RX1", args.agc1, args.gain1), tag("RX2", args.agc2, args.gain2))
-    print("dual tracking ARFCN %d (%.1f MHz)  %s  |  %s  |  filter %.0f kHz" % (
-        args.arfcn, freq / 1e6, names[0], names[1], BW[0] / 1e3), flush=True)
-    for pid in F.other_scanners():
-        try:
-            os.kill(pid, signal.SIGINT)
-        except OSError:
-            pass
-    signal.signal(signal.SIGINT, F._first_ctrl_c_only)
-    tb, kind = build(args, freq)
-    print("streaming via %s" % kind, flush=True)
-
-    P = F.SI3_PERIOD
-    seen = [0, 0]
-    dec = [[], []]            # decode times per channel
-    events = []               # merged broadcasts: [t_first, set(channels), text]
-    pending = None
-    last_msg = time.time()
-    restarts = 0
+# -------------------------------------------------------------------------------------------- track
+def track(args, arfcn):
+    freq = G.downlink(arfcn)
+    if freq is None:
+        sys.exit("ARFCN %d is not a GSM downlink channel" % arfcn)
+    names = (gain_name(1, args.agc1, args.gain1), gain_name(2, args.agc2, args.gain2))
+    C.info("Two-antenna tracking of ARFCN %d (%.1f MHz): %s, %s, filter %.0f kHz. Ctrl-C to stop."
+           % (arfcn, freq / 1e6, names[0], names[1], args.bw / 1e3))
+    tb = open_dual(args, freq)
     t0 = time.time()
-    next_stats = t0 + args.stats_every if args.stats_every > 0 else None
+    seen, dec, events = [0, 0], [[], []], []      # events: [time, set(channels), cell]
+    pending, last_print, last_msg, restarts = None, None, time.time(), 0
     next_level = t0
-    last_print = None
 
-    def missed_of(times):
-        m, longest = 0, 0.0
-        for a, b in zip(times, times[1:]):
-            m += max(0, int(round((b - a) / P)) - 1)
-            longest = max(longest, b - a)
-        return m, longest
-
-    def summary(final=False):
-        run = time.time() - t0
-        u = [e[0] for e in events]
-        rows = []
-        for name, times in ((names[0], dec[0]), (names[1], dec[1]), ("COMBINED", u)):
-            m, lg = missed_of(times)
-            rate = 100.0 * len(times) / (len(times) + m) if times else 0.0
-            rows.append((name, len(times), m, rate, lg))
-        only1 = sum(1 for e in events if e[1] == {0})
-        only2 = sum(1 for e in events if e[1] == {1})
-        both = sum(1 for e in events if e[1] == {0, 1})
-        lv = [tb.level(0), tb.level(1)]
-        out = ["[%s] %.0fs  restarts %d  source %s" % (args.label, run, restarts, kind)]
-        for name, n, m, rate, lg in rows:
-            out.append("  %-12s decoded %4d  missed %4d  = %5.1f%% caught  longest gap %.1fs" % (name, n, m, rate, lg))
-        out.append("  broadcasts: both %d  RX1 only %d  RX2 only %d   levels RX1 %.0f dBFS (peak %.2f)  RX2 %.0f dBFS (peak %.2f)"
-                   % (both, only1, only2, lv[0][0], lv[0][1], lv[1][0], lv[1][1]))
-        print(("\n===== dual tracking summary =====\n" if final else "") + "\n".join(out), flush=True)
-        if final:
-            path = os.path.expanduser(args.summary_csv)
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            new = not os.path.exists(path)
-            with open(path, "a") as fh:
-                if new:
-                    fh.write("start_utc,label,arfcn,rx1,rx2,runtime_s,rx1_decoded,rx1_missed,rx1_pct,rx2_decoded,"
-                             "rx2_missed,rx2_pct,comb_decoded,comb_missed,comb_pct,both,rx1_only,rx2_only,restarts,source\n")
-                fh.write("%s,%s,%d,%s,%s,%.1f,%d,%d,%.1f,%d,%d,%.1f,%d,%d,%.1f,%d,%d,%d,%d,%s\n" % (
-                    time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t0)), args.label or "", args.arfcn,
-                    names[0], names[1], run, rows[0][1], rows[0][2], rows[0][3], rows[1][1], rows[1][2], rows[1][3],
-                    rows[2][1], rows[2][2], rows[2][3], both, only1, only2, restarts, kind))
-                print("  summary row added to %s" % path, flush=True)
-
-    def flush_pending(force=False):
+    def flush(force=False):
         nonlocal pending, last_print
         if pending and (force or time.time() - pending[0] > 0.3):
-            t, chans, text = pending
-            who = "RX1+RX2" if chans == {0, 1} else ("RX1 only" if chans == {0} else "RX2 only")
-            gap = (t - last_print) if last_print else (t - t0)
+            t, chans, cell = pending
+            gap = t - (last_print or t0)
             last_print = t
-            print("%s  %5.1fs  [%-8s] %s" % (F.clean.now_stamp(), gap, who, text), flush=True)
+            tag, col = who(chans)
+            print("%s  %s" % (G.cell_line(cell, gap), C.c("[%s]" % tag, col)), flush=True)
             pending = None
-
     try:
         while True:
             now = time.time()
             if args.levels and now >= next_level:
-                l1, l2 = tb.level(0), tb.level(1)
-                clip = lambda l: "  CLIPPING" if l[1] >= 0.99 else ""
-                print("%s  RX1 %6.1f dBFS peak %.2f%s   RX2 %6.1f dBFS peak %.2f%s   (difference %.1f dB)" % (
-                    F.clean.now_stamp(), l1[0], l1[1], clip(l1), l2[0], l2[1], clip(l2), l2[0] - l1[0]), flush=True)
+                (l1, p1), (l2, p2) = tb.level(0), tb.level(1)
+                clip = lambda p: C.c("  CLIPPING", "red") if p >= 0.99 else ""
+                print("%s  RX1 %6.1f dBFS peak %.2f%s   RX2 %6.1f dBFS peak %.2f%s   difference %.1f dB" % (
+                    C.c(C.now_stamp(), "grey"), l1, p1, clip(p1), l2, p2, clip(p2), l2 - l1), flush=True)
                 next_level = now + 1.0
             for ch in (0, 1):
                 try:
@@ -444,55 +158,173 @@ def main():
                     msg = tb.dbg[ch].get_message(seen[ch])
                     seen[ch] += 1
                     last_msg = time.time()
-                    text = F.si3_text(F.blob_of(msg), args.arfcn, freq)
-                    if not text:
+                    cell = G.si3_cell(G.blob_of(msg), arfcn, freq)
+                    if not cell:
                         continue
                     t = time.time()
                     dec[ch].append(t)
                     if events and t - events[-1][0] < 0.3 and ch not in events[-1][1]:
-                        events[-1][1].add(ch)
-                        if pending is not None and pending[0] == events[-1][0]:
-                            pending[1].add(ch)
+                        events[-1][1].add(ch)             # the other antenna's copy of the same broadcast
                     else:
-                        flush_pending(force=True)
-                        events.append([t, {ch}, text])
-                        pending = [t, events[-1][1], text]
+                        flush(force=True)
+                        events.append([t, {ch}, cell])
+                        pending = [t, events[-1][1], cell]
             if not args.levels:
-                flush_pending()
-            if next_stats and now >= next_stats:
-                flush_pending(force=True)
-                summary()
-                next_stats = now + args.stats_every
+                flush()
             if time.time() - last_msg > 3.0:
                 restarts += 1
-                print("%s  no messages on either channel for 3 s - restarting radio" % F.clean.now_stamp(), flush=True)
-                try:
-                    tb.stop()
-                    tb.wait()
-                except Exception:
-                    pass
-                del tb
-                tb, kind = build(args, freq)
-                seen = [0, 0]
-                last_msg = time.time()
+                C.warn("%s  no decoder output on either antenna for 3 s - restarting the receiver" % C.now_stamp())
+                close_dual(tb)
+                tb = open_dual(args, freq)
+                seen, last_msg = [0, 0], time.time()
             time.sleep(0.02)
     except KeyboardInterrupt:
-        pass
+        print("")
     finally:
-        try:
-            signal.signal(signal.SIGINT, signal.SIG_IGN)
-        except KeyboardInterrupt:
-            pass
-        flush_pending(force=True)
-        try:
-            summary(final=True)
-        except BrokenPipeError:
-            pass
-        try:
-            tb.stop()
-        except Exception:
-            pass
+        C.ignore_ctrl_c()
+        flush(force=True)
+        levels = [tb.level(0), tb.level(1)]
+        close_dual(tb)
+    track_summary(args, arfcn, freq, names, t0, dec, events, restarts, levels)
     return 0
+
+
+def _missed(times):
+    m, longest = 0, 0.0
+    for a, b in zip(times, times[1:]):
+        m += max(0, int(round((b - a) / G.SI3_PERIOD)) - 1)
+        longest = max(longest, b - a)
+    return m, longest
+
+
+def track_summary(args, arfcn, freq, names, t0, dec, events, restarts, levels):
+    run = time.time() - t0
+    cells = {}
+    for e in events:
+        cells.setdefault(e[2]["cid"], e[2])
+    t = C.Table(["Receiver", "Decoded", "Missed", "Caught", "Longest gap", "Level (dBFS)", "Peak"],
+                align={k: "right" for k in ("Decoded", "Missed", "Caught", "Longest gap", "Level (dBFS)", "Peak")})
+    rows = []
+    for name, times, lv in ((names[0], dec[0], levels[0]), (names[1], dec[1], levels[1]),
+                            ("Both combined", [e[0] for e in events], None)):
+        m, lg = _missed(times)
+        pct = 100.0 * len(times) / (len(times) + m) if times else 0.0
+        rows.append((name, len(times), m, pct, lg))
+        t.add([(name, "bold" if lv is None else ""), len(times), m, ("%.1f%%" % pct, C.rate_colour(pct)),
+               "%.1f s" % lg, "%.1f" % lv[0] if lv else "", (("%.2f" % lv[1]) + (" CLIP" if lv[1] >= 0.99 else ""),
+                                                            "red" if lv[1] >= 0.99 else "") if lv else ""])
+    t.show("Two-antenna tracking summary - ARFCN %d (%.0f s, restarts %d)" % (arfcn, run, restarts))
+    ct = C.Table(["Cell ID", "Operator", "MCC-MNC", "LAC", "Broadcasts", "Both", "RX1 only", "RX2 only"],
+                 align={k: "right" for k in ("Cell ID", "LAC", "Broadcasts", "Both", "RX1 only", "RX2 only")})
+    for cid, x in cells.items():
+        ev = [e for e in events if e[2]["cid"] == cid]
+        ct.add([(cid, "green+bold"), C.op_cell(x["operator"]), "%03d-%02d" % (x["mcc"], x["mnc"]), x["lac"], len(ev),
+                sum(1 for e in ev if e[1] == {0, 1}), sum(1 for e in ev if e[1] == {0}),
+                sum(1 for e in ev if e[1] == {1})])
+    ct.show("Cells")
+    if args.summary_csv:
+        path = os.path.expanduser(args.summary_csv)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        new = not os.path.exists(path)
+        with open(path, "a") as fh:
+            if new:
+                fh.write("start_utc,label,arfcn,rx1,rx2,runtime_s,rx1_decoded,rx1_caught_pct,rx2_decoded,"
+                         "rx2_caught_pct,both_decoded,both_caught_pct,restarts,cell_ids\n")
+            fh.write("%s,%s,%d,%s,%s,%.1f,%d,%.1f,%d,%.1f,%d,%.1f,%d,%s\n" % (
+                C.utc_iso(t0), args.label or "", arfcn, names[0], names[1], run, rows[0][1], rows[0][3],
+                rows[1][1], rows[1][3], rows[2][1], rows[2][3], restarts, "/".join(str(k) for k in cells)))
+        C.info("summary row added to %s" % path)
+
+
+# --------------------------------------------------------------------------------------------- scan
+def scan(args, channels):
+    names = (gain_name(1, args.agc1, args.gain1), gain_name(2, args.agc2, args.gain2))
+    C.info("Two-antenna scan of %d channel(s): %s, %s. The radio is reopened for every channel (~4 s each). "
+           "Ctrl-C to stop." % (len(channels), names[0], names[1]))
+    found, t_all, tb = {}, time.time(), None
+    try:
+        for arfcn in channels:
+            freq = G.downlink(arfcn)
+            if freq is None:
+                continue
+            close_dual(tb)
+            tb = open_dual(args, freq)
+            t0, seen, got, cell = time.time(), [0, 0], set(), None
+            while time.time() - t0 < args.dwell:
+                for ch in (0, 1):
+                    try:
+                        n = tb.dbg[ch].num_messages()
+                    except Exception:
+                        continue
+                    while seen[ch] < n:
+                        x = G.si3_cell(G.blob_of(tb.dbg[ch].get_message(seen[ch])), arfcn, freq)
+                        seen[ch] += 1
+                        if x:
+                            got.add(ch)
+                            cell = cell or x
+                if got == {0, 1} or (got and time.time() - t0 > 1.0):
+                    break                    # both antennas have it, or one has and the other had 1 s more
+                if not got and time.time() - t0 > args.sync_secs and not tb.synced(0) and not tb.synced(1):
+                    break                    # no GSM sync on either antenna
+                time.sleep(0.02)
+            if cell:
+                tag, col = who(got)
+                print("%s  %s" % (G.cell_line(cell, time.time() - t0), C.c("[%s]" % tag, col)), flush=True)
+                prev = found.get(arfcn)
+                found[arfcn] = (cell, set(got) | (prev[1] if prev else set()))
+            elif args.verbose:
+                print("%s          ARFCN %4d  %7.1f MHz  %s" % (C.c(C.now_stamp(), "grey"), arfcn, freq / 1e6,
+                                                                C.c("no cell", "grey")), flush=True)
+    except KeyboardInterrupt:
+        print("")
+    finally:
+        C.ignore_ctrl_c()
+        close_dual(tb)
+    t = C.Table(["ARFCN", "MHz", "Operator", "MCC-MNC", "LAC", "Cell ID", "Power", "Decoded by"],
+                align={k: "right" for k in ("ARFCN", "MHz", "LAC", "Cell ID", "Power")})
+    for a in sorted(found, key=lambda a: (a >= 512 and a <= 885, a < 900, a)):
+        x, chans = found[a]
+        t.add([a, "%.1f" % x["mhz"], C.op_cell(x["operator"]), "%03d-%02d" % (x["mcc"], x["mnc"]), x["lac"],
+               (x["cid"], "green+bold"), x["power"] if x["power"] is not None else "-", who(chans)])
+    t.show("GSM cells found with two antennas: %d (%.0f s)" % (len(found), time.time() - t_all))
+    n1 = sum(1 for v in found.values() if 0 in v[1])
+    n2 = sum(1 for v in found.values() if 1 in v[1])
+    C.info("%s decoded %d, %s decoded %d" % (names[0], n1, names[1], n2))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Two-antenna GSM tracking and scanning (BladeRF RX1 + RX2).",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    what = ap.add_mutually_exclusive_group(required=True)
+    what.add_argument("--band", choices=sorted(G.BANDS), help="scan every channel of a band")
+    what.add_argument("--arfcn", type=int, nargs="+", help="one ARFCN = track it; several = scan them")
+    ap.add_argument("--gain1", type=float, default=20.0, help="RX1 gain in dB (default 20, for strong cells)")
+    ap.add_argument("--gain2", type=float, default=40.0, help="RX2 gain in dB (default 40, for weak cells)")
+    ap.add_argument("--agc1", action="store_true", help="RX1 uses automatic gain control")
+    ap.add_argument("--agc2", action="store_true", help="RX2 uses automatic gain control")
+    ap.add_argument("--bw", type=float, default=2e6,
+                    help="analog filter bandwidth in Hz, shared by both antennas (default 2e6, minimum 200e3)")
+    ap.add_argument("--levels", action="store_true", help="track: print both antennas' signal levels every second")
+    ap.add_argument("--dwell", type=float, default=2.5, help="scan: longest wait per channel in s (default 2.5)")
+    ap.add_argument("--sync-secs", type=float, default=1.2,
+                    help="scan: leave a channel after this long without GSM sync on either antenna (default 1.2)")
+    ap.add_argument("--verbose", action="store_true", help="scan: also list channels without a cell")
+    ap.add_argument("--label", default=None, help="track: name for this run in the summary CSV")
+    ap.add_argument("--summary-csv", default="~/field/dual_summary.csv",
+                    help="track: CSV file the summary row is added to (default ~/field/dual_summary.csv)")
+    ap.add_argument("--no-color", action="store_true", help="plain text output")
+    args = ap.parse_args()
+    args.bw = max(200e3, float(args.bw))
+    if args.no_color:
+        C.set_colour(False)
+    C.stop_on_first_ctrl_c()
+    G.stop_other_scanners()
+    if args.band:
+        return scan(args, G.BANDS[args.band])
+    if len(args.arfcn) == 1:
+        return track(args, args.arfcn[0])
+    return scan(args, args.arfcn)
 
 
 if __name__ == "__main__":
