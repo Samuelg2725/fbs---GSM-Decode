@@ -63,6 +63,13 @@ Lime (live, Owen's rig): python3 gsm_arfcn_fast.py --arfcn 13 --df   (osmosdr dr
                      instead of saving sib1_bits.bin -> now parsed from the text. Survey centres were 1-2 MHz
                      off -> default is now the phone's carrier list (B20 6175/6225/6300/6400, B8 3501/3725,
                      B3 1363/1617, B1 223/347); --discover adds the survey. All PCIs per carrier decoded.
+- gsm_dual.py        TWO-ANTENNA GSM TRACKING (2026-11-25): RX1 + RX2 on the same ARFCN, separate gains
+                     (--gain1 20 / --gain2 45, or --agc1/--agc2), a full gr-gsm decoder per channel, merged
+                     output tagged [RX1+RX2]/[RX1 only]/[RX2 only]; summary = caught % for RX1, RX2, COMBINED
+                     + dBFS level/peak per channel -> ~/field/dual_summary.csv. --src auto tries gr-soapy,
+                     osmosdr via soapy, osmosdr numchan=2, bladerf nchan=2 until both channels stream.
+                     --levels = only print both levels (gain proof). Merge logic tested here with stubs;
+                     radio path untested (needs Pi). Pi has SoapySDR + bladerf driver (SoapySDRUtil --find).
 - lte_track.py       LTE TRACKING. Default = CAPTURE MODE: lock once (probe PCI/CFO, MIB -> RB), then loop
                      0.1 s capture -> align (first 30 ms only) -> pdsch_ue stopped at first SIB1; re-lock
                      after 3 misses. --live = srsRAN live receiver: FAILED at home 12:5x (endless cell search,
