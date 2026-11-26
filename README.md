@@ -234,6 +234,7 @@ At the end it prints the `lte_decode.py --cells ...` command for the cells the S
     sudo python3 modem_scan.py                 # LTE, all bands
     sudo python3 modem_scan.py --band 20 3     # only bands 20 and 3 (faster)
     sudo python3 modem_scan.py --rat all       # LTE + GSM
+    sudo python3 modem_scan.py --sdr           # then the SDR decodes the same cells, and the two are compared
 
 `modem_probe.py --cmd 'AT...'` sends any single AT command. Other useful ALA440 commands:
 `AT^CELLINFO=1` (serving cell), `AT^CELLINFO=2` (neighbour cells with PCI and RSRP),
