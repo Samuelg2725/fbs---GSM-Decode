@@ -28,6 +28,17 @@ PROTO = "void srsran_sib1_print(const uint8_t* payload, uint32_t nbits);\n"
 MIB_PROTO = "void srsran_mib_print(const uint8_t* bits);\n"
 MIB_ANCHOR = "srsran_pbch_mib_unpack(bch_payload, &cell, &sfn);"
 MIB_CALL = MIB_ANCHOR + "\n              srsran_mib_print(bch_payload);"
+# In file mode pdsch_ue sets up its decoder once with PHICH resource "1" and never applies the PHICH settings
+# the MIB reports, so a cell configured with another PHICH resource (e.g. 1/2) decodes its MIB but never SIB1.
+PHICH_ANCHOR = "srsran_mib_print(bch_payload);"
+PHICH_CALL = PHICH_ANCHOR + """
+              {
+                /* file mode: use the PHICH settings the MIB reports (srsRAN starts from a fixed guess) */
+                srsran_cell_t mib_cell   = ue_dl.cell;
+                mib_cell.phich_resources = cell.phich_resources;
+                mib_cell.phich_length    = cell.phich_length;
+                srsran_ue_dl_set_cell(&ue_dl, mib_cell);
+              }"""
 
 
 def main():
@@ -63,6 +74,13 @@ def main():
         print("patched %s (MIB bytes)" % pdsch)
     else:
         print("pdsch_ue.c already prints the MIB bytes")
+    # third hook: apply the MIB's PHICH settings
+    if "use the PHICH settings the MIB reports" not in text:
+        text = text.replace(PHICH_ANCHOR, PHICH_CALL, 1)
+        pdsch.write_text(text)
+        print("patched %s (PHICH settings from the MIB)" % pdsch)
+    else:
+        print("pdsch_ue.c already uses the MIB's PHICH settings")
 
     cmake = EXAMPLES / "CMakeLists.txt"
     cmake_text = cmake.read_text()
