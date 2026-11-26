@@ -222,3 +222,20 @@ once (setup step 3).
 | `NOTES.md` | Technical notes and test findings |
 
 Set `NO_COLOR=1` (or pass `--no-color`) for plain text output.
+
+## Reference scan with the Teltonika CALYX modem (ALA440)
+
+The CALYX's modem decodes cells like a phone does. `modem_scan.py` makes it scan (`AT^NETSCAN`, no SIM needed)
+and lists every cell it decoded: EARFCN, PCI, operator, TAC and Cell ID. Each cell is marked with whether the
+SDR (`lte_decode.py` / `lte_track.py`, via `~/field/lte_cells.csv`) has decoded it with the same Cell ID.
+At the end it prints the `lte_decode.py --cells ...` command for the cells the SDR has not decoded yet.
+
+    sudo modprobe option && echo 1d12 0101 | sudo tee /sys/bus/usb-serial/drivers/option1/new_id   # once per boot
+    sudo python3 modem_scan.py                 # LTE, all bands
+    sudo python3 modem_scan.py --band 20 3     # only bands 20 and 3 (faster)
+    sudo python3 modem_scan.py --rat all       # LTE + GSM
+
+`modem_probe.py --cmd 'AT...'` sends any single AT command. Other useful ALA440 commands:
+`AT^CELLINFO=1` (serving cell), `AT^CELLINFO=2` (neighbour cells with PCI and RSRP),
+`AT^CELLLOCK=1,3,1,<earfcn>,<pci>` (lock onto one cell; set it in flight mode `AT+CFUN=0`, then `AT+CFUN=1`;
+`AT^CELLLOCK=0` unlocks, which needs a modem restart to take effect).
