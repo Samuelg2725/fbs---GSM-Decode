@@ -57,6 +57,8 @@ def main():
     ap.add_argument("ports", nargs="*", help="serial ports (default: all /dev/ttyUSB* and /dev/ttyACM*)")
     ap.add_argument("--cmd", action="append", help="send this AT command instead of the identification set")
     ap.add_argument("--timeout", type=float, default=3.0, help="seconds to wait per command (default 3)")
+    ap.add_argument("--listen", type=float, default=0,
+                    help="after the commands, print everything the modem sends for this many seconds")
     args = ap.parse_args()
     ports = args.ports or sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
     if not ports:
@@ -75,7 +77,19 @@ def main():
                 continue
             for cmd in (args.cmd or IDENTIFY):
                 reply = command(fd, cmd, args.timeout)
-                print("   %-10s -> %s" % (cmd, " | ".join(l for l in reply.splitlines() if l.strip()) or "(nothing)"))
+                print("   %-10s -> %s" % (cmd, " | ".join(l for l in reply.splitlines() if l.strip()) or "(nothing)"),
+                      flush=True)
+            end = time.time() + args.listen
+            while time.time() < end:
+                r, _, _ = select.select([fd], [], [], 0.5)
+                if r:
+                    try:
+                        text = os.read(fd, 4096).decode(errors="replace")
+                    except BlockingIOError:
+                        continue
+                    for line in text.splitlines():
+                        if line.strip():
+                            print("   (unsolicited) %s" % line.strip(), flush=True)
         finally:
             os.close(fd)
     return 0
