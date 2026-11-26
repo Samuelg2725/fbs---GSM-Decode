@@ -240,3 +240,12 @@ At the end it prints the `lte_decode.py --cells ...` command for the cells the S
 `AT^CELLINFO=1` (serving cell), `AT^CELLINFO=2` (neighbour cells with PCI and RSRP),
 `AT^CELLLOCK=1,3,1,<earfcn>,<pci>` (lock onto one cell; set it in flight mode `AT+CFUN=0`, then `AT+CFUN=1`;
 `AT^CELLLOCK=0` unlocks, which needs a modem restart to take effect).
+
+### Modem and SDR at the same time: `compare_scan.py`
+
+    sudo python3 compare_scan.py                       # add --sdr-args '--dual' for both antennas
+
+The modem keeps scanning all LTE bands over and over while the SDR goes once through every carrier
+(the UK list plus every EARFCN the modem reports). At the end, one table lists every cell either of them found,
+with both Cell IDs: both / modem only / SDR only / different ID. Only this run's results count.
+It is saved as ~/field/compare_<time>.csv.

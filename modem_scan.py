@@ -113,13 +113,14 @@ def find_port(given):
     sys.exit("No modem AT port found. Is the CALYX plugged in? Load the driver (see --help) and run with sudo.")
 
 
-def scan(fd, rat, band, timeout):
+def scan(fd, rat, band, timeout, quiet=False):
     """Send AT^NETSCAN, show progress while the modem searches, return its answer lines."""
     cmd = "AT^NETSCAN=%d" % rat + (",%d" % band if band else "")
     os.write(fd, (cmd + "\r").encode())
     buf, t0 = b"", time.time()
     while time.time() - t0 < timeout:
-        C.status("  %s: modem scanning... %.0f s" % (cmd, time.time() - t0))
+        if not quiet:
+            C.status("  %s: modem scanning... %.0f s" % (cmd, time.time() - t0))
         r, _, _ = select.select([fd], [], [], 1.0)
         if not r:
             continue
@@ -130,11 +131,12 @@ def scan(fd, rat, band, timeout):
         text = buf.decode(errors="replace")
         if re.search(r"\r\n(OK|ERROR|\+CME ERROR:[^\r]*)\r\n", text):
             break
-    C.clear_status()
+    if not quiet:
+        C.clear_status()
     text = buf.decode(errors="replace")
     with open(RAW, "a") as fh:
         fh.write("=== %s %s (%.0f s)\n%s\n" % (C.utc_iso(), cmd, time.time() - t0, text.strip()))
-    if "OK" not in text:
+    if "OK" not in text and not quiet:
         err = re.search(r"(\+CME ERROR:[^\r\n]*|ERROR)", text)
         C.warn("  %s -> %s" % (cmd, err.group(1) if err else "no answer in %d s" % timeout))
     return text.splitlines()
