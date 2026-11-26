@@ -18,7 +18,9 @@ import argparse
 import os
 import sys
 
-import numpy as np
+os.environ.setdefault("OPENBLAS_NUM_THREADS", str(max(1, (os.cpu_count() or 4) - 1)))
+os.environ.setdefault("OMP_NUM_THREADS", os.environ["OPENBLAS_NUM_THREADS"])
+import numpy as np  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -92,6 +94,7 @@ def main():
     if args.no_color:
         C.set_colour(False)
     L.clean_leftovers()
+    C.be_nice()
     freqs = [(f, "") for f in args.freq_mhz] if args.freq_mhz else DEFAULT
     C.heading("Step 1: antennas connected")
     rows = []

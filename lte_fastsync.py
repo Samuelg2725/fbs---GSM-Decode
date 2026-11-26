@@ -11,6 +11,8 @@ The "osprey 2" files are not edited: install() swaps the functions in at runtime
 """
 import numpy as np
 
+import common as C
+
 _REF = {}
 
 
@@ -99,11 +101,11 @@ def correlate_mag_fast(spectrum, template, length):
     key = (spectrum.size, template.tobytes())
     t = _TPL.get(key)
     if t is None:
-        t = np.conj(sf.fft(template, spectrum.size, workers=-1))
+        t = np.conj(sf.fft(template, spectrum.size, workers=C.WORKERS))
         if len(_TPL) > 400:
             _TPL.clear()
         _TPL[key] = t
-    corr = sf.ifft(spectrum * t, workers=-1)
+    corr = sf.ifft(spectrum * t, workers=C.WORKERS)
     return np.abs(corr[:length])
 
 
@@ -119,7 +121,7 @@ class _FFTProxy(object):
         a = np.asarray(a)
         if n is not None and a.ndim == 1 and (n & (n - 1)) == 0 and n >= a.size + S.FFT_SIZE - 1 > 4096:
             import scipy.fft as sf
-            return sf.fft(a, sf.next_fast_len(a.size + S.FFT_SIZE - 1), workers=-1)
+            return sf.fft(a, sf.next_fast_len(a.size + S.FFT_SIZE - 1), workers=C.WORKERS)
         return np.fft.fft(a, n=n, axis=axis, norm=norm)
 
 

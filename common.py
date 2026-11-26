@@ -234,5 +234,18 @@ def stop_leftovers(script_names=(), program_names=()):
     return len(found)
 
 
+# Heavy processing leaves one CPU core free and runs at lower priority, so the Pi (and an SSH session to it)
+# stays responsive while a tool is working.
+WORKERS = max(1, (os.cpu_count() or 4) - 1)
+
+
+def be_nice():
+    """Lower this tool's priority (srsRAN and other child programs inherit it)."""
+    try:
+        os.nice(10)
+    except (AttributeError, OSError):
+        pass
+
+
 def rate_colour(pct):
     return "green" if pct >= 95 else ("yellow" if pct >= 70 else "red")

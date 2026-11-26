@@ -37,7 +37,9 @@ import sys
 import threading
 import time
 
-import numpy as np
+os.environ.setdefault("OPENBLAS_NUM_THREADS", str(max(1, (os.cpu_count() or 4) - 1)))
+os.environ.setdefault("OMP_NUM_THREADS", os.environ["OPENBLAS_NUM_THREADS"])
+import numpy as np  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -642,6 +644,7 @@ def main():
         sys.exit("srsRAN pdsch_ue was not found at %s - build it first (see README)." % L.pdsch_ue())
     lte_fastsync.install()
     L.clean_leftovers()
+    C.be_nice()
     if args.earfcn is not None:
         args.freq_mhz_now = L.earfcn_to_mhz(args.earfcn)
         if args.freq_mhz_now is None:
