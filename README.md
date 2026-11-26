@@ -30,6 +30,7 @@ export LD_LIBRARY_PATH=/usr/local/lib
 | Decode LTE carriers by frequency | `python3 lte_decode.py --freq-mhz 806 816 952.5` |
 | Decode LTE carriers by channel number | `python3 lte_decode.py --earfcn 6300 6400 3725 223` |
 | Decode LTE with both antennas | `python3 lte_decode.py --freq-mhz 816 --dual` |
+| Check how much signal the antennas bring in per band (no decoding) | `python3 spectrum_check.py` |
 | Look for the cells a phone lists (EARFCN:PCI,PCI) | `python3 lte_decode.py --cells 6175:216,272 1617:389,461` |
 | Watch every LTE cell on one carrier, saving raw IQ | `python3 lte_track.py --earfcn 6400` |
 | …the same with both antennas (for direction finding) | `python3 lte_track.py --earfcn 6400 --dual` |
@@ -164,6 +165,7 @@ UK carriers seen during testing (EARFCN → MHz): 6175 → 793.5, 6225 → 798.5
 | `gsm_neigh.py` | GSM neighbour lists |
 | `gsm_freqlist.py` | Decoder for GSM frequency lists (used by `gsm_neigh.py`) |
 | `lte_decode.py` | LTE cell identity decoder |
+| `spectrum_check.py` | Antenna check: signal power per frequency, with and without the antennas |
 | `lte_track.py` | Tracks every LTE cell on one carrier and saves raw IQ |
 | `lte_fastsync.py` | Faster LTE cell search (identical results) |
 | `common.py` | Shared tables, colours and operator names |
