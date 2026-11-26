@@ -116,6 +116,14 @@ DLSCH_HEX_RE = re.compile(r"BCCH-DL-SCH hex ([0-9a-f]+)")
 SIB1DCI_RE = re.compile(r"SIB1dci cfi=(\d+) L=(\d+) ncce=(\d+) riv=(\d+) mode=(\d+) nprb1a=(\d+) ngap=(\d+) mcs=(\d+)")
 PPM = []                 # frequency error of the radio (offset / carrier) measured on decoded cells
 UK_BANDS = (20, 8, 3, 1, 7, 28, 32, 38, 40)
+# UK LTE (FDD) carriers: published per-operator EARFCNs plus every one heard on air so far. Low to high frequency.
+UK_EARFCN = [
+    6175, 6225, 6300, 6400,                          # band 20  800 MHz: Three, EE, Vodafone, O2
+    3501, 3574, 3700, 3725,                          # band 8   900 MHz: Vodafone / O2
+    1226, 1288, 1363, 1392, 1617, 1815,              # band 3  1800 MHz: O2, Vodafone, Three, EE
+    76, 223, 347,                                    # band 1  2100 MHz
+    2850, 3179, 3350,                                # band 7  2600 MHz
+]
 
 
 def carrier_rate(n_rb):
@@ -1307,6 +1315,8 @@ def main():
     what = ap.add_mutually_exclusive_group()
     what.add_argument("--freq-mhz", type=float, nargs="+", help="carrier centre frequency/frequencies in MHz")
     what.add_argument("--earfcn", type=int, nargs="+", help="carrier channel number(s) (EARFCN)")
+    what.add_argument("--uk", action="store_true",
+                      help="every UK LTE carrier (%d EARFCNs, all bands, all operators)" % len(UK_EARFCN))
     what.add_argument("--cells", nargs="+", metavar="EARFCN:PCI,PCI",
                       help="look for these cells, e.g. from a phone's list: 6175:216,272 1617:389,461 - every "
                            "PCI is looked for directly even when the search does not find it, and a check table "
@@ -1369,14 +1379,16 @@ def main():
             centre = float(meta["captures"][0]["core:frequency"])
             carrier = float(meta["global"].get("lte:carrier_hz") or centre)
             args.file_low_if_mhz = (centre - carrier) / 1e6
-            if not (args.freq_mhz or args.earfcn or args.cells):
+            if not (args.freq_mhz or args.earfcn or args.cells or args.uk):
                 args.freq_mhz = [carrier / 1e6]
         if not args.file_rate:
             sys.exit("--file needs --file-rate (sample rate in Hz), e.g. --file-rate 23.04e6")
         if args.dual:
             sys.exit("--dual cannot be used with --file")
+    if args.uk:
+        args.earfcn = list(UK_EARFCN)
     if not (args.freq_mhz or args.earfcn or args.cells):
-        ap.error("give the carrier: --earfcn, --freq-mhz or --cells")
+        ap.error("give the carrier: --earfcn, --freq-mhz, --cells or --uk")
     if not pdsch_ue().is_file():
         sys.exit("srsRAN pdsch_ue was not found at %s - build it first (see README)." % pdsch_ue())
     lte_fastsync.install()

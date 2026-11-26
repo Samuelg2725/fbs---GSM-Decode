@@ -244,6 +244,7 @@ At the end it prints the `lte_decode.py --cells ...` command for the cells the S
 ### Modem and SDR at the same time: `compare_scan.py`
 
     sudo python3 compare_scan.py                       # add --dual for both antennas
+    python3 lte_decode.py --uk                         # SDR alone: every UK LTE carrier (20 EARFCNs), blind
 
 The modem keeps scanning all LTE bands over and over while the SDR goes once through every carrier
 (the UK list plus every EARFCN the modem reports). At the end, one table lists every cell either of them found,

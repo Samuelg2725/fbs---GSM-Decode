@@ -8,8 +8,9 @@
 
 What it does:
   1. The modem does one full scan first (AT^NETSCAN, all LTE bands, ~20 s), so its carriers are known.
-  2. The SDR (lte_decode.py) then goes once through every carrier: the UK list below plus every EARFCN the
-     modem has reported (now or in earlier scans). Its output is shown as it runs.
+  2. The SDR (lte_decode.py) then goes once through every carrier, blind (no PCI list - it finds every cell on
+     each carrier itself): all UK LTE carriers (lte_decode.py --uk) plus any other EARFCN the modem has
+     reported. Its output is shown as it runs.
   3. Meanwhile the modem keeps scanning over and over (plus its neighbour list), collecting every cell it hears.
   4. When the SDR has finished: one table of every cell either of them found, with both Cell IDs:
        both        - both decoded it (Cell IDs compared)
@@ -32,8 +33,14 @@ import common as C                                   # noqa: E402
 import modem_scan as M                               # noqa: E402
 from modem_probe import open_port, command          # noqa: E402
 
-# UK LTE carriers seen so far (Vodafone, O2, EE, Three) - the modem's EARFCNs are added to these
-UK_EARFCN = [76, 223, 347, 1363, 1617, 1815, 2850, 3179, 3350, 3501, 3725, 6175, 6225, 6300, 6400]
+
+def uk_earfcns():
+    """The UK LTE carrier list from lte_decode.py (read from its source: importing it needs the srsRAN folder)."""
+    import ast
+    import re
+    src = open(os.path.join(HERE, "lte_decode.py")).read()
+    m = re.search(r"UK_EARFCN = (\[.*?\])", src, re.S)
+    return ast.literal_eval(re.sub(r"#[^\n]*", "", m.group(1)))
 
 
 class Modem(threading.Thread):
@@ -183,7 +190,7 @@ def main():
                             old.add(int(r["freq"]))
                         except (ValueError, TypeError):
                             pass
-        earfcns = sorted(set(UK_EARFCN) | {k[0] for k in seen} | old)
+        earfcns = sorted(set(uk_earfcns()) | {k[0] for k in seen} | old)
     cmd = [sys.executable, os.path.join(HERE, "lte_decode.py"), "--earfcn"] + [str(e) for e in earfcns] + \
           ["--csv", sdr_csv] + sdr_extra
     user = os.environ.get("SUDO_USER")
