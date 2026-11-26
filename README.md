@@ -207,6 +207,7 @@ once (setup step 3).
 | `lte_decode.py` | LTE cell identity decoder |
 | `spectrum_check.py` | Antenna check: signal power per frequency, with and without the antennas |
 | `lte_track.py` | Tracks every LTE cell on one carrier and saves raw IQ |
+| `sigmf_join.py` | Joins the IQ recordings of a tracking run into one file (per sample rate) |
 | `lte_fastsync.py` | Faster LTE cell search (identical results) |
 | `pcap_out.py` | Writes decoded messages to pcap files (GSMTAP) for Wireshark |
 | `common.py` | Shared tables, colours and operator names |
