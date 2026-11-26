@@ -449,14 +449,13 @@ def align_wide(samples, rate, pci, cfo_hz):
     return np.asarray(corrected[start:], dtype=np.complex64)
 
 
-def align_narrow(samples, rate, pci, cfo_hz):
+def align_narrow(samples, rate, pci, cfo_hz, both=False):
     """Subframe-0 alignment for a weak cell. Full-band alignment can be drowned by a stronger cell's whole
     transmission; here the capture is reduced to the centre 1.08 MHz (where PSS/SSS live), this PCI's PSS is
     found on its 5 ms comb, and the SSS is averaged over every repeat to tell subframe 0 from subframe 5."""
     import lte_sync as S
     from lte_pci_search import resample_to_lte
-    from lte_cellid import _useful_wide, _subframe_wide, _refine_wide, symbol_useful_offset
-    from lte_sync import _pss_freq, sss_freq
+    from lte_sync import sss_freq
     wide = derotate(samples, cfo_hz, rate)
     x = np.asarray(resample_to_lte(wide, rate), dtype=np.complex128)
     nid2, nid1 = pci % 3, pci // 3
@@ -478,15 +477,27 @@ def align_narrow(samples, rate, pci, cfo_hz):
         seq = S._extract_seq(x, t - S.SYMBOL, 0.0)
         if seq is not None:
             groups[i % 2].append(seq)
-    best = None
+    scored = []
     for swap in (False, True):
         sc = [S._mean_match(groups[g], sss_freq(nid1, nid2, (g == 1) != swap)) for g in (0, 1) if groups[g]]
-        score = sum(sc) / max(1, len(sc))
-        if best is None or score > best[0]:
-            best = (score, swap)
-    score, swap = best
+        scored.append((sum(sc) / max(1, len(sc)), swap))
+    scored.sort(reverse=True)
+    if both and scored[0][0] < 0.3:
+        # too weak to tell subframe 0 from subframe 5 with the SSS: return both positions, best first - the
+        # MIB (only in subframe 0, checked by its CRC) decides
+        outs = [_narrow_start(wide, rate, times, sw, nid2) for _sc, sw in scored]
+        return [o for o in outs if o is not None] or None
+    score, swap = scored[0]
     if score < 0.3:
         return None
+    out = _narrow_start(wide, rate, times, swap, nid2)
+    return [out] if (both and out is not None) else out
+
+
+def _narrow_start(wide, rate, times, swap, nid2):
+    """Subframe-0 aligned recording from the PSS times found by align_narrow (swap: subframe 5 came first)."""
+    from lte_cellid import _useful_wide, _subframe_wide, _refine_wide, symbol_useful_offset
+    from lte_sync import _pss_freq
     start_n = (times[1] if swap else times[0]) - symbol_useful_offset(6)
     nfft = int(round(rate / 15000.0))
     pss_at, sub = _useful_wide(6, nfft), _subframe_wide(nfft)
@@ -585,12 +596,22 @@ def run_pdsch(path, pci, n_prb, n_sf, timeout, ports=2, extra=()):
 def decode_cell(samples, rate, hit, args, freq_mhz, aligned=None):
     """MIB + SIB1 of one PCI with srsRAN. Returns a result dict; 'ident' is set when the identity decoded."""
     pci = int(hit["pci"])
-    out = {"pci": pci, "strength": hit.get("pss_ratio", 0.0), "mib": None, "mib_odd": False, "ident": None,
+    out = {"pci": pci, "strength": hit.get("pss_ratio", 0.0), "offset": float(hit.get("offset_hz") or 0.0),
+           "mib": None, "mib_odd": False, "ident": None,
            "aligned": None}
     if aligned is None:
         aligned = align_wide(samples, rate, pci, float(hit.get("offset_hz", 0.0)))
     if aligned is None:
-        aligned = align_narrow(samples, rate, pci, float(hit.get("offset_hz", 0.0)))
+        cands = align_narrow(samples, rate, pci, float(hit.get("offset_hz", 0.0)), both=True)
+        if cands and len(cands) > 1:
+            # subframe 0 / 5 not distinguishable: try both positions, the MIB's CRC picks the right one
+            r = None
+            for cand in cands:
+                r = decode_cell(samples, rate, hit, args, freq_mhz, aligned=cand)
+                if r["ident"] or r["mib"] or r["mib_odd"]:
+                    return r
+            return r
+        aligned = cands[0] if cands else None
     if aligned is None:
         out["status"] = "frame timing not found"
         return out
@@ -925,8 +946,8 @@ def _decode_capture(args, freq_mhz, rate, x1, x2):
         parent = next((p for p in results if p["ident"] and p.get("aligned") is not None
                        and p["pci"] // 3 == pci // 3), None)
         if parent is not None:                   # same mast as a decoded cell: use its frame timing first
-            r = decode_cell(None, rate, {"pci": pci, "width": parent.get("mib"), "ports": parent.get("ports")},
-                            args, freq_mhz, aligned=parent["aligned"])
+            r = decode_cell(None, rate, {"pci": pci, "width": parent.get("mib"), "ports": parent.get("ports"),
+                             "offset_hz": parent.get("offset", 0.0)}, args, freq_mhz, aligned=parent["aligned"])
             if r["ident"]:
                 r["how"] = "looked for (--cells), timing of PCI %d" % parent["pci"]
                 results.append(r)
@@ -960,13 +981,84 @@ def _decode_capture(args, freq_mhz, rate, x1, x2):
                 if sib in tried or (getattr(args, "only", False) and sib not in args._targets_now):
                     continue
                 tried.add(sib)
-                r = decode_cell(None, rate, {"pci": sib, "width": parent.get("mib"), "ports": parent.get("ports")}, args,
+                r = decode_cell(None, rate, {"pci": sib, "width": parent.get("mib"), "ports": parent.get("ports"),
+                                                "offset_hz": parent.get("offset", 0.0)}, args,
                                 freq_mhz, aligned=parent["aligned"])
                 r["how"] = "sector of PCI %d's mast" % parent["pci"]
                 if r["ident"] or args.show_failed_siblings:
                     results.append(r)
                     show(r)
+    if not args.no_cancel:
+        results = _after_cancelling(args, freq_mhz, rate, x1, x2, results, tried, show)
     for r in results:
+        r.pop("aligned", None)
+    return results
+
+
+def _after_cancelling(args, freq_mhz, rate, x1, x2, results, tried, show):
+    """Interference cancellation: remove the reference signals of every decoded cell from the recording, search it
+    again and retry the cells that were not decoded (and any new ones the cleaned search finds). On a lightly
+    loaded carrier a strong cell's reference signals are most of what covers a weak one (lte_cancel.py)."""
+    from lte_cancel import cancel_crs
+    strong = sorted([r for r in results if r["ident"] and r.get("aligned") is not None],
+                    key=lambda r: -(r.get("strength") or 0))
+    pending = [r for r in results if not r["ident"]]
+    if not strong:
+        return results
+    only = getattr(args, "only", False)
+    if not pending and only:
+        return results
+    t0 = time.time()
+    C.status("  removing the reference signals of PCI %s..." % ", ".join(str(r["pci"]) for r in strong))
+    clean1, clean2 = x1, x2
+    own_rb = {7680000: 25, 15360000: 50, 23040000: 75, 30720000: 100}.get(int(round(rate)), 50)
+    for r in strong:
+        start = len(x1) - len(r["aligned"])
+        kw = dict(rate=rate, start=start, pci=r["pci"], n_rb=r.get("mib") or own_rb, ports=r.get("ports") or 2,
+                  cfo_hz=r.get("offset", 0.0))
+        clean1 = cancel_crs(clean1, **kw)
+        if clean2 is not None:
+            clean2 = cancel_crs(clean2, **kw)
+    label = "after removing PCI %s" % ", ".join(str(r["pci"]) for r in strong)
+    # search the cleaned recording: cells hidden under the strong ones may now be found
+    hits = list(search_cells(clean1, rate, args)["hits"])
+    if clean2 is not None:
+        have = {h["pci"] for h in hits}
+        hits += [h for h in search_cells(clean2, rate, args)["hits"] if h["pci"] not in have]
+    decoded = {r["pci"] for r in strong} | set(getattr(args, "_done_pcis", ()))
+    offsets = {int(h["pci"]): h for h in hits}
+    default_off = strong[0].get("offset", 0.0)
+    todo = [r["pci"] for r in pending]
+    todo += [int(h["pci"]) for h in hits if int(h["pci"]) not in decoded and int(h["pci"]) not in todo
+             and (not only or int(h["pci"]) in args._targets_now)]
+    new_found = [p for p in todo if p not in tried]
+    C.clear_status()
+    if not todo:
+        C.info("  interference cancellation (%.1f s): no further cells under PCI %s" % (
+            time.time() - t0, ", ".join(str(r["pci"]) for r in strong)))
+        return results
+    C.info("  interference cancellation (%.1f s): retrying %s%s" % (
+        time.time() - t0, ", ".join("PCI %d" % p for p in todo),
+        ("; new in the cleaned search: " + ", ".join(map(str, new_found))) if new_found else ""))
+    for pci in todo[:8]:
+        h = offsets.get(pci) or {"pci": pci, "offset_hz": default_off, "pss_ratio": 0.0}
+        if x2 is not None:
+            w1, w2, share = cell_weights(clean1, clean2, rate, pci, float(h.get("offset_hz", 0.0)))
+            r = decode_cell((w1 * clean1 + w2 * clean2).astype(np.complex64), rate, h, args, freq_mhz)
+        else:
+            r = decode_cell(clean1, rate, h, args, freq_mhz)
+        r["how"] = label
+        if r["status"] == "frame timing not found":
+            r["status"] = "not found"
+        old = next((x for x in results if x["pci"] == pci), None)
+        better = old is None or (r["ident"] and not old["ident"]) or (not old["ident"] and r["mib"] and not old["mib"])
+        if better:
+            if old is not None:
+                results.remove(old)
+            results.append(r)
+            tried.add(pci)
+            if r["ident"] or old is None or r["mib"]:
+                show(r)
         r.pop("aligned", None)
     return results
 
@@ -1067,6 +1159,9 @@ def main():
                          "each cell decoded in")
     ap.add_argument("--only", action="store_true",
                     help="with --cells: decode only the listed PCIs (other cells found are not decoded)")
+    ap.add_argument("--no-cancel", action="store_true",
+                    help="skip interference cancellation (removing decoded cells' reference signals to find weaker "
+                         "cells underneath)")
     ap.add_argument("--retries", type=int, default=2,
                     help="extra recordings for cells whose MIB decoded but not their Cell ID (default 2)")
     ap.add_argument("--srsran-timeout", type=int, default=30, help="seconds per srsRAN attempt (default 30)")

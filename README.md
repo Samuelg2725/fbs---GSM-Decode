@@ -86,6 +86,18 @@ It automatically:
   even when their own sync signal is too weak to detect);
 - records again at a higher sample rate for 15 MHz and 20 MHz wide cells.
 
+Two techniques get weak cells that srsRAN alone cannot:
+
+- **SIB1 combining** (in the srsRAN patch): a cell repeats the same SIB1 every 20 ms in four redundancy versions.
+  Stock srsRAN decodes each transmission on its own; the patched decoder adds up the control channel and the
+  SIB1 data over the repeats. Measured with srsRAN's own test signals: stock srsRAN stops decoding about 3-4 dB
+  earlier (1 s recordings: stock 0 of 3 at a noise level where the patched decoder gets 3 of 3).
+- **Interference cancellation** (`lte_cancel.py`): after the cells it can decode, the tool removes their reference
+  and sync signals (known from the PCI) from the recording, searches it again and retries the cells that were not
+  decoded. Measured: a cell 15-21 dB weaker than a strong cell on the same frequency decodes after cancellation
+  and not before (on a quiet carrier; the more traffic the strong cell carries, the less this gains).
+  `--no-cancel` turns it off.
+
 With `--cells EARFCN:PCI,PCI …` (for example copied from a phone's network-monitor app) every listed PCI is
 looked for directly, even when the search does not find it: knowing the PCI, its sync signal is added up over
 the whole recording, which finds cells several dB weaker than the blind search. A "Cell list check" table at

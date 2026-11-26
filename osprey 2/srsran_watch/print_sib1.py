@@ -31,6 +31,20 @@ MIB_CALL = MIB_ANCHOR + "\n              srsran_mib_print(bch_payload);"
 # In file mode pdsch_ue sets up its decoder once with PHICH resource "1" and never applies the PHICH settings
 # the MIB reports, so a cell configured with another PHICH resource (e.g. 1/2) decodes its MIB but never SIB1.
 PHICH_ANCHOR = "srsran_mib_print(bch_payload);"
+# SIB1 decoding with combining of repeated transmissions (srsran_sib1_decode in sib1_print.cc)
+COMBINE_PROTO = ("int srsran_sib1_combining_enabled(void);\n"
+                 "int srsran_sib1_decode(srsran_ue_dl_t* q, srsran_dl_sf_cfg_t* sf, srsran_ue_dl_cfg_t* cfg,\n"
+                 "                       srsran_pdsch_cfg_t* pdsch_cfg, uint8_t* data[SRSRAN_MAX_CODEWORDS],\n"
+                 "                       bool acks[SRSRAN_MAX_CODEWORDS]);\n")
+COMBINE_ANCHOR = "n = srsran_ue_dl_find_and_decode(&ue_dl, &dl_sf, &ue_dl_cfg, &pdsch_cfg, data, acks);"
+COMBINE_CALL = """if (prog_args.rnti == SRSRAN_SIRNTI && srsran_sib1_combining_enabled()) {
+                  /* SIB1 uses one port or transmit diversity: decode once per subframe, combining repeats */
+                  n = (tm == (cell.nof_ports == 1 ? 0u : 1u))
+                          ? srsran_sib1_decode(&ue_dl, &dl_sf, &ue_dl_cfg, &pdsch_cfg, data, acks)
+                          : 0;
+                } else {
+                  n = srsran_ue_dl_find_and_decode(&ue_dl, &dl_sf, &ue_dl_cfg, &pdsch_cfg, data, acks);
+                }"""
 PHICH_CALL = PHICH_ANCHOR + """
               {
                 /* file mode: use the PHICH settings the MIB reports (srsRAN starts from a fixed guess) */
@@ -74,6 +88,17 @@ def main():
         print("patched %s (MIB bytes)" % pdsch)
     else:
         print("pdsch_ue.c already prints the MIB bytes")
+    # fourth hook: SIB1 decoding with combining of repeats
+    if "srsran_sib1_decode" not in text:
+        if COMBINE_ANCHOR not in text:
+            sys.exit("pdsch_ue.c has no PDSCH decode call to hook")
+        text = text.replace(COMBINE_ANCHOR, COMBINE_CALL, 1)
+        main_at = text.find("int main(")
+        text = text[:main_at] + COMBINE_PROTO + "\n" + text[main_at:]
+        pdsch.write_text(text)
+        print("patched %s (SIB1 combining)" % pdsch)
+    else:
+        print("pdsch_ue.c already combines SIB1 repeats")
     # third hook: apply the MIB's PHICH settings
     if "use the PHICH settings the MIB reports" not in text:
         text = text.replace(PHICH_ANCHOR, PHICH_CALL, 1)

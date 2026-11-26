@@ -55,6 +55,23 @@ Test location: home, November 2026. Reference: a phone network-monitor app at th
   PCI's subframe-0 position, for re-decoding or direction finding (RX1/RX2 share one tuner, so `--dual`
   recordings keep the phase between antennas).
 
+- **SIB1 combining (srsRAN patch, `sib1_print.cc`):** stock `pdsch_ue` clears the soft buffer before every SIB1
+  transmission and gives up on a subframe whose PDCCH does not decode. The patch adds up PDCCH soft bits over the
+  occasions with the same redundancy version (one sum per CFI; scaled by 1/sqrt(n) because srsRAN skips candidates
+  whose mean soft value is below 0.3), keeps the PDSCH soft buffer over up to 8 transmissions, and reuses the last
+  SIB1 allocation when a PDCCH is missed. Soft bits are divided by 4 first: srsRAN's 16-bit turbo decoder lost
+  accuracy with the summed values (8 transmissions: 33 decodes with /4, 17 without; 16 transmissions was worse).
+  Test with srsRAN's own transmitter (`sib1_enodeb`, SIB1 every 20 ms, RV per 36.321) and 1 s recordings: stock
+  srsRAN 0/3 recordings at -18 and -19 dB (noise vs average power), patched 3/3; patched 2/3 at -20 dB.
+  `SIB1_NO_COMBINE=1` switches it off, `SIB1_DEBUG=1` prints each SIB1 occasion.
+- **Interference cancellation (`lte_cancel.py`):** CRS of a decoded cell rebuilt from its PCI and the channel
+  measured on its own pilots (frequency smoothing after removing the timing phase slope, 0.25/0.5/0.25 across
+  slots), subtracted with the cyclic prefix; PSS and SSS likewise (without that a 15 dB stronger cell's sync pulled
+  the weak cell's timing). Test with two `sib1_enodeb` cells, different timing: weak cell 15/18/21 dB below the
+  strong one - nothing without, MIB + SIB1 with; srsRAN's SNR of the weak cell +3.5 -> +17.8 dB at -15 dB. Synthetic
+  load test: +12 dB signal-to-interference at 0% load, +3 dB at 10%, +1.5 dB at 30%.
+- When the SSS cannot tell subframe 0 from 5 (weak cell), both frame positions are tried; the MIB CRC decides.
+
 ## Tried and removed
 
 Wideband GSM with rescue pass, keep-open GSM retune, srsRAN live mode, the all-Python LTE MIB decoder,
