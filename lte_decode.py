@@ -587,7 +587,9 @@ def decode_cell(samples, rate, hit, args, freq_mhz, aligned=None):
 
         for i, n_prb in enumerate(order):
             text = srsran(n_prb, ports)
-            if i == 0 and not got_mib(text) and not hit.get("ports"):
+            # only for a clearly strong cell: a weak cell fails the MIB for lack of signal, and each extra
+            # srsRAN run on a wide two-antenna recording costs up to 30 s
+            if i == 0 and not got_mib(text) and not hit.get("ports") and (hit.get("pss_ratio") or 0) >= 12:
                 # no MIB: the cell may send from 4 (or 1) antennas - srsRAN must be told the right number
                 for p in (4, 1, 2):
                     if p != ports:
@@ -681,6 +683,31 @@ def auto_gain(args, freq_mhz, rate, x1, x2, rounds=3):
     return x1, x2
 
 
+MEMORY = os.path.expanduser("~/field/lte_carriers.json")
+
+
+def carrier_memory():
+    """Width and gain of each carrier from earlier runs (EARFCN -> {"width": resource blocks, "gain": dB})."""
+    try:
+        import json
+        with open(MEMORY) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def remember_carrier(earfcn, width, gain):
+    import json
+    mem = carrier_memory()
+    mem[str(earfcn)] = {"width": int(width), "gain": float(gain)}
+    try:
+        os.makedirs(os.path.dirname(MEMORY), exist_ok=True)
+        with open(MEMORY, "w") as fh:
+            json.dump(mem, fh, indent=1, sort_keys=True)
+    except OSError:
+        pass
+
+
 def decode_carrier(args, freq_mhz):
     """Everything for one carrier. Returns a list of result rows (decoded and not decoded)."""
     earfcn, band = mhz_to_earfcn(freq_mhz)
@@ -689,6 +716,15 @@ def decode_carrier(args, freq_mhz):
     t0 = time.time()
     rate = 15.36e6
     args.gain_now = args.gain
+    known = carrier_memory().get(str(earfcn), {}) if not args.no_auto_gain else {}
+    if known:
+        # width and gain learned on an earlier run: record at the right rate and gain straight away
+        if known.get("width"):
+            rate = carrier_rate(known["width"])
+        if known.get("gain") is not None:
+            args.gain_now = float(known["gain"])
+        C.info("  from an earlier run: %s MHz wide, gain %g - recording at %.2f Msps" % (
+            BW_MHZ.get(known.get("width"), "?"), args.gain_now, rate / 1e6))
     x1, x2 = auto_gain(args, freq_mhz, rate, *record(args, freq_mhz, rate))
     rows = []
     if x1 is None:
@@ -736,6 +772,9 @@ def decode_carrier(args, freq_mhz):
                 break
             continue
         break
+    widths = [r["mib"] for r in results if r.get("mib")]
+    if widths and earfcn is not None:
+        remember_carrier(earfcn, max(widths), args.gain_now)
     for r in results:
         r.update({"mhz": freq_mhz, "earfcn": earfcn, "band": band})
         rows.append(r)
