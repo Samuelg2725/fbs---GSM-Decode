@@ -73,6 +73,14 @@ def diagnosis(text):
 
 def why_not(r):
     """Plain-language reason a cell was not decoded."""
+    text = _why_not(r)
+    if r.get("sync_with") is not None and text:
+        text += "; frame-synchronised with PCI %d, so its MIB and control channel sit on top of PCI %d's" % (
+            r["sync_with"], r["sync_with"])
+    return text
+
+
+def _why_not(r):
     st, d = r.get("status", ""), r.get("diag") or {}
     if st in ("not found", "frame timing not found"):
         return "its sync signal was too weak to find in this recording"
@@ -616,6 +624,8 @@ def decode_cell(samples, rate, hit, args, freq_mhz, aligned=None):
         out["status"] = "frame timing not found"
         return out
     out["aligned"] = aligned
+    # frame start in the recording (to see whether cells are frame-synchronised)
+    out["start"] = (len(samples) - len(aligned)) if samples is not None else hit.get("start")
     with tempfile.NamedTemporaryFile(prefix="lte_dec_", suffix=".cf32", delete=False, dir="/dev/shm") as fh:
         path = Path(fh.name)
     try:
@@ -947,7 +957,7 @@ def _decode_capture(args, freq_mhz, rate, x1, x2):
                        and p["pci"] // 3 == pci // 3), None)
         if parent is not None:                   # same mast as a decoded cell: use its frame timing first
             r = decode_cell(None, rate, {"pci": pci, "width": parent.get("mib"), "ports": parent.get("ports"),
-                             "offset_hz": parent.get("offset", 0.0)}, args, freq_mhz, aligned=parent["aligned"])
+                             "offset_hz": parent.get("offset", 0.0), "start": parent.get("start")}, args, freq_mhz, aligned=parent["aligned"])
             if r["ident"]:
                 r["how"] = "looked for (--cells), timing of PCI %d" % parent["pci"]
                 results.append(r)
@@ -982,7 +992,7 @@ def _decode_capture(args, freq_mhz, rate, x1, x2):
                     continue
                 tried.add(sib)
                 r = decode_cell(None, rate, {"pci": sib, "width": parent.get("mib"), "ports": parent.get("ports"),
-                                                "offset_hz": parent.get("offset", 0.0)}, args,
+                                                "offset_hz": parent.get("offset", 0.0), "start": parent.get("start")}, args,
                                 freq_mhz, aligned=parent["aligned"])
                 r["how"] = "sector of PCI %d's mast" % parent["pci"]
                 if r["ident"] or args.show_failed_siblings:
@@ -990,9 +1000,34 @@ def _decode_capture(args, freq_mhz, rate, x1, x2):
                     show(r)
     if not args.no_cancel:
         results = _after_cancelling(args, freq_mhz, rate, x1, x2, results, tried, show)
+    mark_synchronised(results, rate)
     for r in results:
         r.pop("aligned", None)
     return results
+
+
+def mark_synchronised(results, rate):
+    """Note cells that were not decoded but whose frames start (within 10 us) where a decoded cell's do. In a
+    frame-synchronised network such a cell's MIB, control channel and SIB1 slot sit exactly on top of the decoded
+    cell's, so they are covered by it every time - more recordings do not help."""
+    frame = int(round(rate * 0.01))
+    tol = rate * 10e-6
+    decoded = [r for r in results if r.get("ident") and r.get("start") is not None]
+    for r in results:
+        if r.get("ident") or r.get("start") is None:
+            continue
+        for d in decoded:
+            diff = (r["start"] - d["start"]) % frame
+            if min(diff, frame - diff) <= tol:
+                r["sync_with"] = d["pci"]
+                break
+    timed = [r for r in results if r.get("start") is not None]
+    if len(timed) > 1:
+        C.info("  frame timing (ms into the 10 ms frame): " + ",  ".join(
+            "PCI %d %.3f%s" % (r["pci"], (r["start"] % frame) / rate * 1e3,
+                               " (decoded)" if r.get("ident") else
+                               (" = PCI %d's" % r["sync_with"] if r.get("sync_with") is not None else ""))
+            for r in sorted(timed, key=lambda r: r["start"] % frame)))
 
 
 def _after_cancelling(args, freq_mhz, rate, x1, x2, results, tried, show):
