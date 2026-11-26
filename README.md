@@ -32,6 +32,7 @@ export LD_LIBRARY_PATH=/usr/local/lib
 | Decode LTE carriers by channel number | `python3 lte_decode.py --earfcn 6300 6400 3725 223` |
 | Decode LTE with both antennas | `python3 lte_decode.py --freq-mhz 816 --dual` |
 | Check how much signal the antennas bring in per band (no decoding) | `python3 spectrum_check.py` |
+| Compare antennas one after another (same gains) | `python3 spectrum_check.py --antennas whip panel` |
 | Look for the cells a phone lists (EARFCN:PCI,PCI) | `python3 lte_decode.py --cells 6175:216,272 1617:389,461` |
 | Decode only one cell | `python3 lte_decode.py --cells 6225:320 --only` |
 | …and keep repeating until Ctrl-C | `python3 lte_decode.py --cells 6225:320 --only --loop` |

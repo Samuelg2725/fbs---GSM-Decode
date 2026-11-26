@@ -12,7 +12,16 @@ radio only sees its own noise, so:
     antenna effect = power with antenna - power without antenna
   * 10 dB or more: the antenna brings in real signal at that frequency
   * under 3 dB:    nothing comes through the antenna there - only the radio's own noise is being measured
-Use --no-compare to skip the second step. Run with LD_LIBRARY_PATH=/usr/local/lib.
+Use --no-compare to skip the second step.
+
+Comparing antennas:
+  * two at once: one antenna on RX1, the other on RX2, then run as above - the "RX2 vs RX1" column is how much
+    more the RX2 antenna brings in (both measured at the same moment, same gain). To be sure it is the antenna and
+    not the port, swap the two antennas between the ports and run again: the difference should change sign.
+  * any number, one after another on RX1, at the same gains:
+      python3 spectrum_check.py --antennas whip panel window-whip
+    It asks you to connect each one in turn and prints one table comparing them.
+Run with LD_LIBRARY_PATH=/usr/local/lib.
 """
 import argparse
 import os
@@ -82,6 +91,70 @@ def pick_gain(freq_mhz, start):
         g = max(0, g - 8)
 
 
+def ask(text):
+    print(C.c(text, "yellow+bold"), flush=True)
+    try:
+        input()
+        return True
+    except (EOFError, KeyboardInterrupt):
+        print("")
+        return False
+
+
+def compare_antennas(args, freqs):
+    """Measure each named antenna on RX1 in turn, all at the same gains, and compare them."""
+    names = args.antennas
+    gains, results = {}, {n: {} for n in names}
+    for i, name in enumerate(names):
+        C.heading("Antenna %d of %d: %s" % (i + 1, len(names), name))
+        if not ask("  Connect '%s' to RX1, put it where you want to test it, then press Enter." % name):
+            return 1
+        for f, label in freqs:
+            C.status("  measuring %.1f MHz..." % f)
+            if f not in gains:
+                g, m = pick_gain(f, args.gain)
+                # leave 6 dB headroom so a better antenna measured later does not clip
+                g = max(0.0, g - 6)
+                m = measure(f, g)
+                gains[f] = g
+            else:
+                m = measure(f, gains[f])
+            if m is None:
+                continue
+            results[name][f] = (band_power(m["RX1"]), m["peak"] >= 0.99)
+        C.clear_status()
+        print("  done: %s" % ", ".join("%.1f MHz %.1f dB%s" % (f, v[0], " (clipped)" if v[1] else "")
+                                       for f, v in sorted(results[name].items())), flush=True)
+    first = names[0]
+    cols = ["MHz", "Band", "Gain"] + names + ["Best"]
+    t = C.Table(cols, align={k: "right" for k in ["MHz", "Gain"] + names})
+    totals = {n: [] for n in names}
+    for f, label in freqs:
+        if f not in gains:
+            continue
+        row = ["%.1f" % f, label.split(" (")[0] or "-", "%g" % gains[f]]
+        vals = {n: results[n].get(f) for n in names}
+        base = vals[first][0] if vals[first] else None
+        for n in names:
+            v = vals[n]
+            if v is None:
+                row.append("-")
+                continue
+            d = v[0] - base if base is not None else 0.0
+            totals[n].append(d)
+            text = "%.1f" % v[0] if n == first else "%.1f (%+.1f)" % (v[0], d)
+            colour = "red" if v[1] else ("green" if d >= 3 else ("yellow" if d <= -3 else ""))
+            row.append((text + (" clip" if v[1] else ""), colour))
+        best = max((n for n in names if vals[n]), key=lambda n: vals[n][0], default="-")
+        row.append((best, "green+bold"))
+        t.add(row)
+    t.show("Antenna comparison (power in the carrier's centre 9 MHz, dB; in brackets: difference to '%s')" % first)
+    C.info("Average difference to '%s': %s" % (first, ",  ".join(
+        "%s %+.1f dB" % (n, float(np.mean(v))) for n, v in totals.items() if v and n != first) or "-"))
+    C.info("3 dB = twice the signal power. 'clip' = too strong at this gain (the real difference is even larger).")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="Antenna check: signal power per frequency, with and without the "
                                              "antennas connected.",
@@ -89,6 +162,8 @@ def main():
     ap.add_argument("--freq-mhz", type=float, nargs="+", help="frequencies to check (default: UK LTE list)")
     ap.add_argument("--gain", type=float, default=60, help="highest gain to use, dB (default 60)")
     ap.add_argument("--no-compare", action="store_true", help="skip the measurement with the antennas unplugged")
+    ap.add_argument("--antennas", nargs="+", metavar="NAME",
+                    help="compare these antennas one after another on RX1 (you are asked to connect each)")
     ap.add_argument("--no-color", action="store_true", help="plain text output")
     args = ap.parse_args()
     if args.no_color:
@@ -96,6 +171,8 @@ def main():
     L.clean_leftovers()
     C.be_nice()
     freqs = [(f, "") for f in args.freq_mhz] if args.freq_mhz else DEFAULT
+    if args.antennas:
+        return compare_antennas(args, freqs)
     C.heading("Step 1: antennas connected")
     rows = []
     for f, label in freqs:
@@ -130,9 +207,9 @@ def main():
         C.clear_status()
         print(C.c("  Plug the antennas back in.", "yellow"), flush=True)
     t = C.Table(["MHz", "Band", "Gain", "RX1 with", "RX1 without", "RX1 effect", "RX2 with", "RX2 without",
-                 "RX2 effect", "Result"],
+                 "RX2 effect", "RX2 vs RX1", "Result"],
                 align={k: "right" for k in ("MHz", "Gain", "RX1 with", "RX1 without", "RX1 effect", "RX2 with",
-                                            "RX2 without", "RX2 effect")})
+                                            "RX2 without", "RX2 effect", "RX2 vs RX1")})
     for r in rows:
         cells, best = [], None
         for ant in ("RX1", "RX2"):
@@ -145,6 +222,8 @@ def main():
                                                     ("yellow" if d >= 3 else "red"))]
             else:
                 cells += ["%.1f" % w, "-", "-"]
+        diff = band_power(r["with"]["RX2"]) - band_power(r["with"]["RX1"])
+        cells.append(("%+.1f dB" % diff, "green" if diff >= 3 else ("yellow" if diff <= -3 else "")))
         if best is None:
             result = ("not compared", "grey")
         elif best >= 10:
@@ -156,6 +235,7 @@ def main():
         t.add(["%.1f" % r["f"], r["label"].split(" (")[0] or "-", "%g" % r["gain"]] + cells + [result])
     t.show("Antenna check (power in the carrier's centre 9 MHz, dB relative to full scale)")
     C.info("effect = with antenna minus without: how much the antenna adds above the radio's own noise")
+    C.info("RX2 vs RX1 = how much more the antenna on RX2 brings in than the one on RX1 (same moment, same gain)")
     return 0
 
 
