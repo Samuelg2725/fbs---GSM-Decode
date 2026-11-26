@@ -806,8 +806,38 @@ def cell_weights(x1, x2, rate, pci, cfo_hz):
 
 
 # ------------------------------------------------------------------------------------------ carrier
+def read_file(args):
+    """The next --secs of a recording given with --file -> conditioned complex baseband, or None at the end.
+    16-bit I/Q (.sc16 / .cs16 / ci16 SigMF data, 12-bit full scale 2048) or complex float32 (.cf32)."""
+    path = args.file
+    is_float = path.endswith(".cf32") or getattr(args, "_file_dtype", "") == "cf32_le"
+    size = 8 if is_float else 4
+    total = os.path.getsize(path) // size
+    n = int(args.file_rate * args.secs)
+    pos = getattr(args, "_file_pos", int(args.start * args.file_rate))
+    if pos + n > total:
+        if pos >= total - int(args.file_rate * 0.05):
+            C.warn("  end of the file reached")
+            return None
+        n = total - pos
+    if is_float:
+        iq = np.fromfile(path, np.complex64, count=n, offset=pos * 8)
+    else:
+        raw = np.fromfile(path, "<i2", count=2 * n, offset=pos * 4)
+        iq = ((raw[0::2].astype(np.float32) + 1j * raw[1::2].astype(np.float32)) / 2048.0).astype(np.complex64)
+    args._file_pos = pos + n
+    peak = float(np.max(np.abs(iq.view(np.float32)))) if iq.size else 0.0
+    LAST_PEAK[0] = peak
+    C.info("  file %.1f-%.1f s of %.1f s, level %.1f dBFS, peak %.2f%s" % (
+        pos / args.file_rate, (pos + n) / args.file_rate, total / args.file_rate,
+        10 * np.log10(float(np.mean(np.abs(iq) ** 2)) + 1e-20), peak, "  CLIPPING" if peak >= 0.99 else ""))
+    return condition(iq, args.file_rate, args.file_low_if_mhz * 1e6)
+
+
 def record(args, freq_mhz, rate):
     """Capture at the current gain (one or two antennas) -> (rx1, rx2 or None) or (None, None)."""
+    if getattr(args, "file", None):
+        return read_file(args), None
     lif = args.low_if_mhz * 1e6
     if args.dual:
         pair = capture_dual(freq_mhz * 1e6, rate, args.secs, args.gain_now, lif,
@@ -893,7 +923,11 @@ def decode_carrier(args, freq_mhz):
     rate = 15.36e6
     args.gain_now = args.gain
     args.gain_now2 = args.gain
-    known = carrier_memory().get(str(earfcn), {}) if not args.no_auto_gain else {}
+    from_file = bool(getattr(args, "file", None))
+    if from_file:                                # a recording: its own rate, no gain to set
+        rate = args.file_rate
+        args.no_auto_gain = True
+    known = carrier_memory().get(str(earfcn), {}) if not (args.no_auto_gain or from_file) else {}
     if known:
         # width and gain learned on an earlier run: record at the right rate and gain straight away
         if known.get("width"):
@@ -923,6 +957,11 @@ def decode_carrier(args, freq_mhz):
         if not need:                             # MIB read but its width not understood: try the widest
             need = [30.72e6 for r in results if not r["ident"] and r["mib_odd"]]
         need = [n for n in need if n not in rates_done]
+        if need and from_file:
+            if max(need) > rate:
+                C.warn("  a cell is wider than this recording (%.2f Msps) - its SIB1 cannot be decoded from it" % (
+                    rate / 1e6))
+            need = []                            # narrower cells are handled inside srsRAN's decode
         if need:
             rate = max(need)
             rates_done.add(rate)
@@ -1264,7 +1303,7 @@ def write_csv(path, rows):
 def main():
     ap = argparse.ArgumentParser(description="LTE cell identity decoder (BladeRF + srsRAN).",
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
-    what = ap.add_mutually_exclusive_group(required=True)
+    what = ap.add_mutually_exclusive_group()
     what.add_argument("--freq-mhz", type=float, nargs="+", help="carrier centre frequency/frequencies in MHz")
     what.add_argument("--earfcn", type=int, nargs="+", help="carrier channel number(s) (EARFCN)")
     what.add_argument("--cells", nargs="+", metavar="EARFCN:PCI,PCI",
@@ -1292,6 +1331,13 @@ def main():
                          "each cell decoded in")
     ap.add_argument("--only", action="store_true",
                     help="with --cells: decode only the listed PCIs (other cells found are not decoded)")
+    ap.add_argument("--file", default=None,
+                    help="decode a recording instead of the radio: .sc16 (16-bit I/Q), .cf32, or a .sigmf-data/-meta "
+                         "pair (rate, frequency and format then come from the .sigmf-meta)")
+    ap.add_argument("--file-rate", type=float, default=None, help="sample rate of --file in Hz (e.g. 23.04e6)")
+    ap.add_argument("--file-low-if-mhz", type=float, default=0.0,
+                    help="how far above the carrier the recording was tuned (0 = centred on the carrier)")
+    ap.add_argument("--start", type=float, default=0.0, help="--file: start this many seconds in")
     ap.add_argument("--no-cancel", action="store_true",
                     help="skip interference cancellation (removing decoded cells' reference signals to find weaker "
                          "cells underneath)")
@@ -1307,6 +1353,29 @@ def main():
     args = ap.parse_args()
     if args.no_color:
         C.set_colour(False)
+    if args.file:
+        args.file = os.path.expanduser(args.file)
+        meta_path = re.sub(r"\.sigmf-(data|meta)$", ".sigmf-meta", args.file)
+        if meta_path.endswith(".sigmf-meta") and os.path.exists(meta_path):
+            import json
+            with open(meta_path) as fh:
+                meta = json.load(fh)
+            args.file = meta_path[:-len(".sigmf-meta")] + ".sigmf-data"
+            args._file_dtype = meta["global"].get("core:datatype", "ci16_le")
+            if int(meta["global"].get("core:num_channels", 1)) > 1:
+                sys.exit("two-antenna recordings are not supported with --file yet; use iq_export.py first")
+            args.file_rate = args.file_rate or float(meta["global"]["core:sample_rate"])
+            centre = float(meta["captures"][0]["core:frequency"])
+            carrier = float(meta["global"].get("lte:carrier_hz") or centre)
+            args.file_low_if_mhz = (centre - carrier) / 1e6
+            if not (args.freq_mhz or args.earfcn or args.cells):
+                args.freq_mhz = [carrier / 1e6]
+        if not args.file_rate:
+            sys.exit("--file needs --file-rate (sample rate in Hz), e.g. --file-rate 23.04e6")
+        if args.dual:
+            sys.exit("--dual cannot be used with --file")
+    if not (args.freq_mhz or args.earfcn or args.cells):
+        ap.error("give the carrier: --earfcn, --freq-mhz or --cells")
     if not pdsch_ue().is_file():
         sys.exit("srsRAN pdsch_ue was not found at %s - build it first (see README)." % pdsch_ue())
     lte_fastsync.install()
