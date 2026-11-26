@@ -818,6 +818,7 @@ def read_file(args):
     if pos + n > total:
         if pos >= total - int(args.file_rate * 0.05):
             C.warn("  end of the file reached")
+            args._file_end = True
             return None
         n = total - pos
     if is_float:
@@ -1411,7 +1412,7 @@ def main():
                 if args.csv and new:
                     write_csv(args.csv, new)
             finished = passes
-            if not args.loop:
+            if not args.loop or getattr(args, "_file_end", False):
                 break
             C.info("pass %d done - cells decoded so far: %s" % (passes, ", ".join(
                 "%s:%d" % (e, p) for e, p in sorted({(r["earfcn"], r["pci"]) for r in rows if r.get("ident")}))
