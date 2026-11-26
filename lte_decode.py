@@ -113,6 +113,7 @@ LAST_PEAK = [0.0]
 PCAP = [None]            # pcap_out.PcapWriter for the decoded MIB / SIB messages, or None
 BCH_HEX_RE = re.compile(r"BCCH-BCH hex ([0-9a-f]{6})")
 DLSCH_HEX_RE = re.compile(r"BCCH-DL-SCH hex ([0-9a-f]+)")
+SIB1DCI_RE = re.compile(r"SIB1dci cfi=(\d+) L=(\d+) ncce=(\d+) riv=(\d+) mode=(\d+) nprb1a=(\d+) ngap=(\d+) mcs=(\d+)")
 PPM = []                 # frequency error of the radio (offset / carrier) measured on decoded cells
 UK_BANDS = (20, 8, 3, 1, 7, 28, 32, 38, 40)
 
@@ -665,6 +666,10 @@ def decode_cell(samples, rate, hit, args, freq_mhz, aligned=None):
                 pdus.setdefault(("bch", h), None)
             for h in DLSCH_HEX_RE.findall(text):
                 pdus.setdefault(("dlsch", h), None)
+            m = SIB1DCI_RE.search(text)
+            if m and "sib1_dci" not in out:
+                out["sib1_dci"] = dict(zip(("cfi", "L", "ncce", "riv", "mode", "nprb1a", "ngap", "mcs"),
+                                           map(int, m.groups())))
             if args.srsran_log:
                 d = os.path.expanduser(args.srsran_log)
                 os.makedirs(d, exist_ok=True)
@@ -714,6 +719,8 @@ def decode_cell(samples, rate, hit, args, freq_mhz, aligned=None):
         path.unlink(missing_ok=True)
     out["ports"] = ports if (out["mib"] or out["mib_odd"]) else None
     out["diag"] = diag
+    out["mib_hex"] = next((h for kind, h in pdus if kind == "bch"), None)
+    out["sib1_hex"] = next((h for kind, h in pdus if kind == "dlsch"), None) if out["ident"] else None
     if PCAP[0] is not None:
         for kind, h in pdus:
             PCAP[0].lte_rrc(pcap_out.LTE_RRC_BCCH_BCH if kind == "bch" else pcap_out.LTE_RRC_BCCH_DL_SCH,
@@ -1030,71 +1037,103 @@ def mark_synchronised(results, rate):
             for r in sorted(timed, key=lambda r: r["start"] % frame)))
 
 
-def _after_cancelling(args, freq_mhz, rate, x1, x2, results, tried, show):
-    """Interference cancellation: remove the reference signals of every decoded cell from the recording, search it
-    again and retry the cells that were not decoded (and any new ones the cleaned search finds). On a lightly
-    loaded carrier a strong cell's reference signals are most of what covers a weak one (lte_cancel.py)."""
-    from lte_cancel import cancel_crs
-    strong = sorted([r for r in results if r["ident"] and r.get("aligned") is not None],
-                    key=lambda r: -(r.get("strength") or 0))
-    pending = [r for r in results if not r["ident"]]
-    if not strong:
-        return results
+def _after_cancelling(args, freq_mhz, rate, x1, x2, results, tried, show, rounds=3):
+    """Interference cancellation, in rounds. Every cell whose signals can be rebuilt - decoded, or at least its MIB
+    decoded (PCI, frame timing, width and antenna ports known) - has its reference signals, sync signals and MIB
+    channel removed from the recording (strongest first, each estimated from what the stronger ones left). The
+    cleaned recording is searched again and every cell not yet decoded is retried, with all the OTHER cells removed.
+    Cells that get further (decoded, or MIB newly decoded) are removed too in the next round (lte_cancel.py)."""
+    from lte_cancel import cancel_crs, regen_sib1
     only = getattr(args, "only", False)
-    if not pending and only:
-        return results
-    t0 = time.time()
-    C.status("  removing the reference signals of PCI %s..." % ", ".join(str(r["pci"]) for r in strong))
-    clean1, clean2 = x1, x2
+    regen = pdsch_ue().parent / "sib1_regen"
+    grids_cache = {}
+
+    def sib1_grids(r, n_rb):
+        """The decoded cell's SIB1 subframe rebuilt by srsRAN (needs the sib1_regen helper from the patch)."""
+        if not (r["ident"] and r.get("sib1_dci") and r.get("sib1_hex") and r.get("mib_hex") and regen.is_file()):
+            return None
+        if r.get("mib") != n_rb:
+            return None                          # the cell is wider than this recording
+        key = r["pci"]
+        if key not in grids_cache:
+            grids_cache[key] = regen_sib1(regen, r["pci"], n_rb, r.get("ports") or 2, r["mib_hex"], r["sib1_dci"],
+                                          r["sib1_hex"])
+        return grids_cache[key]
     own_rb = {7680000: 25, 15360000: 50, 23040000: 75, 30720000: 100}.get(int(round(rate)), 50)
-    for r in strong:
-        start = len(x1) - len(r["aligned"])
-        kw = dict(rate=rate, start=start, pci=r["pci"], n_rb=r.get("mib") or own_rb, ports=r.get("ports") or 2,
-                  cfo_hz=r.get("offset", 0.0))
-        clean1 = cancel_crs(clean1, **kw)
-        if clean2 is not None:
-            clean2 = cancel_crs(clean2, **kw)
-    label = "after removing PCI %s" % ", ".join(str(r["pci"]) for r in strong)
-    # search the cleaned recording: cells hidden under the strong ones may now be found
-    hits = list(search_cells(clean1, rate, args)["hits"])
-    if clean2 is not None:
-        have = {h["pci"] for h in hits}
-        hits += [h for h in search_cells(clean2, rate, args)["hits"] if h["pci"] not in have]
-    decoded = {r["pci"] for r in strong} | set(getattr(args, "_done_pcis", ()))
-    offsets = {int(h["pci"]): h for h in hits}
-    default_off = strong[0].get("offset", 0.0)
-    todo = [r["pci"] for r in pending]
-    todo += [int(h["pci"]) for h in hits if int(h["pci"]) not in decoded and int(h["pci"]) not in todo
-             and (not only or int(h["pci"]) in args._targets_now)]
-    new_found = [p for p in todo if p not in tried]
-    C.clear_status()
-    if not todo:
-        C.info("  interference cancellation (%.1f s): no further cells under PCI %s" % (
-            time.time() - t0, ", ".join(str(r["pci"]) for r in strong)))
-        return results
-    C.info("  interference cancellation (%.1f s): retrying %s%s" % (
-        time.time() - t0, ", ".join("PCI %d" % p for p in todo),
-        ("; new in the cleaned search: " + ", ".join(map(str, new_found))) if new_found else ""))
-    for pci in todo[:8]:
-        h = offsets.get(pci) or {"pci": pci, "offset_hz": default_off, "pss_ratio": 0.0}
-        if x2 is not None:
-            w1, w2, share = cell_weights(clean1, clean2, rate, pci, float(h.get("offset_hz", 0.0)))
-            r = decode_cell((w1 * clean1 + w2 * clean2).astype(np.complex64), rate, h, args, freq_mhz)
-        else:
-            r = decode_cell(clean1, rate, h, args, freq_mhz)
-        r["how"] = label
-        if r["status"] == "frame timing not found":
-            r["status"] = "not found"
-        old = next((x for x in results if x["pci"] == pci), None)
-        better = old is None or (r["ident"] and not old["ident"]) or (not old["ident"] and r["mib"] and not old["mib"])
-        if better:
-            if old is not None:
-                results.remove(old)
-            results.append(r)
-            tried.add(pci)
-            if r["ident"] or old is None or r["mib"]:
-                show(r)
-        r.pop("aligned", None)
+    t0 = time.time()
+    for rnd in range(rounds):
+        known = sorted([r for r in results if r.get("start") is not None and (r["ident"] or r["mib"])],
+                       key=lambda r: -(r.get("strength") or 0))
+        if not known:
+            return results
+        C.status("  interference cancellation, round %d: removing PCI %s..." % (
+            rnd + 1, ", ".join(str(r["pci"]) for r in known)))
+        res1, res2 = x1, x2
+        own_part = {}                            # a not-yet-decoded cell's own rebuilt part, to add back for it
+        for r in known:
+            n_rb = min(r.get("mib") or own_rb, own_rb)
+            kw = dict(rate=rate, start=int(r["start"]), pci=r["pci"], n_rb=n_rb,
+                      ports=r.get("ports") or 2, cfo_hz=r.get("offset", 0.0), mib_hex=r.get("mib_hex"),
+                      sib1_grids=sib1_grids(r, n_rb))
+            c1 = cancel_crs(res1, **kw)
+            c2 = cancel_crs(res2, **kw) if res2 is not None else None
+            if not r["ident"]:
+                own_part[r["pci"]] = (res1 - c1, None if c2 is None else res2 - c2)
+            res1, res2 = c1, c2
+        hits = list(search_cells(res1, rate, args)["hits"])
+        if res2 is not None:
+            have = {h["pci"] for h in hits}
+            hits += [h for h in search_cells(res2, rate, args)["hits"] if h["pci"] not in have]
+        decoded = {r["pci"] for r in results if r["ident"]} | set(getattr(args, "_done_pcis", ()))
+        found = {int(h["pci"]): h for h in hits}
+        todo = [r["pci"] for r in results if not r["ident"]]
+        todo += [p for p in found if p not in decoded and p not in todo and (not only or p in args._targets_now)]
+        new_found = [p for p in todo if p not in tried]
+        C.clear_status()
+        if not todo:
+            C.info("  interference cancellation (%.1f s): no further cells under PCI %s" % (
+                time.time() - t0, ", ".join(str(r["pci"]) for r in known)))
+            return results
+        C.info("  interference cancellation round %d (%.1f s): removed PCI %s, retrying %s%s" % (
+            rnd + 1, time.time() - t0, ", ".join(str(r["pci"]) for r in known), ", ".join(map(str, todo)),
+            ("; new in the cleaned search: " + ", ".join(map(str, new_found))) if new_found else ""))
+        improved = False
+        # cells on one carrier normally share width and antenna-port count (same operator, often the same mast):
+        # a cell not decoded yet is tried with what the known cells use
+        common_ports = max(set(k.get("ports") or 2 for k in known), key=[k.get("ports") or 2 for k in known].count)
+        common_width = known[0].get("mib")
+        for pci in todo[:8]:
+            old = next((x for x in results if x["pci"] == pci), None)
+            h = dict(found.get(pci) or {"pci": pci, "offset_hz": (old or known[0]).get("offset", 0.0),
+                                        "pss_ratio": 0.0})
+            h["ports"] = (old or {}).get("ports") or common_ports
+            h["width"] = (old or {}).get("mib") or common_width
+            s1, s2 = res1, res2
+            if pci in own_part:                  # keep this cell's own signal in its recording
+                s1 = res1 + own_part[pci][0]
+                s2 = None if res2 is None else res2 + own_part[pci][1]
+            if s2 is not None:
+                w1, w2, share = cell_weights(s1, s2, rate, pci, float(h.get("offset_hz", 0.0)))
+                r = decode_cell((w1 * s1 + w2 * s2).astype(np.complex64), rate, h, args, freq_mhz)
+            else:
+                r = decode_cell(s1, rate, h, args, freq_mhz)
+            r["how"] = "after removing PCI %s" % ", ".join(str(k["pci"]) for k in known if k["pci"] != pci)
+            if r["status"] == "frame timing not found":
+                r["status"] = "not found"
+            better = old is None or (r["ident"] and not old["ident"]) or \
+                (not old["ident"] and r["mib"] and not old["mib"])
+            if better:
+                if old is not None:
+                    results.remove(old)
+                results.append(r)
+                tried.add(pci)
+                improved = improved or bool(r["ident"] or r["mib"])
+                if r["ident"] or old is None or r["mib"]:
+                    show(r)
+            r.pop("aligned", None)
+        own_part.clear()
+        if not improved:
+            break
     return results
 
 

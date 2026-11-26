@@ -61,6 +61,7 @@ def main():
     if not EXAMPLES.is_dir():
         sys.exit("srsRAN examples were not found at %s" % EXAMPLES)
     shutil.copy(SOURCE, EXAMPLES / "sib1_print.cc")
+    shutil.copy(SOURCE.parent / "sib1_regen.c", EXAMPLES / "sib1_regen.c")
 
     pdsch = EXAMPLES / "pdsch_ue.c"
     text = pdsch.read_text()
@@ -127,6 +128,11 @@ def main():
         if line in cmake_text:
             cmake_text = cmake_text.replace(line, line[:-1] + " rrc_asn1)")
             changed = True
+    if "sib1_regen" not in cmake_text:
+        cmake_text += ("\n# SIB1 subframe rebuild for interference cancellation (lte_cancel.py)\n"
+                       "add_executable(sib1_regen sib1_regen.c)\n"
+                       "target_link_libraries(sib1_regen srsran_phy srsran_common pthread)\n")
+        changed = True
     if changed:
         cmake.write_text(cmake_text)
         print("patched %s" % cmake)

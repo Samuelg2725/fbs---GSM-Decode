@@ -70,6 +70,14 @@ Test location: home, November 2026. Reference: a phone network-monitor app at th
   the weak cell's timing). Test with two `sib1_enodeb` cells, different timing: weak cell 15/18/21 dB below the
   strong one - nothing without, MIB + SIB1 with; srsRAN's SNR of the weak cell +3.5 -> +17.8 dB at -15 dB. Synthetic
   load test: +12 dB signal-to-interference at 0% load, +3 dB at 10%, +1.5 dB at 30%.
+- **PBCH and SIB1 cancellation:** the PBCH of a cell is rebuilt from its decoded MIB for every SFN (found by matching
+  all 1024 in the first frames), SIB1 subframes (PCFICH + SIB1 PDCCH + PDSCH) by `sib1_regen` with srsRAN's encoder
+  from the decoder's `SIB1dci` line and the SIB1 bytes (correlation with the transmitted subframe 1.000, all four
+  RVs). The library's `conv_rate_match` (osprey 2/lte_coding.py) does not follow 36.212 5.1.4.2 (60% bit agreement
+  with srsRAN's PBCH); lte_cancel.py has its own, which matches 100%. Two synchronised `sib1_enodeb` cells with real
+  SIB1s on the same resource blocks: weak cell decoded at -10/-15/-20 dB with cancellation (nothing without), MIB
+  only at -25. Office: PCI 76 (eNB 2264, not in the phone's list) decoded after removing PCI 199.
+- Office measurements showed frame-synchronised cells: 1363 PCI 21 with 199 (7.054/7.055 ms), 3725 PCI 80 with 144.
 - When the SSS cannot tell subframe 0 from 5 (weak cell), both frame positions are tried; the MIB CRC decides.
 
 ## Tried and removed

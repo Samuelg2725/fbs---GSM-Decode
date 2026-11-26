@@ -145,6 +145,9 @@ static uint32_t             sib1_grant_cfi = 0;
 static bool                 have_grant     = false;
 static uint32_t             pdsch_n        = PDSCH_MAX_COMBINE;
 static uint32_t             reported       = 0;
+static srsran_dci_dl_t      sib1_dci;                /* last SIB1 control message found */
+static bool                 have_dci       = false;
+static bool                 dci_printed    = false;
 
 extern "C" int srsran_sib1_combining_enabled(void)
 {
@@ -229,6 +232,8 @@ extern "C" int srsran_sib1_decode(srsran_ue_dl_t*     q,
     if (srsran_ue_dl_dci_to_pdsch_grant(q, sf, cfg, &dci[0], &pdsch_cfg->grant)) {
       return SRSRAN_ERROR;
     }
+    sib1_dci = dci[0];
+    have_dci = true;
   } else if (have_grant) {
     pdsch_cfg->grant = sib1_grant;
     sf->cfi          = sib1_grant_cfi; /* SIB1's control region size does not change */
@@ -307,6 +312,21 @@ extern "C" int srsran_sib1_decode(srsran_ue_dl_t*     q,
             pdsch_cfg->grant.tb[0].rv,
             pdsch_cfg->grant.tb[0].tbs,
             pdsch_cfg->grant.nof_prb);
+  }
+  if (acks[0] && have_dci && !dci_printed) {
+    /* what is needed to rebuild this cell's SIB1 subframe (for interference cancellation) */
+    fprintf(stderr,
+            "\nSIB1dci cfi=%u L=%u ncce=%u riv=%u mode=%d nprb1a=%d ngap=%d mcs=%u\n",
+            cfi,
+            sib1_dci.location.L,
+            sib1_dci.location.ncce,
+            sib1_dci.type2_alloc.riv,
+            (int)sib1_dci.type2_alloc.mode,
+            (int)sib1_dci.type2_alloc.n_prb1a,
+            (int)sib1_dci.type2_alloc.n_gap,
+            sib1_dci.tb[0].mcs_idx);
+    fflush(stderr);
+    dci_printed = true;
   }
   if (acks[0]) {
     if ((pdsch_n > 1 || from_avg || from_saved) && reported < 3) {

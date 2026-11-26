@@ -92,11 +92,15 @@ Two techniques get weak cells that srsRAN alone cannot:
   Stock srsRAN decodes each transmission on its own; the patched decoder adds up the control channel and the
   SIB1 data over the repeats. Measured with srsRAN's own test signals: stock srsRAN stops decoding about 3-4 dB
   earlier (1 s recordings: stock 0 of 3 at a noise level where the patched decoder gets 3 of 3).
-- **Interference cancellation** (`lte_cancel.py`): after the cells it can decode, the tool removes their reference
-  and sync signals (known from the PCI) from the recording, searches it again and retries the cells that were not
-  decoded. Measured: a cell 15-21 dB weaker than a strong cell on the same frequency decodes after cancellation
-  and not before (on a quiet carrier; the more traffic the strong cell carries, the less this gains).
-  `--no-cancel` turns it off.
+- **Interference cancellation** (`lte_cancel.py`): every cell whose signals can be rebuilt is removed from the
+  recording - reference signals and sync signals (from the PCI), the MIB channel (from its decoded MIB) and, for
+  decoded cells, the whole SIB1 subframe (rebuilt by srsRAN's own transmitter code, `sib1_regen`). The cleaned
+  recording is searched again and the remaining cells retried, in rounds. This is what decodes cells hidden under
+  a stronger cell - including frame-synchronised cells, whose MIB and SIB1 are sent on exactly the same resource
+  elements. Measured with srsRAN test cells carrying real SIB1s: a synchronised cell 10-20 dB weaker than the
+  decoded one is fully decoded after cancellation and not at all before; cells with different timing likewise.
+  User traffic of the strong cell cannot be rebuilt, so on a busy carrier the gain is smaller. `--no-cancel` turns
+  it off. The line `frame timing (ms into the 10 ms frame)` shows which cells are synchronised.
 
 With `--cells EARFCN:PCI,PCI …` (for example copied from a phone's network-monitor app) every listed PCI is
 looked for directly, even when the search does not find it: knowing the PCI, its sync signal is added up over
@@ -184,12 +188,13 @@ once (setup step 3).
    sudo apt install -y build-essential cmake libfftw3-dev libmbedtls-dev libboost-program-options-dev libconfig++-dev libsctp-dev
    cd ~ && git clone --depth 1 https://github.com/srsran/srsRAN_4G.git
    python3 ~/fbs-upload/"osprey 2"/srsran_watch/print_sib1.py
-   mkdir -p ~/srsRAN_4G/build && cd ~/srsRAN_4G/build && cmake .. && make -j3 pdsch_ue
+   mkdir -p ~/srsRAN_4G/build && cd ~/srsRAN_4G/build && cmake .. && make -j3 pdsch_ue sib1_regen
    ```
-   The patch makes srsRAN print the decoded cell identity and the raw MIB / SIB bytes (for the pcap files).
-   Re-run the last two commands whenever `sib1_print.cc` changes:
+   The patch makes srsRAN print the decoded cell identity and the raw MIB / SIB bytes (for the pcap files), adds
+   SIB1 combining and the PHICH fix, and builds the `sib1_regen` helper used by interference cancellation.
+   Re-run these whenever anything in `osprey 2/srsran_watch` changes:
    ```bash
-   python3 ~/fbs-upload/"osprey 2"/srsran_watch/print_sib1.py && cd ~/srsRAN_4G/build && make -j3 pdsch_ue
+   python3 ~/fbs-upload/"osprey 2"/srsran_watch/print_sib1.py && cd ~/srsRAN_4G/build && cmake .. && make -j3 pdsch_ue sib1_regen
    ```
 4. Optional check that the fast LTE search gives the same answers as the original code:
    `python3 lte_fastsync.py` (ends with `OK`).
