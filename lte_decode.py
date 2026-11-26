@@ -609,10 +609,12 @@ def decode_cell(samples, rate, hit, args, freq_mhz, aligned=None):
         pdus = {}                                # decoded MIB / SIB bytes, in order, for the pcap file
         diag = {}                                # srsRAN's measurements of the cell
 
-        def srsran(n_prb, ports, extra=()):
-            C.status("  PCI %d: srsRAN decoding (%s MHz, %d transmit antenna%s%s)..." % (
-                pci, BW_MHZ.get(n_prb, "?"), ports, "" if ports == 1 else "s",
-                ", averaged channel estimate" if extra else ""))
+        # channel estimate: averaged over the subframe by default (less noisy: weak cells decode that fail with
+        # srsRAN's own default); srsRAN's interpolated estimate (follows fast changes, e.g. when moving) is the
+        # second try
+        def srsran(n_prb, ports, extra=("-R", "average")):
+            C.status("  PCI %d: srsRAN decoding (%s MHz, %d transmit antenna%s, %s channel estimate)..." % (
+                pci, BW_MHZ.get(n_prb, "?"), ports, "" if ports == 1 else "s", extra[-1]))
             # srsRAN reads a file at the standard rate for the width it is told (5 MHz = 7.68 Msps, ...): give
             # a narrower cell a recording reduced to its own rate
             k = rate / NATIVE_RATE[n_prb]
@@ -672,11 +674,11 @@ def decode_cell(samples, rate, hit, args, freq_mhz, aligned=None):
             if out["mib"] is not None and (out["mib"] == n_prb or needed_rate(out["mib"]) > rate):
                 break                                # right width tried, or the cell needs a wider capture
         if not out["ident"] and out["mib"] and NATIVE_RATE[out["mib"]] <= rate * 1.01:
-            # MIB read but not SIB1: one more go with an averaged channel estimate - less noisy than the default
-            # (which follows fast changes), which helps a weak cell that is not moving
-            text = srsran(out["mib"], ports, ("-R", "average"))
+            # MIB read but not SIB1: one more go with srsRAN's interpolated channel estimate, which can do better
+            # when the radio or the surroundings are moving
+            text = srsran(out["mib"], ports, ("-R", "interpolate"))
             if parse_ident(text, out):
-                out["note"] = "averaged channel estimate"
+                out["note"] = "interpolated channel estimate"
     finally:
         path.unlink(missing_ok=True)
     out["ports"] = ports if (out["mib"] or out["mib_odd"]) else None
