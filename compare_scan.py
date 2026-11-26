@@ -2,7 +2,8 @@
 """Side-by-side test: the CALYX modem and the SDR scan at the same time, then one table compares them.
 
   sudo python3 compare_scan.py
-  sudo python3 compare_scan.py --sdr-args '--dual'          # SDR with both antennas
+  sudo python3 compare_scan.py --dual                        # SDR with both antennas (any lte_decode option
+                                                             # given here is passed on to it)
   sudo python3 compare_scan.py --earfcn 6300 6400 1617      # only these carriers
 
 What it does:
@@ -146,7 +147,8 @@ def main():
     ap.add_argument("--earfcn", type=int, nargs="+", help="SDR carriers (default: UK list + the modem's)")
     ap.add_argument("--sdr-args", default="", help="extra lte_decode.py options, e.g. '--dual --retries 4'")
     ap.add_argument("--timeout", type=float, default=600, help="seconds per modem scan (default 600)")
-    args = ap.parse_args()
+    args, passthrough = ap.parse_known_args()
+    sdr_extra = passthrough + args.sdr_args.split()   # any lte_decode.py option, e.g. --dual, goes straight through
     if os.geteuid() != 0:
         sys.exit("Run with sudo (the modem port needs it); the SDR part runs as your normal user.")
     os.makedirs(M.FIELD, exist_ok=True)
@@ -158,8 +160,14 @@ def main():
     modem = Modem(port, args.timeout)
     modem.start()
     C.info("modem on %s: first full scan (about 20 s)..." % port)
-    while not modem.first.wait(1):
-        C.status("  modem first scan... %.0f s" % (time.time() - t0))
+    try:
+        while not modem.first.wait(1):
+            C.status("  modem first scan... %.0f s" % (time.time() - t0))
+    except KeyboardInterrupt:
+        C.clear_status()
+        print("")
+        C.warn("stopped")
+        return 1
     C.clear_status()
     with modem.lock:
         seen = sorted(modem.cells)
@@ -177,7 +185,7 @@ def main():
                             pass
         earfcns = sorted(set(UK_EARFCN) | {k[0] for k in seen} | old)
     cmd = [sys.executable, os.path.join(HERE, "lte_decode.py"), "--earfcn"] + [str(e) for e in earfcns] + \
-          ["--csv", sdr_csv] + args.sdr_args.split()
+          ["--csv", sdr_csv] + sdr_extra
     user = os.environ.get("SUDO_USER")
     if user and user != "root":
         cmd = ["sudo", "-u", user, "env", "LD_LIBRARY_PATH=/usr/local/lib"] + cmd

@@ -288,7 +288,10 @@ def main():
     ap.add_argument("--sdr-args", default="",
                     help="extra lte_decode.py options for --sdr, e.g. '--dual --retries 4'")
     ap.add_argument("--no-color", action="store_true", help="plain text output")
-    args = ap.parse_args()
+    args, passthrough = ap.parse_known_args()
+    if passthrough and not args.sdr:
+        ap.error("unrecognised arguments: %s" % " ".join(passthrough))
+    args.sdr_args = " ".join(passthrough + args.sdr_args.split())
     if args.no_color:
         C.set_colour(False)
     os.makedirs(os.path.dirname(RAW), exist_ok=True)
