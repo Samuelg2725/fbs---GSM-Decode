@@ -5,6 +5,7 @@ EARFCN, PCI, TAC and Cell ID - then a comparison with what the SDR decoder has d
   sudo python3 modem_scan.py                    # scan LTE, all bands (can take a few minutes)
   sudo python3 modem_scan.py --band 20 3        # only band 20 (800) and band 3 (1800) - faster
   sudo python3 modem_scan.py --rat all          # LTE + GSM (+ 3G)
+  sudo python3 modem_scan.py --earfcn 6300 76 --loop   # only these carriers, scanned again and again
   sudo python3 modem_scan.py --loop             # repeat, adding new cells to the list
   sudo python3 modem_scan.py --sdr              # then decode the same cells with the SDR and compare
 
@@ -54,6 +55,15 @@ def user_home():
 
 
 FIELD = os.path.join(user_home(), "field")
+# LTE bands by downlink EARFCN range (the scan can be limited to a band, not to one EARFCN)
+LTE_BANDS = [(1, 0, 599), (3, 1200, 1949), (7, 2750, 3449), (8, 3450, 3799), (20, 6150, 6449), (28, 9210, 9659),
+             (32, 9920, 10359), (38, 37750, 38249), (40, 38650, 39649)]
+
+
+def band_of(earfcn):
+    return next((b for b, lo, hi in LTE_BANDS if lo <= earfcn <= hi), None)
+
+
 SDR_CSV = os.path.join(FIELD, "lte_cells.csv")
 OUT_CSV = os.path.join(FIELD, "modem_cells.csv")
 RAW = os.path.join(FIELD, "modem_scan_raw.txt")
@@ -205,7 +215,7 @@ def show(cells, sdr, neigh=()):
     lte = sorted((c for c in cells if c["rat"] == "LTE"), key=lambda c: (c["freq"], -c["level"]))
     todo = {}
     if lte:
-        t = C.Table(["EARFCN", "PCI", "Operator", "TAC", "eNB", "Sector", "Cell ID", "RSRP", "RSRQ", "SDR"],
+        t = C.Table(["EARFCN", "PCI", "Operator", "TAC", "eNB", "Sector", "Cell ID", "RSRP", "RSRQ", "Seen", "SDR"],
                     align={k: "right" for k in ("EARFCN", "PCI", "TAC", "eNB", "Sector", "Cell ID", "RSRP", "RSRQ")})
         ok = 0
         for c in lte:
@@ -222,7 +232,7 @@ def show(cells, sdr, neigh=()):
             if not (got and c["cell_id"] in got):
                 todo.setdefault(c["freq"], []).append(c["pci"])
             t.add([c["freq"], c["pci"], C.op_cell(operator(c["plmn"])), c["tac"], c["enb"], c["sector"],
-                   (c["cell_id"], "green+bold"), c["level"], c["rsrq"], mark])
+                   (c["cell_id"], "green+bold"), c["level"], c["rsrq"], seen_text(c), mark])
         t.show("LTE cells the modem decoded: %d   (SDR has decoded %d of them)" % (len(lte), ok))
     known = {(c["freq"], c["pci"]) for c in lte}
     extra = sorted({(n["freq"], n["pci"]): n for n in neigh if (n["freq"], n["pci"]) not in known}.values(),
@@ -254,6 +264,16 @@ def show(cells, sdr, neigh=()):
     return todo
 
 
+def seen_text(c):
+    """First and last time (Pi clock) the modem reported the cell, and in how many scans."""
+    if "first" not in c:
+        return "-"
+    if c.get("times", 1) <= 1:
+        return time.strftime("%H:%M:%S", time.localtime(c["first"]))
+    return "%s-%s (%dx)" % (time.strftime("%H:%M:%S", time.localtime(c["first"])),
+                            time.strftime("%H:%M:%S", time.localtime(c["last"])), c["times"])
+
+
 def cells_arg(todo):
     return ["--cells"] + ["%d:%s" % (f, ",".join(map(str, sorted(set(p))))) for f, p in sorted(todo.items())]
 
@@ -279,6 +299,8 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--port", help="modem AT port (default: find it, usually /dev/ttyUSB2)")
     ap.add_argument("--rat", choices=sorted(RAT), default="lte", help="what to scan (default lte)")
+    ap.add_argument("--earfcn", type=int, nargs="+",
+                    help="only these LTE carriers (the modem scans their band; other carriers are left out)")
     ap.add_argument("--band", type=int, nargs="+", help="only these bands (LTE e.g. 20 3 1 8 7; GSM 1=900 2=1800)")
     ap.add_argument("--timeout", type=float, default=600, help="seconds to wait per scan (default 600)")
     ap.add_argument("--loop", action="store_true", help="scan again and again; the table keeps every cell seen")
@@ -304,6 +326,13 @@ def main():
         C.info("radio was off (%s) - switching it on" % " ".join(fun.split()))
         command(fd, "AT+CFUN=1", 15)
         time.sleep(3)
+    if args.earfcn:
+        bands = sorted({band_of(e) for e in args.earfcn} - {None})
+        if not bands:
+            ap.error("no known LTE band for EARFCN %s" % args.earfcn)
+        args.band = sorted(set(args.band or []) | set(bands))
+        C.info("EARFCN %s -> scanning band %s" % (" ".join(map(str, args.earfcn)), " ".join(map(str, args.band))))
+    keep = (lambda f: f in args.earfcn) if args.earfcn else (lambda f: True)
     seen, neigh, n = {}, {}, 0
     try:
         while True:
@@ -313,13 +342,20 @@ def main():
                 if args.raw:
                     print("\n".join("   | " + l for l in lines if l.strip()), flush=True)
                 cells = parse(lines)
+                now = time.time()
+                for c in cells:
+                    c["first"] = c["last"] = now
                 if not cells and any(l.strip() not in ("", "OK") for l in lines):
                     C.warn("  answer not understood - raw text saved in %s; run with --raw and send it" % RAW)
                 save(cells)
                 for c in cells:
                     key = (c["rat"], c["freq"], c.get("pci", c.get("bsic")), c["cell_id"])
                     old = seen.get(key)
-                    seen[key] = c if old is None or c["level"] > old["level"] else old
+                    if old is not None:
+                        c["first"], c["times"] = old["first"], old.get("times", 1) + 1
+                        if c["level"] < old["level"]:
+                            c["level"], c["rsrq"] = old["level"], old.get("rsrq")
+                    seen[key] = c
             for c in neighbours(fd):
                 key = (c["freq"], c["pci"])
                 if key not in neigh or c["rsrp"] > neigh[key]["rsrp"]:
@@ -327,7 +363,8 @@ def main():
             for path in (RAW, OUT_CSV):
                 give_back(path)
             C.heading("Scan %d - %s" % (n, time.strftime("%H:%M:%S")))
-            todo = show(list(seen.values()), sdr_results(), neigh.values())
+            todo = show([c for c in seen.values() if keep(c["freq"])], sdr_results(),
+                        [x for x in neigh.values() if keep(x["freq"])])
             if args.sdr and todo:
                 os.close(fd)
                 run_sdr(todo, args.sdr_args.split())
