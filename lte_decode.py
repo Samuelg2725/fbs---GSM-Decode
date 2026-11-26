@@ -1411,7 +1411,7 @@ def main():
                 rows += new
                 if args.csv and new:
                     write_csv(args.csv, new)
-            finished = passes
+            finished = passes - (1 if getattr(args, "_file_end", False) else 0)
             if not args.loop or getattr(args, "_file_end", False):
                 break
             C.info("pass %d done - cells decoded so far: %s" % (passes, ", ".join(
