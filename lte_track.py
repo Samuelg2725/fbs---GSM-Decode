@@ -356,6 +356,7 @@ def apply_result(cell, r):
 def track(args):
     rate = 15.36e6
     args.gain_now = args.gain
+    args.gain_now2 = args.gain
     cells, cycles, t_all = {}, 0, time.time()
     writer = IQWriter(args.iq_dir, args.iq_max_gb) if args.save_iq != "none" else None
     log = CycleLog(args.log)
@@ -562,12 +563,16 @@ def track(args):
 
             # keep the gain right as conditions change; switch to a wider recording for a wider cell
             if not args.no_auto_gain:
-                if peak >= 0.99 and args.gain_now > 0:
-                    args.gain_now = max(0.0, args.gain_now - 6)
-                    C.info("  clipping - gain lowered to %g dB" % args.gain_now)
-                elif 0 < peak < 0.12 and args.gain_now < 60:
-                    args.gain_now = min(60.0, args.gain_now + 6)
-                    C.info("  signal low - gain raised to %g dB" % args.gain_now)
+                chans = [("", "gain_now", peak)] if not args.dual else [
+                    ("RX1 ", "gain_now", L.LAST_PEAKS[0]), ("RX2 ", "gain_now2", L.LAST_PEAKS[1])]
+                for name, attr, pk in chans:
+                    g = getattr(args, attr, args.gain_now)
+                    if pk >= 0.99 and g > 0:
+                        setattr(args, attr, max(0.0, g - 6))
+                        C.info("  %sclipping - gain lowered to %g dB" % (name, getattr(args, attr)))
+                    elif 0 < pk < 0.12 and g < 60:
+                        setattr(args, attr, min(60.0, g + 6))
+                        C.info("  %ssignal low - gain raised to %g dB" % (name, getattr(args, attr)))
             if want_rate != rate:
                 rate = want_rate
                 C.info("  the carrier is %s MHz wide - recording %.2f Msps from now on%s" % (

@@ -158,7 +158,7 @@ def _bladerf_cli(cmd):
     return subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
 
-def _cli_raw(freq_hz, rate, secs, gain, dual):
+def _cli_raw(freq_hz, rate, secs, gain, dual, gain2=None):
     """bladeRF-cli capture (opens the radio each time) -> int16 array, one row per sample:
     [I1, Q1] or [I1, Q1, I2, Q2]. Includes the tuning transient. None on failure."""
     n = int(rate * (secs + 0.01))
@@ -173,7 +173,7 @@ def _cli_raw(freq_hz, rate, secs, gain, dual):
         # with two channels, n= counts the samples of both; gains must be set after 'rx config' to reach both
         cmd += ["-e", "rx config file=%s format=bin n=%d channel=1,2 samples=16384 buffers=64 xfers=16 "
                 "timeout=20000" % (SC16, 2 * n),
-                "-e", "set gain rx1 %d" % int(gain), "-e", "set gain rx2 %d" % int(gain)]
+                "-e", "set gain rx1 %d" % int(gain), "-e", "set gain rx2 %d" % int(gain if gain2 is None else gain2)]
     else:
         cmd += ["-e", "set gain rx %d" % int(gain),
                 "-e", "rx config file=%s format=bin n=%d samples=16384 buffers=64 xfers=16 timeout=20000"
@@ -228,7 +228,7 @@ class LibRadio(object):
         if ret < 0:
             raise RuntimeError("libbladeRF %s failed: %s" % (what, self.lib.bladerf_strerror(ret).decode()))
 
-    def raw(self, freq_hz, rate, secs, gain):
+    def raw(self, freq_hz, rate, secs, gain, gain2=None):
         ct, lib, dev = self.ct, self.lib, self.dev
         try:
             if rate != self.rate:
@@ -244,9 +244,10 @@ class LibRadio(object):
             # for every capture (cheap compared with re-opening the radio)
             self._ok(lib.bladerf_sync_config(dev, self.RX_X2 if len(self.chans) == 2 else self.RX_X1,
                                              self.SC16_Q11, 64, 16384, 16, 5000), "configure stream")
-            for ch in self.chans:
+            for i, ch in enumerate(self.chans):
+                g = gain if (i == 0 or gain2 is None) else gain2
                 self._ok(lib.bladerf_set_gain_mode(dev, ch, self.GAIN_MGC), "set manual gain")
-                self._ok(lib.bladerf_set_gain(dev, ch, int(gain)), "set gain")
+                self._ok(lib.bladerf_set_gain(dev, ch, int(g)), "set gain")
             n = int(rate * (secs + 0.01))
             nch = len(self.chans)
             buf = np.empty((n, 2 * nch), np.int16)             # with two channels: I1 Q1 I2 Q2 per sample
@@ -274,12 +275,13 @@ LAST_RAW = [None]        # int16 samples of the last capture (tuning transient r
 KEEP_RAW = [False]       # lte_track.py sets this; lte_decode.py does not need the raw copy
 
 
-def capture_raw(freq_hz, rate, secs, gain, dual):
-    """One capture -> int16 array [I1, Q1(, I2, Q2)] per row, tuning transient removed, or None."""
+def capture_raw(freq_hz, rate, secs, gain, dual, gain2=None):
+    """One capture -> int16 array [I1, Q1(, I2, Q2)] per row, tuning transient removed, or None.
+    gain2: RX2's gain when it differs from RX1's (the two antennas have independent gains)."""
     if RADIO[0] is not None:
-        raw = RADIO[0].raw(freq_hz, rate, secs, gain)
+        raw = RADIO[0].raw(freq_hz, rate, secs, gain, gain2)
     else:
-        raw = _cli_raw(freq_hz, rate, secs, gain, dual)
+        raw = _cli_raw(freq_hz, rate, secs, gain, dual, gain2)
     if raw is None:
         return None
     raw = raw[int(rate * 0.01):]
@@ -303,18 +305,27 @@ def capture(freq_hz, rate, secs, gain, low_if_hz):
     return condition(iq, rate, low_if_hz)
 
 
-def capture_dual(freq_hz, rate, secs, gain, low_if_hz):
-    """RX1 + RX2 together (one tuner, same gain) -> (rx1, rx2) or None."""
-    raw = capture_raw(freq_hz + low_if_hz, rate, secs, gain, True)
+LAST_PEAKS = [0.0, 0.0]  # per antenna, for separate auto gain
+
+
+def capture_dual(freq_hz, rate, secs, gain, low_if_hz, gain2=None):
+    """RX1 + RX2 together (one tuner; each antenna its own gain) -> (rx1, rx2) or None. RX2 is scaled to RX1's gain,
+    so both are on the same scale for combining."""
+    gain2 = gain if gain2 is None else gain2
+    raw = capture_raw(freq_hz + low_if_hz, rate, secs, gain, True, gain2)
     if raw is None:
         return None
     out, peak = [], 0.0
-    for col, name in ((0, "RX1"), (2, "RX2")):
+    for i, (col, name, g) in enumerate(((0, "RX1", gain), (2, "RX2", gain2))):
         iq = _to_iq(raw, col)
         pk = float(np.max(np.abs(raw[:, col:col + 2]))) / 2048.0
         peak = max(peak, pk)
-        _level_line(name, iq, pk, gain)
-        out.append(condition(iq, rate, low_if_hz))
+        LAST_PEAKS[i] = pk
+        _level_line(name, iq, pk, g)
+        x = condition(iq, rate, low_if_hz)
+        if g != gain:
+            x = (x * np.float32(10 ** ((gain - g) / 20.0))).astype(np.complex64)
+        out.append(x)
     LAST_PEAK[0] = peak
     return out[0], out[1]
 
@@ -779,25 +790,45 @@ def record(args, freq_mhz, rate):
     """Capture at the current gain (one or two antennas) -> (rx1, rx2 or None) or (None, None)."""
     lif = args.low_if_mhz * 1e6
     if args.dual:
-        pair = capture_dual(freq_mhz * 1e6, rate, args.secs, args.gain_now, lif)
+        pair = capture_dual(freq_mhz * 1e6, rate, args.secs, args.gain_now, lif,
+                            getattr(args, "gain_now2", args.gain_now))
         return pair if pair else (None, None)
     return capture(freq_mhz * 1e6, rate, args.secs, args.gain_now, lif), None
 
 
+def better_gain(gain, peak):
+    """New gain aiming for a peak of about half full scale, or None when the gain is fine."""
+    if peak >= 0.99:
+        return max(0.0, gain - 10)
+    if 0 < peak < 0.25 and gain < 60:
+        return min(60.0, gain + max(3.0, min(20.0, round(20 * np.log10(0.5 / peak)))))
+    return None
+
+
 def auto_gain(args, freq_mhz, rate, x1, x2, rounds=3):
-    """Re-record at a better gain (aiming for a peak of about half full scale) up to `rounds` times."""
+    """Re-record at a better gain (aiming for a peak of about half full scale) up to `rounds` times. With two
+    antennas each gets its own gain: one strong antenna no longer pulls the other's gain down."""
+    if not hasattr(args, "gain_now2"):
+        args.gain_now2 = args.gain_now
     for _round in range(0 if args.no_auto_gain else rounds):
         if x1 is None:
             break
-        pk, new = LAST_PEAK[0], None
-        if pk >= 0.99:
-            new = args.gain_now - 10
-        elif 0 < pk < 0.25 and args.gain_now < 60:
-            new = min(60.0, args.gain_now + max(3.0, min(20.0, round(20 * np.log10(0.5 / pk)))))
-        if new is None or new == args.gain_now:
-            break
-        C.info("  auto gain: %g -> %g dB" % (args.gain_now, new))
-        args.gain_now = new
+        if args.dual:
+            new1 = better_gain(args.gain_now, LAST_PEAKS[0])
+            new2 = better_gain(args.gain_now2, LAST_PEAKS[1])
+            if new1 is None and new2 is None:
+                break
+            C.info("  auto gain: RX1 %g -> %g dB, RX2 %g -> %g dB" % (
+                args.gain_now, new1 if new1 is not None else args.gain_now,
+                args.gain_now2, new2 if new2 is not None else args.gain_now2))
+            args.gain_now = args.gain_now if new1 is None else new1
+            args.gain_now2 = args.gain_now2 if new2 is None else new2
+        else:
+            new = better_gain(args.gain_now, LAST_PEAK[0])
+            if new is None or new == args.gain_now:
+                break
+            C.info("  auto gain: %g -> %g dB" % (args.gain_now, new))
+            args.gain_now = new
         x1, x2 = record(args, freq_mhz, rate)
     return x1, x2
 
@@ -815,10 +846,15 @@ def carrier_memory():
         return {}
 
 
-def remember_carrier(earfcn, width, gain):
+def remember_carrier(earfcn, width, gain, gain2=None):
     import json
     mem = carrier_memory()
+    old = mem.get(str(earfcn), {})
     mem[str(earfcn)] = {"width": int(width), "gain": float(gain)}
+    if gain2 is not None:
+        mem[str(earfcn)]["gain2"] = float(gain2)
+    elif "gain2" in old:
+        mem[str(earfcn)]["gain2"] = old["gain2"]
     try:
         os.makedirs(os.path.dirname(MEMORY), exist_ok=True)
         with open(MEMORY, "w") as fh:
@@ -836,6 +872,7 @@ def decode_carrier(args, freq_mhz):
     t0 = time.time()
     rate = 15.36e6
     args.gain_now = args.gain
+    args.gain_now2 = args.gain
     known = carrier_memory().get(str(earfcn), {}) if not args.no_auto_gain else {}
     if known:
         # width and gain learned on an earlier run: record at the right rate and gain straight away
@@ -843,8 +880,10 @@ def decode_carrier(args, freq_mhz):
             rate = carrier_rate(known["width"])
         if known.get("gain") is not None:
             args.gain_now = float(known["gain"])
-        C.info("  from an earlier run: %s MHz wide, gain %g - recording at %.2f Msps" % (
-            BW_MHZ.get(known.get("width"), "?"), args.gain_now, rate / 1e6))
+            args.gain_now2 = float(known.get("gain2", known["gain"]))
+        C.info("  from an earlier run: %s MHz wide, gain %g%s - recording at %.2f Msps" % (
+            BW_MHZ.get(known.get("width"), "?"), args.gain_now,
+            (" (RX2 %g)" % args.gain_now2) if args.dual and args.gain_now2 != args.gain_now else "", rate / 1e6))
     x1, x2 = auto_gain(args, freq_mhz, rate, *record(args, freq_mhz, rate))
     rows = []
     if x1 is None:
@@ -894,7 +933,7 @@ def decode_carrier(args, freq_mhz):
         break
     widths = [r["mib"] for r in results if r.get("mib")]
     if widths and earfcn is not None:
-        remember_carrier(earfcn, max(widths), args.gain_now)
+        remember_carrier(earfcn, max(widths), args.gain_now, args.gain_now2 if args.dual else None)
     for r in results:
         r.update({"mhz": freq_mhz, "earfcn": earfcn, "band": band})
         rows.append(r)
