@@ -208,6 +208,7 @@ once (setup step 3).
 | `spectrum_check.py` | Antenna check: signal power per frequency, with and without the antennas |
 | `lte_track.py` | Tracks every LTE cell on one carrier and saves raw IQ |
 | `sigmf_join.py` | Joins the IQ recordings of a tracking run into one file (per sample rate) |
+| `iq_export.py` | Exports IQ recordings as decoder-ready files (centred, float32, one file per cell aligned to its subframe 0) with decode commands |
 | `lte_fastsync.py` | Faster LTE cell search (identical results) |
 | `pcap_out.py` | Writes decoded messages to pcap files (GSMTAP) for Wireshark |
 | `common.py` | Shared tables, colours and operator names |

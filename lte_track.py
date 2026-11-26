@@ -175,6 +175,8 @@ def sigmf_meta(args, rate, t_capture, cells_in_file):
             a.update({"lte:cell_id": x["cell_id"], "lte:enb": x["enb"], "lte:sector": x["sector"],
                       "lte:tac": x["tac"], "lte:mcc": x["mcc"], "lte:mnc": x["mnc"], "lte:operator": x["operator"],
                       "lte:width_mhz": width_mhz})
+        if cell.ports:
+            a["lte:ports"] = cell.ports
         annotations.append(a)
     annotations.sort(key=lambda a: a["core:sample_start"])
     chans = "RX1 and RX2, interleaved per sample (I1 Q1 I2 Q2)" if args.dual else "RX1"
