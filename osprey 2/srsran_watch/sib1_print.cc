@@ -32,6 +32,20 @@ extern "C" void srsran_sib1_print(const uint8_t* payload, uint32_t nbits)
     return;
   }
 
+  /* raw bytes of every system-information block that passed its CRC, for the pcap file */
+  {
+    char     hex[2 * 2048 + 1];
+    uint32_t nbytes = (nbits + 7) / 8;
+    if (nbytes > 2048) {
+      nbytes = 2048;
+    }
+    for (uint32_t i = 0; i < nbytes; i++) {
+      snprintf(hex + 2 * i, 3, "%02x", payload[i]);
+    }
+    fprintf(stderr, "\nBCCH-DL-SCH hex %s\n", hex);
+    fflush(stderr);
+  }
+
   asn1::rrc::bcch_dl_sch_msg_s msg;
   asn1::cbit_ref               bref(payload, (nbits + 7) / 8);
   if (msg.unpack(bref) != asn1::SRSASN_SUCCESS) {
@@ -79,4 +93,21 @@ extern "C" void srsran_sib1_print(const uint8_t* payload, uint32_t nbits)
     used += wrote;
   }
   save_line(line);
+}
+
+
+/* The decoded MIB: 24 bits, one bit per byte as srsRAN keeps it. Printed packed (3 bytes) for the pcap file. */
+extern "C" void srsran_mib_print(const uint8_t* bits)
+{
+  uint8_t packed[3] = {0, 0, 0};
+  if (bits == NULL) {
+    return;
+  }
+  for (int i = 0; i < 24; i++) {
+    if (bits[i]) {
+      packed[i / 8] |= (uint8_t)(0x80u >> (i % 8));
+    }
+  }
+  fprintf(stderr, "\nBCCH-BCH hex %02x%02x%02x\n", packed[0], packed[1], packed[2]);
+  fflush(stderr);
 }

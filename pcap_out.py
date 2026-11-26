@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Write decoded GSM and LTE messages to a .pcap file that Wireshark opens and decodes.
+
+Every message is stored the standard way for radio captures: a GSMTAP header (the format gr-gsm, srsRAN and
+osmocom use) inside UDP to port 4729, inside IPv4/Ethernet. Wireshark recognises port 4729 as GSMTAP and
+decodes the message underneath (GSM RR System Information, LTE RRC MIB / SIB1 / SIBs).
+
+  GSM: the messages gr-gsm decodes already carry a GSMTAP header - they are written as they are.
+  LTE: the MIB (BCCH-BCH) and system information blocks (BCCH-DL-SCH) srsRAN decodes are given a GSMTAP
+       header of type LTE RRC with the EARFCN and PCI.
+
+Open a file with:  wireshark ~/field/pcap/<file>.pcap   (or tshark -r <file> -V for text)
+"""
+import os
+import struct
+import threading
+import time
+
+GSMTAP_PORT = 4729
+GSMTAP_TYPE_LTE_RRC = 0x0d
+LTE_RRC_BCCH_BCH = 4           # MIB
+LTE_RRC_BCCH_DL_SCH = 5        # SIB1 and the other system information blocks
+
+
+def default_path(tool):
+    folder = os.path.expanduser("~/field/pcap")
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, "%s_%s.pcap" % (tool, time.strftime("%Y%m%d_%H%M%S")))
+
+
+class PcapWriter(object):
+    """Appends packets to a pcap file (Ethernet link type). Safe to call from several threads."""
+
+    def __init__(self, path):
+        self.path = os.path.expanduser(path)
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        self.fh = open(self.path, "wb")
+        # pcap global header: magic, version 2.4, timezone 0, accuracy 0, snap length, link type 1 (Ethernet)
+        self.fh.write(struct.pack("<IHHiIII", 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1))
+        self.fh.flush()
+        self.count = 0
+        self.lock = threading.Lock()
+
+    def _packet(self, gsmtap, ts=None):
+        ts = time.time() if ts is None else ts
+        udp = struct.pack(">HHHH", GSMTAP_PORT, GSMTAP_PORT, 8 + len(gsmtap), 0) + gsmtap
+        ip = struct.pack(">BBHHHBBH4s4s", 0x45, 0, 20 + len(udp), 0, 0x4000, 64, 17, 0,
+                         bytes([127, 0, 0, 1]), bytes([127, 0, 0, 1]))
+        ip = ip[:10] + struct.pack(">H", _ip_checksum(ip)) + ip[12:]
+        frame = b"\x00" * 12 + b"\x08\x00" + ip + udp
+        sec = int(ts)
+        with self.lock:
+            self.fh.write(struct.pack("<IIII", sec, int((ts - sec) * 1e6), len(frame), len(frame)) + frame)
+            self.fh.flush()
+            self.count += 1
+
+    def gsm(self, blob, antenna=0, ts=None):
+        """A gr-gsm message (GSMTAP header + GSM frame). antenna: 0 = RX1, 1 = RX2."""
+        if not blob or len(blob) < 16:
+            return
+        blob = bytearray(blob)
+        if antenna:
+            blob[13] = antenna & 0xff                   # GSMTAP antenna number
+        self._packet(bytes(blob), ts)
+
+    def lte_rrc(self, subtype, payload, earfcn=0, pci=0, ts=None):
+        """An LTE RRC message: subtype LTE_RRC_BCCH_BCH (MIB) or LTE_RRC_BCCH_DL_SCH (SIBs)."""
+        if not payload:
+            return
+        # GSMTAP v2 header (16 bytes): version, header length in 32-bit words, type, timeslot, ARFCN,
+        # signal dBm, SNR dB, frame number, sub type, antenna, sub slot, reserved. The PCI is put in the
+        # frame number field so it is visible in Wireshark's GSMTAP details.
+        hdr = struct.pack(">BBBBHbbIBBBB", 2, 4, GSMTAP_TYPE_LTE_RRC, 0, int(earfcn or 0) & 0x3fff, 0, 0,
+                          int(pci or 0), subtype, 0, 0, 0)
+        self._packet(hdr + bytes(payload), ts)
+
+    def close(self):
+        try:
+            self.fh.close()
+        except OSError:
+            pass
+
+
+def add_args(ap):
+    ap.add_argument("--pcap", default=None, metavar="FILE",
+                    help="pcap file for the decoded messages (default ~/field/pcap/<tool>_<time>.pcap)")
+    ap.add_argument("--no-pcap", action="store_true", help="do not write a pcap file")
+
+
+def open_from_args(args, tool):
+    """PcapWriter for the tool's --pcap / --no-pcap options, or None."""
+    if getattr(args, "no_pcap", False):
+        return None
+    return PcapWriter(args.pcap or default_path(tool))
+
+
+def report(writer):
+    if writer is not None:
+        import common as C
+        writer.close()
+        C.info("%d decoded message(s) saved to %s (open with Wireshark)" % (writer.count, writer.path))
+
+
+def _ip_checksum(header):
+    total = sum(struct.unpack(">10H", header))
+    while total >> 16:
+        total = (total & 0xffff) + (total >> 16)
+    return (~total) & 0xffff
+
+
+if __name__ == "__main__":
+    # self-check: a file with one LTE MIB and one GSM-looking packet
+    w = PcapWriter("/tmp/pcap_out_selftest.pcap")
+    w.lte_rrc(LTE_RRC_BCCH_BCH, bytes.fromhex("a8f080"), earfcn=6300, pci=430)
+    w.close()
+    print("wrote %d packet(s) to %s" % (w.count, w.path))

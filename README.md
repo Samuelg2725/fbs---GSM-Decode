@@ -6,7 +6,8 @@ Finds the mobile-network cells around you and decodes their identity:
 - **LTE (4G):** carrier, PCI, operator, TAC, eNB, sector and Cell ID — every cell the radio can hear on each
   carrier, not only the strongest.
 
-Results are printed as colour-coded tables, and saved to CSV files in `~/field/`.
+Results are printed as colour-coded tables, and saved to CSV files in `~/field/`. Every decoded message is also
+saved to a **pcap file** in `~/field/pcap/` that opens in Wireshark (see "pcap files" below).
 
 ---
 
@@ -125,6 +126,26 @@ UK carriers seen during testing (EARFCN → MHz): 6175 → 793.5, 6225 → 798.5
 
 ---
 
+## pcap files
+
+Every tool writes the messages it decodes to `~/field/pcap/<tool>_<date>_<time>.pcap` (`--pcap FILE` to choose
+the name, `--no-pcap` to turn it off). Messages are stored as GSMTAP (UDP port 4729), which Wireshark decodes:
+
+- **GSM:** every message gr-gsm decodes - System Information 1-4, 2bis/2ter/2quater, paging and other BCCH/CCCH
+  messages. With two antennas the GSMTAP antenna field says which receiver decoded it (0 = RX1, 1 = RX2).
+- **LTE:** the MIB (LTE RRC BCCH-BCH) and SIB1 (BCCH-DL-SCH) of every decoded cell, with the EARFCN in the
+  GSMTAP ARFCN field and the PCI in the frame-number field.
+
+```bash
+wireshark ~/field/pcap/lte_20261126_103300.pcap
+tshark -r ~/field/pcap/gsm_scan_20261126_103300.pcap -V | less
+```
+
+The LTE bytes come from the srsRAN patch: after updating the repository, re-run the patch and rebuild srsRAN
+once (setup step 3).
+
+---
+
 ## Example output
 
 ```
@@ -153,6 +174,11 @@ UK carriers seen during testing (EARFCN → MHz): 6175 → 793.5, 6225 → 798.5
    python3 ~/fbs-upload/"osprey 2"/srsran_watch/print_sib1.py
    mkdir -p ~/srsRAN_4G/build && cd ~/srsRAN_4G/build && cmake .. && make -j3 pdsch_ue
    ```
+   The patch makes srsRAN print the decoded cell identity and the raw MIB / SIB bytes (for the pcap files).
+   Re-run the last two commands whenever `sib1_print.cc` changes:
+   ```bash
+   python3 ~/fbs-upload/"osprey 2"/srsran_watch/print_sib1.py && cd ~/srsRAN_4G/build && make -j3 pdsch_ue
+   ```
 4. Optional check that the fast LTE search gives the same answers as the original code:
    `python3 lte_fastsync.py` (ends with `OK`).
 
@@ -170,6 +196,7 @@ UK carriers seen during testing (EARFCN → MHz): 6175 → 793.5, 6225 → 798.5
 | `spectrum_check.py` | Antenna check: signal power per frequency, with and without the antennas |
 | `lte_track.py` | Tracks every LTE cell on one carrier and saves raw IQ |
 | `lte_fastsync.py` | Faster LTE cell search (identical results) |
+| `pcap_out.py` | Writes decoded messages to pcap files (GSMTAP) for Wireshark |
 | `common.py` | Shared tables, colours and operator names |
 | `osprey 2/` | LTE signal-processing library and the srsRAN patch |
 | `NOTES.md` | Technical notes and test findings |

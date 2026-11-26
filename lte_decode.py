@@ -41,6 +41,7 @@ else:
 
 import common as C                                   # noqa: E402
 import lte_fastsync                                  # noqa: E402
+import pcap_out                                      # noqa: E402
 from lte_pci_search import search_samples            # noqa: E402
 
 BLADE_LIBS = "/usr/local/lib"
@@ -53,6 +54,9 @@ SIB1_RE = re.compile(
     r"SIB1 cell identity (\d+)\s+eNB (\d+)\s+sector (\d+)\s+TAC (\d+)((?:[ \t]+PLMN \d+-\d+)*)[ \t]*\r?\n")
 MIB_PRB_RE = re.compile(r"PRB:\s+(\d+)")
 LAST_PEAK = [0.0]
+PCAP = [None]            # pcap_out.PcapWriter for the decoded MIB / SIB messages, or None
+BCH_HEX_RE = re.compile(r"BCCH-BCH hex ([0-9a-f]{6})")
+DLSCH_HEX_RE = re.compile(r"BCCH-DL-SCH hex ([0-9a-f]+)")
 PPM = []                 # frequency error of the radio (offset / carrier) measured on decoded cells
 UK_BANDS = (20, 8, 3, 1, 7, 28, 32, 38, 40)
 
@@ -554,6 +558,7 @@ def decode_cell(samples, rate, hit, args, freq_mhz, aligned=None):
             order.remove(hit["width"])
             order.insert(0, hit["width"])
         ports = hit.get("ports") or 2
+        pdus = {}                                # decoded MIB / SIB bytes, in order, for the pcap file
 
         def srsran(n_prb, ports):
             C.status("  PCI %d: srsRAN decoding (%s MHz, %d transmit antenna%s)..." % (
@@ -572,6 +577,10 @@ def decode_cell(samples, rate, hit, args, freq_mhz, aligned=None):
             else:
                 text = run_pdsch(path, pci, n_prb, n_sf, args.srsran_timeout, ports)
             C.clear_status()
+            for h in BCH_HEX_RE.findall(text):
+                pdus.setdefault(("bch", h), None)
+            for h in DLSCH_HEX_RE.findall(text):
+                pdus.setdefault(("dlsch", h), None)
             if args.srsran_log:
                 d = os.path.expanduser(args.srsran_log)
                 os.makedirs(d, exist_ok=True)
@@ -620,6 +629,10 @@ def decode_cell(samples, rate, hit, args, freq_mhz, aligned=None):
     finally:
         path.unlink(missing_ok=True)
     out["ports"] = ports if (out["mib"] or out["mib_odd"]) else None
+    if PCAP[0] is not None:
+        for kind, h in pdus:
+            PCAP[0].lte_rrc(pcap_out.LTE_RRC_BCCH_BCH if kind == "bch" else pcap_out.LTE_RRC_BCCH_DL_SCH,
+                            bytes.fromhex(h), earfcn=getattr(args, "_earfcn_now", 0), pci=pci)
     if out["ident"]:
         out["status"] = "decoded"
     elif out["mib"]:
@@ -712,6 +725,7 @@ def decode_carrier(args, freq_mhz):
     """Everything for one carrier. Returns a list of result rows (decoded and not decoded)."""
     earfcn, band = mhz_to_earfcn(freq_mhz)
     args._targets_now = list(getattr(args, "targets", {}).get(earfcn, []))
+    args._earfcn_now = earfcn or 0
     C.heading("%.1f MHz   EARFCN %s   band %s" % (freq_mhz, earfcn if earfcn is not None else "?", band or "?"))
     t0 = time.time()
     rate = 15.36e6
@@ -988,6 +1002,7 @@ def main():
     ap.add_argument("--debug-search", action="store_true", help="print every weak-search peak and its result")
     ap.add_argument("--csv", default="~/field/lte_cells.csv",
                     help="CSV file results are added to (default ~/field/lte_cells.csv, '' = none)")
+    pcap_out.add_args(ap)
     ap.add_argument("--no-color", action="store_true", help="plain text output")
     args = ap.parse_args()
     if args.no_color:
@@ -1011,6 +1026,7 @@ def main():
         if f is None:
             sys.exit("EARFCN %d is not an LTE downlink channel" % e)
         freqs.append(f)
+    PCAP[0] = pcap_out.open_from_args(args, "lte")
     C.stop_on_first_ctrl_c()
     t_all, rows, passes, finished = time.time(), [], 0, 0
     try:
@@ -1050,6 +1066,7 @@ def main():
     summary(rows_best, t_all)
     if args.targets:
         phone_check(args, rows_best, max(1, finished) if args.loop else None)
+    pcap_out.report(PCAP[0])
     return 0
 
 

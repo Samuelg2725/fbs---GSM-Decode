@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Make stock pdsch_ue print the 28-bit cell identity from a passing SIB1 block.
+"""Make stock pdsch_ue print the 28-bit cell identity from a passing SIB1 block, and the raw bytes of the
+MIB and of every system-information block (used for the pcap files).
 
 This file is not a decoder. It copies sib1_print.cc into the srsRAN examples
 directory and adds one call in lib/examples/pdsch_ue.c. srsRAN still does the
@@ -11,7 +12,7 @@ from pathlib import Path
 import shutil
 import sys
 
-EXAMPLES = Path("/home/revector/srsRAN_4G/lib/examples")
+EXAMPLES = Path(sys.argv[1] if len(sys.argv) > 1 else "~/srsRAN_4G/lib/examples").expanduser()
 SOURCE = Path(__file__).resolve().parent / "sib1_print.cc"
 
 CALL = """nof_detected++;
@@ -24,6 +25,9 @@ CALL = """nof_detected++;
         }"""
 
 PROTO = "void srsran_sib1_print(const uint8_t* payload, uint32_t nbits);\n"
+MIB_PROTO = "void srsran_mib_print(const uint8_t* bits);\n"
+MIB_ANCHOR = "srsran_pbch_mib_unpack(bch_payload, &cell, &sfn);"
+MIB_CALL = MIB_ANCHOR + "\n              srsran_mib_print(bch_payload);"
 
 
 def main():
@@ -48,6 +52,17 @@ def main():
         print("patched %s" % pdsch)
     else:
         print("pdsch_ue.c already prints SIB1")
+    # second hook: the raw MIB, for the pcap file
+    if "srsran_mib_print" not in text:
+        if MIB_ANCHOR not in text:
+            sys.exit("pdsch_ue.c has no MIB decode point to hook")
+        text = text.replace(MIB_ANCHOR, MIB_CALL, 1)
+        main_at = text.find("int main(")
+        text = text[:main_at] + MIB_PROTO + "\n" + text[main_at:]
+        pdsch.write_text(text)
+        print("patched %s (MIB bytes)" % pdsch)
+    else:
+        print("pdsch_ue.c already prints the MIB bytes")
 
     cmake = EXAMPLES / "CMakeLists.txt"
     cmake_text = cmake.read_text()

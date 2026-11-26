@@ -20,6 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import common as C                     # noqa: E402
 import gsm_arfcn_fast as G             # noqa: E402
+import pcap_out                        # noqa: E402
 import gsm_freqlist as FL              # noqa: E402
 
 
@@ -85,9 +86,11 @@ def main():
     ap.add_argument("--sync-secs", type=float, default=1.2, help="leave a channel without GSM sync after this")
     ap.add_argument("--retry-dwell", type=float, default=8.0,
                     help="listed channels that showed GSM signal but no cell ID get one more try this long (0 = off)")
+    pcap_out.add_args(ap)
     ap.add_argument("--no-color", action="store_true", help="plain text output")
     args = ap.parse_args()
     args.agc, args.bw = False, None
+    G.PCAP[0] = pcap_out.open_from_args(args, "gsm_neigh")
     if args.no_color:
         C.set_colour(False)
     C.stop_on_first_ctrl_c()
@@ -154,6 +157,7 @@ def main():
     missing = sorted(x for x in listed_by if x not in cells)
     if missing:
         C.info("Listed as neighbours but no cell decoded here: %s" % ranges(missing))
+    pcap_out.report(G.PCAP[0])
     return 0
 
 

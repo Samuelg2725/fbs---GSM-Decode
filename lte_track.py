@@ -46,6 +46,7 @@ sys.path.insert(0, HERE)
 import common as C                                   # noqa: E402
 import lte_decode as L                               # noqa: E402  (also sets up the "osprey 2" library path)
 import lte_fastsync                                  # noqa: E402
+import pcap_out                                      # noqa: E402
 
 
 # ------------------------------------------------------------------------------------------- cells
@@ -635,6 +636,7 @@ def main():
     ap.add_argument("--label", default="-", help="name for this run in the summary CSV")
     ap.add_argument("--csv", default="~/field/lte_track_summary.csv", help="summary CSV ('' = none)")
     ap.add_argument("--log", default="~/field/lte_track_log.csv", help="per-cycle CSV ('' = none)")
+    pcap_out.add_args(ap)
     ap.add_argument("--no-color", action="store_true", help="plain text output")
     args = ap.parse_args()
     args._sector_tried = {}
@@ -662,8 +664,11 @@ def main():
         except Exception as e:
             C.warn("could not keep the radio open (%s) - using bladeRF-cli" % e)
     L.KEEP_RAW[0] = True                         # raw samples are needed for the IQ files
+    args._earfcn_now = args.earfcn_now or 0
+    L.PCAP[0] = pcap_out.open_from_args(args, "lte_track")
     C.stop_on_first_ctrl_c()
     track(args)
+    pcap_out.report(L.PCAP[0])
     return 0
 
 

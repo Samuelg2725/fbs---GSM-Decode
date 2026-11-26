@@ -26,6 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import common as C                     # noqa: E402
 import gsm_arfcn_fast as G             # noqa: E402
+import pcap_out                        # noqa: E402
 from gnuradio import blocks, gr, gsm   # noqa: E402
 
 SAMPLE_RATE = 2e6
@@ -158,7 +159,10 @@ def track(args, arfcn):
                     msg = tb.dbg[ch].get_message(seen[ch])
                     seen[ch] += 1
                     last_msg = time.time()
-                    cell = G.si3_cell(G.blob_of(msg), arfcn, freq)
+                    blob = G.blob_of(msg)
+                    if G.PCAP[0] is not None:
+                        G.PCAP[0].gsm(blob, antenna=ch)
+                    cell = G.si3_cell(blob, arfcn, freq)
                     if not cell:
                         continue
                     t = time.time()
@@ -259,7 +263,10 @@ def scan(args, channels):
                     except Exception:
                         continue
                     while seen[ch] < n:
-                        x = G.si3_cell(G.blob_of(tb.dbg[ch].get_message(seen[ch])), arfcn, freq)
+                        blob = G.blob_of(tb.dbg[ch].get_message(seen[ch]))
+                        if G.PCAP[0] is not None:
+                            G.PCAP[0].gsm(blob, antenna=ch)
+                        x = G.si3_cell(blob, arfcn, freq)
                         seen[ch] += 1
                         if x:
                             got.add(ch)
@@ -318,6 +325,7 @@ def main():
     ap.add_argument("--label", default=None, help="track: name for this run in the summary CSV")
     ap.add_argument("--summary-csv", default="~/field/dual_summary.csv",
                     help="track: CSV file the summary row is added to (default ~/field/dual_summary.csv)")
+    pcap_out.add_args(ap)
     ap.add_argument("--no-color", action="store_true", help="plain text output")
     args = ap.parse_args()
     args.bw = max(200e3, float(args.bw))
@@ -325,11 +333,15 @@ def main():
         C.set_colour(False)
     C.stop_on_first_ctrl_c()
     G.stop_other_scanners()
-    if args.band:
-        return scan(args, G.BANDS[args.band])
-    if len(args.arfcn) == 1:
-        return track(args, args.arfcn[0])
-    return scan(args, args.arfcn)
+    G.PCAP[0] = pcap_out.open_from_args(args, "gsm_dual")
+    try:
+        if args.band:
+            return scan(args, G.BANDS[args.band])
+        if len(args.arfcn) == 1:
+            return track(args, args.arfcn[0])
+        return scan(args, args.arfcn)
+    finally:
+        pcap_out.report(G.PCAP[0])
 
 
 if __name__ == "__main__":

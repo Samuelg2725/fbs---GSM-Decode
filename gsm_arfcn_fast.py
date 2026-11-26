@@ -23,6 +23,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import common as C                     # noqa: E402
+import pcap_out                        # noqa: E402
 import pmt                             # noqa: E402
 from gnuradio import blocks, gr, gsm   # noqa: E402
 import osmosdr                         # noqa: E402
@@ -243,12 +244,18 @@ def downlink(arfcn):
     return freq if freq and freq > 100e6 else None
 
 
+PCAP = [None]            # pcap_out.PcapWriter for every decoded message, or None
+
+
 def new_messages(rx, seen):
     try:
         n = rx.dbg.num_messages()
     except Exception:
         return seen, []
     out = [rx.dbg.get_message(i) for i in range(seen, n)]
+    if PCAP[0] is not None:
+        for m in out:
+            PCAP[0].gsm(blob_of(m))
     return n, out
 
 
@@ -495,6 +502,7 @@ def main():
                     help="track: CSV file the summary row is added to (default ~/field/track_summary.csv)")
     ap.add_argument("--stats-every", type=float, default=60.0,
                     help="track: print a statistics line every N s (default 60, 0 = off)")
+    pcap_out.add_args(ap)
     ap.add_argument("--no-color", action="store_true", help="plain text output")
     args = ap.parse_args()
     if args.no_color:
@@ -503,11 +511,15 @@ def main():
     stopped = stop_other_scanners()
     if stopped:
         C.warn("stopped another scanner that was using the radio (pid %s)" % " ".join(map(str, stopped)))
-    if args.band:
-        return scan(args, BANDS[args.band])
-    if len(args.arfcn) == 1:
-        return track(args, args.arfcn[0])
-    return scan(args, args.arfcn)
+    PCAP[0] = pcap_out.open_from_args(args, "gsm_scan" if (args.band or len(args.arfcn) > 1) else "gsm_track")
+    try:
+        if args.band:
+            return scan(args, BANDS[args.band])
+        if len(args.arfcn) == 1:
+            return track(args, args.arfcn[0])
+        return scan(args, args.arfcn)
+    finally:
+        pcap_out.report(PCAP[0])
 
 
 if __name__ == "__main__":
