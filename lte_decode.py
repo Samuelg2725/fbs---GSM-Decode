@@ -53,6 +53,54 @@ NATIVE_RATE = {6: 1.92e6, 15: 3.84e6, 25: 7.68e6, 50: 15.36e6, 75: 23.04e6, 100:
 SIB1_RE = re.compile(
     r"SIB1 cell identity (\d+)\s+eNB (\d+)\s+sector (\d+)\s+TAC (\d+)((?:[ \t]+PLMN \d+-\d+)*)[ \t]*\r?\n")
 MIB_PRB_RE = re.compile(r"PRB:\s+(\d+)")
+# measurements srsRAN prints every frame once it has the MIB
+DIAG_RE = {"snr": re.compile(r"SNR:\s*([+-]?\d+(?:\.\d+)?) dB"),
+           "cfo": re.compile(r"CFO:\s*([+-]?\d+(?:\.\d+)?) Hz"),
+           "pdcch_miss": re.compile(r"PDCCH-Miss:\s*(\d+(?:\.\d+)?)%"),
+           "bler": re.compile(r"PDSCH-BLER:\s*(\d+(?:\.\d+)?)%")}
+
+
+def diagnosis(text):
+    """srsRAN's last reported SNR (dB), frequency error (Hz), control-channel miss rate and SIB1 error rate
+    (%) from one run, or {} when it printed none (no MIB)."""
+    out = {}
+    for key, rx in DIAG_RE.items():
+        vals = rx.findall(text)
+        if vals:
+            out[key] = float(vals[-1])
+    return out
+
+
+def why_not(r):
+    """Plain-language reason a cell was not decoded."""
+    st, d = r.get("status", ""), r.get("diag") or {}
+    if st in ("not found", "frame timing not found"):
+        return "its sync signal was too weak to find in this recording"
+    if st == "MIB not decoded":
+        return "timing found but even the MIB failed - very weak, or covered by a stronger cell"
+    if "MIB only" not in st:
+        return ""
+    parts = []
+    if "snr" in d:
+        parts.append("SNR %+.1f dB" % d["snr"])
+    if "pdcch_miss" in d:
+        parts.append("control channel missed %.0f%%" % d["pdcch_miss"])
+    if "bler" in d:
+        parts.append("SIB1 data errors %.0f%%" % d["bler"])
+    if "cfo" in d and abs(d["cfo"]) > 1000:
+        parts.append("frequency error %.0f Hz" % d["cfo"])
+    if not d:
+        return "MIB read, srsRAN gave no measurements"
+    snr = d.get("snr")
+    if snr is not None and snr < 3:
+        head = "too weak for SIB1"
+    elif d.get("pdcch_miss", 0) >= 90:
+        head = "SIB1's control message not found"
+    elif d.get("bler", 0) >= 90:
+        head = "SIB1 found but its data failed"
+    else:
+        head = "SIB1 not decoded in this recording"
+    return head + " (" + ", ".join(parts) + ")"
 LAST_PEAK = [0.0]
 PCAP = [None]            # pcap_out.PcapWriter for the decoded MIB / SIB messages, or None
 BCH_HEX_RE = re.compile(r"BCCH-BCH hex ([0-9a-f]{6})")
@@ -493,11 +541,11 @@ def clean_leftovers():
                % (n, freed / 1e6))
 
 
-def run_pdsch(path, pci, n_prb, n_sf, timeout, ports=2):
+def run_pdsch(path, pci, n_prb, n_sf, timeout, ports=2, extra=()):
     """srsRAN pdsch_ue on an aligned capture file; stopped as soon as it prints the SIB1 identity line.
     ports: the cell's number of transmit antennas (1, 2 or 4) - in file mode srsRAN only tries this one."""
     cmd = [str(pdsch_ue()), "-d", "-i", str(path), "-p", str(n_prb), "-c", str(pci), "-P", str(ports), "-Q",
-           "-n", str(n_sf)]
+           "-n", str(n_sf)] + list(extra)
     if shutil.which("stdbuf"):
         cmd = ["stdbuf", "-oL", "-eL"] + cmd
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, preexec_fn=_srsran_child)
@@ -559,10 +607,12 @@ def decode_cell(samples, rate, hit, args, freq_mhz, aligned=None):
             order.insert(0, hit["width"])
         ports = hit.get("ports") or 2
         pdus = {}                                # decoded MIB / SIB bytes, in order, for the pcap file
+        diag = {}                                # srsRAN's measurements of the cell
 
-        def srsran(n_prb, ports):
-            C.status("  PCI %d: srsRAN decoding (%s MHz, %d transmit antenna%s)..." % (
-                pci, BW_MHZ.get(n_prb, "?"), ports, "" if ports == 1 else "s"))
+        def srsran(n_prb, ports, extra=()):
+            C.status("  PCI %d: srsRAN decoding (%s MHz, %d transmit antenna%s%s)..." % (
+                pci, BW_MHZ.get(n_prb, "?"), ports, "" if ports == 1 else "s",
+                ", averaged channel estimate" if extra else ""))
             # srsRAN reads a file at the standard rate for the width it is told (5 MHz = 7.68 Msps, ...): give
             # a narrower cell a recording reduced to its own rate
             k = rate / NATIVE_RATE[n_prb]
@@ -571,12 +621,13 @@ def decode_cell(samples, rate, hit, args, freq_mhz, aligned=None):
                 small = path.with_name(path.stem + "_%d.cf32" % n_prb)
                 resample_poly(aligned, 1, int(round(k))).astype(np.complex64).tofile(small)
                 try:
-                    text = run_pdsch(small, pci, n_prb, n_sf, args.srsran_timeout, ports)
+                    text = run_pdsch(small, pci, n_prb, n_sf, args.srsran_timeout, ports, extra)
                 finally:
                     small.unlink(missing_ok=True)
             else:
-                text = run_pdsch(path, pci, n_prb, n_sf, args.srsran_timeout, ports)
+                text = run_pdsch(path, pci, n_prb, n_sf, args.srsran_timeout, ports, extra)
             C.clear_status()
+            diag.update(diagnosis(text))
             for h in BCH_HEX_RE.findall(text):
                 pdus.setdefault(("bch", h), None)
             for h in DLSCH_HEX_RE.findall(text):
@@ -614,21 +665,22 @@ def decode_cell(samples, rate, hit, args, freq_mhz, aligned=None):
                     out["mib"] = vals[-1]
                 else:
                     out["mib_odd"] = True            # MIB decoded but its width was not understood
-            s1 = SIB1_RE.search(text)
-            if s1:
-                plmns = re.findall(r"PLMN (\d+)-(\d+)", s1.group(5) or "")
-                mcc, mnc = (int(plmns[0][0]), plmns[0][1]) if plmns else (None, "?")
-                out["ident"] = {"cell_id": int(s1.group(1)), "enb": int(s1.group(2)), "sector": int(s1.group(3)),
-                                "tac": int(s1.group(4)), "mcc": mcc, "mnc": mnc,
-                                "operator": C.operator(mcc, mnc) if mcc else ""}
+            if parse_ident(text, out):
                 if out["mib"] is None:
                     out["mib"] = own
                 break
             if out["mib"] is not None and (out["mib"] == n_prb or needed_rate(out["mib"]) > rate):
                 break                                # right width tried, or the cell needs a wider capture
+        if not out["ident"] and out["mib"] and NATIVE_RATE[out["mib"]] <= rate * 1.01:
+            # MIB read but not SIB1: one more go with an averaged channel estimate - less noisy than the default
+            # (which follows fast changes), which helps a weak cell that is not moving
+            text = srsran(out["mib"], ports, ("-R", "average"))
+            if parse_ident(text, out):
+                out["note"] = "averaged channel estimate"
     finally:
         path.unlink(missing_ok=True)
     out["ports"] = ports if (out["mib"] or out["mib_odd"]) else None
+    out["diag"] = diag
     if PCAP[0] is not None:
         for kind, h in pdus:
             PCAP[0].lte_rrc(pcap_out.LTE_RRC_BCCH_BCH if kind == "bch" else pcap_out.LTE_RRC_BCCH_DL_SCH,
@@ -637,11 +689,25 @@ def decode_cell(samples, rate, hit, args, freq_mhz, aligned=None):
         out["status"] = "decoded"
     elif out["mib"]:
         out["status"] = "MIB only (%s MHz), no SIB1" % BW_MHZ.get(out["mib"], "?")
+        if diag.get("snr") is not None:
+            out["status"] += ", SNR %+.1f dB" % diag["snr"]
     elif out["mib_odd"]:
         out["status"] = "MIB only, width unclear"
     else:
         out["status"] = "MIB not decoded"
     return out
+
+
+def parse_ident(text, out):
+    """Fill out["ident"] from srsRAN's SIB1 line, if there is one. Returns True when found."""
+    s1 = SIB1_RE.search(text)
+    if not s1:
+        return False
+    plmns = re.findall(r"PLMN (\d+)-(\d+)", s1.group(5) or "")
+    mcc, mnc = (int(plmns[0][0]), plmns[0][1]) if plmns else (None, "?")
+    out["ident"] = {"cell_id": int(s1.group(1)), "enb": int(s1.group(2)), "sector": int(s1.group(3)),
+                    "tac": int(s1.group(4)), "mcc": mcc, "mnc": mnc, "operator": C.operator(mcc, mnc) if mcc else ""}
+    return True
 
 
 def cell_weights(x1, x2, rate, pci, cfo_hz):
@@ -822,7 +888,10 @@ def _decode_capture(args, freq_mhz, rate, x1, x2):
                 x["operator"] or "?", x["mcc"], x["mnc"])
         else:
             line = "  PCI %-3d %s" % (r["pci"], C.c(r["status"], "yellow" if "MIB only" in r["status"] else "red"))
-        print(line + C.c("   [%s%s]" % (r["how"], ", " + r["rx"] if r.get("rx") else ""), "grey"), flush=True)
+        note = ", " + r["note"] if r.get("note") else ""
+        print(line + C.c("   [%s%s%s]" % (r["how"], note, ", " + r["rx"] if r.get("rx") else ""), "grey"), flush=True)
+        if not r["ident"] and why_not(r):
+            print(C.c("          why: " + why_not(r), "grey"), flush=True)
 
     tried |= set(getattr(args, "_done_pcis", ()))     # decoded from an earlier recording of this carrier
     for h in hits:
@@ -914,10 +983,11 @@ def summary(rows, t_all):
     t.show("LTE cells decoded: %d   (%.0f s)" % (len(ok), time.time() - t_all))
     bad = [r for r in rows if not r.get("ident")]
     if bad:
-        f = C.Table(["MHz", "EARFCN", "PCI", "Result"], align={"MHz": "right", "EARFCN": "right", "PCI": "right"})
+        f = C.Table(["MHz", "EARFCN", "PCI", "Result", "Why"],
+                    align={"MHz": "right", "EARFCN": "right", "PCI": "right"})
         for r in bad:
             f.add(["%.1f" % r["mhz"], r["earfcn"] or "?", r["pci"] if r.get("pci") is not None else "-",
-                   (r["status"], "yellow" if "MIB only" in r["status"] else "red")])
+                   (r["status"], "yellow" if "MIB only" in r["status"] else "red"), why_not(r) or "-"])
         f.show("Not decoded")
 
 
