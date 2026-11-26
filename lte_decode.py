@@ -614,6 +614,26 @@ def run_pdsch(path, pci, n_prb, n_sf, timeout, ports=2, extra=()):
 
 
 def decode_cell(samples, rate, hit, args, freq_mhz, aligned=None):
+    """MIB + SIB1 of one PCI with srsRAN (see _decode_cell_once). When the MIB does not decode, the frame start
+    5 ms away is tried too: subframes 0 and 5 carry the same sync signal, and a stronger cell with the same PSS
+    (PCI mod 3) can make the SSS pick the wrong half of the frame."""
+    r = _decode_cell_once(samples, rate, hit, args, freq_mhz, aligned)
+    if (r["ident"] or r["mib"] or r["mib_odd"] or samples is None or hit.get("_half")
+            or r.get("start") is None or r.get("status") == "frame timing not found"):
+        return r
+    half, frame = int(round(rate * 0.005)), int(round(rate * 0.01))
+    alt = r["start"] + half if r["start"] + half + frame <= len(samples) else r["start"] - half
+    if alt < 0:
+        return r
+    shifted = derotate(samples, float(hit.get("offset_hz") or 0.0), rate)[alt:]
+    r2 = _decode_cell_once(samples, rate, dict(hit, _half=True), args, freq_mhz, aligned=shifted)
+    if r2["ident"] or r2["mib"] or r2["mib_odd"]:
+        r2["start"] = alt
+        return r2
+    return r
+
+
+def _decode_cell_once(samples, rate, hit, args, freq_mhz, aligned=None):
     """MIB + SIB1 of one PCI with srsRAN. Returns a result dict; 'ident' is set when the identity decoded."""
     pci = int(hit["pci"])
     out = {"pci": pci, "strength": hit.get("pss_ratio", 0.0), "offset": float(hit.get("offset_hz") or 0.0),
@@ -627,7 +647,7 @@ def decode_cell(samples, rate, hit, args, freq_mhz, aligned=None):
             # subframe 0 / 5 not distinguishable: try both positions, the MIB's CRC picks the right one
             r = None
             for cand in cands:
-                r = decode_cell(samples, rate, hit, args, freq_mhz, aligned=cand)
+                r = decode_cell(samples, rate, dict(hit, _half=True), args, freq_mhz, aligned=cand)
                 if r["ident"] or r["mib"] or r["mib_odd"]:
                     return r
             return r
