@@ -868,10 +868,10 @@ def summary(rows, t_all):
         f.show("Not decoded")
 
 
-def phone_check(args, rows):
+def phone_check(args, rows, passes=None):
     """Table of the cells given with --cells: decoded, found but not decoded, or not found."""
-    t = C.Table(["EARFCN", "PCI", "Result", "Operator", "Cell ID", "How"],
-                align={"EARFCN": "right", "PCI": "right", "Cell ID": "right"})
+    cols = ["EARFCN", "PCI", "Result", "Operator", "Cell ID", "How"] + (["Decoded in"] if passes else [])
+    t = C.Table(cols, align={"EARFCN": "right", "PCI": "right", "Cell ID": "right", "Decoded in": "right"})
     ok = total = 0
     for earfcn in args.targets:
         for pci in args.targets[earfcn]:
@@ -881,12 +881,15 @@ def phone_check(args, rows):
             if r and r.get("ident"):
                 ok += 1
                 x = r["ident"]
-                t.add([earfcn, pci, ("decoded", "green"), C.op_cell(x["operator"]),
-                       (x["cell_id"], "green+bold"), r["how"]])
+                row = [earfcn, pci, ("decoded", "green"), C.op_cell(x["operator"]),
+                       (x["cell_id"], "green+bold"), r["how"]]
             elif r:
-                t.add([earfcn, pci, (r["status"], "yellow" if "MIB" in r["status"] else "red"), "-", "-", r["how"]])
+                row = [earfcn, pci, (r["status"], "yellow" if "MIB" in r["status"] else "red"), "-", "-", r["how"]]
             else:
-                t.add([earfcn, pci, ("not tried", "red"), "-", "-", "-"])
+                row = [earfcn, pci, ("not tried", "red"), "-", "-", "-"]
+            if passes:
+                row.append("%d of %d passes" % ((r or {}).get("decoded_passes", 0), passes))
+            t.add(row)
     t.show("Cell list check: %d of %d decoded" % (ok, total))
 
 
@@ -934,6 +937,9 @@ def main():
                     help="do not try the other sectors of each decoded mast")
     ap.add_argument("--show-failed-siblings", action="store_true",
                     help="also list sector tries that did not decode")
+    ap.add_argument("--loop", action="store_true",
+                    help="repeat until Ctrl-C (each pass records and decodes again); the table counts the passes "
+                         "each cell decoded in")
     ap.add_argument("--only", action="store_true",
                     help="with --cells: decode only the listed PCIs (other cells found are not decoded)")
     ap.add_argument("--retries", type=int, default=2,
@@ -967,20 +973,44 @@ def main():
             sys.exit("EARFCN %d is not an LTE downlink channel" % e)
         freqs.append(f)
     C.stop_on_first_ctrl_c()
-    t_all, rows = time.time(), []
+    t_all, rows, passes, finished = time.time(), [], 0, 0
     try:
-        for f in freqs:
-            rows += decode_carrier(args, f)
+        while True:
+            passes += 1
+            if args.loop:
+                C.heading("Pass %d   (Ctrl-C to stop)" % passes)
+            for f in freqs:
+                new = decode_carrier(args, f)
+                for r in new:
+                    r["pass"] = passes
+                rows += new
+                if args.csv and new:
+                    write_csv(args.csv, new)
+            finished = passes
+            if not args.loop:
+                break
+            C.info("pass %d done - cells decoded so far: %s" % (passes, ", ".join(
+                "%s:%d" % (e, p) for e, p in sorted({(r["earfcn"], r["pci"]) for r in rows if r.get("ident")}))
+                or "none"))
     except KeyboardInterrupt:
         print("")
-        C.warn("stopped - showing the carriers finished so far")
+        C.warn("stopped - showing the results so far")
     finally:
         C.ignore_ctrl_c()
-    summary(rows, t_all)
+    # one row per cell: its best result over all passes, and how many passes decoded it
+    best = {}
+    for r in rows:
+        key = (r.get("earfcn"), r.get("pci"))
+        old = best.get(key)
+        r["decoded_passes"] = (old or {}).get("decoded_passes", 0) + (1 if r.get("ident") else 0)
+        if old is None or (r.get("ident") and not old.get("ident")) or (not old.get("ident") and r.get("mib")):
+            best[key] = r
+        else:
+            old["decoded_passes"] = r["decoded_passes"]
+    rows_best = list(best.values())
+    summary(rows_best, t_all)
     if args.targets:
-        phone_check(args, rows)
-    if args.csv and rows:
-        write_csv(args.csv, rows)
+        phone_check(args, rows_best, max(1, finished) if args.loop else None)
     return 0
 
 

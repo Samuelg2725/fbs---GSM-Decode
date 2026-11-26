@@ -33,6 +33,7 @@ export LD_LIBRARY_PATH=/usr/local/lib
 | Check how much signal the antennas bring in per band (no decoding) | `python3 spectrum_check.py` |
 | Look for the cells a phone lists (EARFCN:PCI,PCI) | `python3 lte_decode.py --cells 6175:216,272 1617:389,461` |
 | Decode only one cell | `python3 lte_decode.py --cells 6225:320 --only` |
+| …and keep repeating until Ctrl-C | `python3 lte_decode.py --cells 6225:320 --only --loop` |
 | Watch every LTE cell on one carrier, saving raw IQ | `python3 lte_track.py --earfcn 6400` |
 | …the same with both antennas (for direction finding) | `python3 lte_track.py --earfcn 6400 --dual` |
 
