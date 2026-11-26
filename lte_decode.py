@@ -775,6 +775,8 @@ def _decode_capture(args, freq_mhz, rate, x1, x2):
     for h in hits:
         if int(h["pci"]) in tried:
             continue
+        if getattr(args, "only", False) and int(h["pci"]) not in getattr(args, "_targets_now", []):
+            continue                             # --only: decode just the PCIs given with --cells
         if x2 is not None:
             w1, w2, share = cell_weights(x1, x2, rate, int(h["pci"]), float(h.get("offset_hz", 0.0)))
             r = decode_cell((w1 * x1 + w2 * x2).astype(np.complex64), rate, h, args, freq_mhz)
@@ -831,7 +833,7 @@ def _decode_capture(args, freq_mhz, rate, x1, x2):
         for parent in [r for r in list(results) if r["ident"] and r.get("aligned") is not None]:
             base = 3 * (parent["pci"] // 3)
             for sib in (base, base + 1, base + 2):
-                if sib in tried:
+                if sib in tried or (getattr(args, "only", False) and sib not in args._targets_now):
                     continue
                 tried.add(sib)
                 r = decode_cell(None, rate, {"pci": sib, "width": parent.get("mib"), "ports": parent.get("ports")}, args,
@@ -932,6 +934,8 @@ def main():
                     help="do not try the other sectors of each decoded mast")
     ap.add_argument("--show-failed-siblings", action="store_true",
                     help="also list sector tries that did not decode")
+    ap.add_argument("--only", action="store_true",
+                    help="with --cells: decode only the listed PCIs (other cells found are not decoded)")
     ap.add_argument("--retries", type=int, default=2,
                     help="extra recordings for cells whose MIB decoded but not their Cell ID (default 2)")
     ap.add_argument("--srsran-timeout", type=int, default=30, help="seconds per srsRAN attempt (default 30)")
