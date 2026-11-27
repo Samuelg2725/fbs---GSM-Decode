@@ -206,6 +206,7 @@ class Band(object):
         idx = (b0 + np.round(np.fft.fftfreq(m) * m).astype(int)) % nx
         self.spec = [S[idx] for S in spectra]        # per antenna
         self.m, self.nx = m, nx
+        self.off_hz = b0 * FS / nx                    # actual centre of this slice relative to the recording
         self._y = None
 
     def y(self):
@@ -382,7 +383,7 @@ def check_candidates(cands, args, b):
         mib = dict(ssb_idx=int(m.group(3)), hrf=int(m.group(4)), sfn=int(m.group(5)), scs_common=int(m.group(6)),
                    kssb=int(m.group(7)), coreset0=int(m.group(8)), ss0=int(m.group(9)), typeA=int(m.group(10)),
                    barred=int(m.group(11)), intra=int(m.group(12)), cfo=float(m.group(14)), bch=m.group(15))
-        key = (d["gscn"], d["pci"])
+        key = (d["gscn"] or round(d["mhz"], 3), d["pci"])
         beam = dict(t=d["t"], ratio=d["ratio"], share=d["share"], **mib)
         if key not in cells:
             cells[key] = dict(gscn=d["gscn"], mhz=d["mhz"], pci=d["pci"], band_obj=d["band"], beams=[])
@@ -474,27 +475,27 @@ def decode_sib1(cell, x_list, fc, b, args):
         hs = [np.vdot(pss_seq(cell["pci"] % 3), g[0, k]) for g in grids]
         norm = np.sqrt(sum(abs(h) ** 2 for h in hs)) + 1e-30
         weights = [np.conj(h) / norm for h in hs]
-    tried = []
-    for f_low, nrb, nsym, scs in layouts:
-        # srsRAN reports the frequency offset with the opposite sign (measured: cfo field = -offset)
-        slots = slot_grids(x_list, fc, frame0, f_low, nrb, scs, -mib["cfo"], weights)
+    def run_layout(f_low, nrb, nsym, scs, cfo, wts, keep_slots=None):
+        """SIB1 attempt on one CORESET 0 position -> helper output ('' when nothing to try)."""
+        slots = slot_grids(x_list, fc, frame0, f_low, nrb, scs, cfo, wts)
+        if keep_slots is not None:
+            slots = [sl for sl in slots if sl[1] in keep_slots]
         if not slots:
-            continue
+            return ""
         # SS/PBCH block REs inside CORESET 0's band, in the slots where this cell's beams were seen
         k_ssb0 = (cell["mhz"] * 1e6 - 120 * b["scs"] * 1e3 - f_low) / scs
         rb0 = int(np.floor(k_ssb0 / 12))
         rbn = int(np.ceil((k_ssb0 + 240 * b["scs"] * 1e3 / scs) / 12)) - rb0
+        starts, slot_len = symbol_starts(int(round(FS / scs)), 1 if scs == 30e3 else 0)
         ssb_syms = {}
         for bm in cell["beams"]:
             t0 = bm["t"] * FS / band.rate
             for l in range(4):
                 ts = t0 + l * (n_ssb + int(round(n_ssb * 144 / 2048)))
                 for (idx, s0, _g) in slots:
-                    starts, slot_len = symbol_starts(int(round(FS / scs)), 1 if scs == 30e3 else 0)
                     if s0 <= ts < s0 + slot_len:
                         j = int(np.argmin([abs(s0 + st - ts) for st in starts]))
-                        ssb_syms.setdefault(s0, 0)
-                        ssb_syms[s0] |= 1 << j
+                        ssb_syms[s0] = ssb_syms.get(s0, 0) | (1 << j)
         spec = ",".join("%d:%d:%d:%x" % (idx, max(rb0, 0), rbn if ssb_syms.get(s0) else 0, ssb_syms.get(s0, 0))
                         for idx, s0, _g in slots)
         path = write_cf32([g for _i, _s, g in slots])
@@ -502,15 +503,44 @@ def decode_sib1(cell, x_list, fc, b, args):
             text = run_helper(["sib1", path, cell["pci"], int(scs / 1e3), nrb, nsym, mib["typeA"], spec], timeout=120)
         finally:
             os.unlink(path)
-        tried.append(text)
+        # slot start samples of the slots with a SIB1 control message (for the retries)
+        found_idx = {int(v) for v in re.findall(r"DCI slot=(\d+)", text)}
+        run_layout.dci_slots = {s0 for idx, s0, _g in slots if idx in found_idx}
+        return text
+
+    def take(text):
         m = re.search(r"CELL slot=(\d+) nci=(\d+) tac=(\S+) plmn=(\S+) reserved=(\d)", text)
-        if m:
-            mcc, mnc = (m.group(4).split(",")[0].split("-") + ["?"])[:2]
-            cell["ident"] = dict(nci=int(m.group(2)), tac=int(m.group(3)) if m.group(3).isdigit() else None,
-                                 mcc=mcc, mnc=mnc, plmns=m.group(4), operator=C.operator(mcc, mnc) or "")
-            hx = re.search(r"SIB1 slot=\d+ hex=([0-9a-f]+)", text)
-            cell["sib1_hex"] = hx.group(1) if hx else None
+        if not m:
+            return False
+        mcc, mnc = (m.group(4).split(",")[0].split("-") + ["?"])[:2]
+        cell["ident"] = dict(nci=int(m.group(2)), tac=int(m.group(3)) if m.group(3).isdigit() else None,
+                             mcc=mcc, mnc=mnc, plmns=m.group(4), operator=C.operator(mcc, mnc) or "")
+        hx = re.search(r"SIB1 slot=\d+ hex=([0-9a-f]+)", text)
+        cell["sib1_hex"] = hx.group(1) if hx else None
+        return True
+
+    # srsRAN reports the frequency offset with the opposite sign (measured: cfo field = -offset)
+    cfo0 = -mib["cfo"]
+    tried, with_dci = [], []
+    for lay in layouts:
+        text = run_layout(*lay, cfo0, weights)
+        tried.append(text)
+        if take(text):
             return
+        if run_layout.dci_slots:
+            with_dci.append((lay, set(run_layout.dci_slots)))
+    # control message found but the data failed: retry those slots only, with small frequency corrections (the
+    # data channel is far more sensitive to them than the PBCH the estimate came from) and each antenna alone
+    variants = [(cfo0 + d, weights) for d in (60.0, -60.0, 120.0, -120.0, 200.0, -200.0)]
+    if len(x_list) > 1:
+        variants += [(cfo0, [1.0 if i == a else 0.0 for i in range(len(x_list))]) for a in range(len(x_list))]
+    for lay, keep in with_dci:
+        for cfo, wts in variants:
+            text = run_layout(*lay, cfo, wts, keep_slots=keep)
+            tried.append(text)
+            if take(text):
+                cell["how"] = "retry (frequency %+.0f Hz%s)" % (cfo - cfo0, "" if wts is weights else ", one antenna")
+                return
     dci = sum(t.count("DCI slot=") for t in tried)
     ko = sum(t.count("crc=KO") for t in tried)
     cell["sib1_status"] = ("SIB1 control message found, data failed (%d tries)" % ko if dci else
@@ -572,6 +602,15 @@ def scan_band(args, band_name, freqs=None, signal=None):
             cands = search_recording(x_list, fc, band_name, gscns, args, None)
         C.status("  %.1f MHz: %d sync peak%s, checking..." % (fc / 1e6, len(cands), "" if len(cands) == 1 else "s"))
         found = check_candidates(cands, args, b) if cands else []
+        if not args.raster_only and has_signal(x_list):
+            # cells off the sync raster (non-standalone cells may put their block anywhere)
+            C.status("  %.1f MHz: searching every frequency for off-raster cells..." % (fc / 1e6))
+            extra = check_candidates(search_anyfreq(x_list, fc, b, args), args, b)
+            for c in extra:
+                if not any(c["pci"] == f["pci"] and abs(c["mhz"] - f["mhz"]) < 0.02 for f in found):
+                    c["how"] = "any-frequency search"
+                    found.append(c)
+            cands = cands or extra
         C.clear_status()
         seen = {(c["gscn"], c["pci"]) for c in cells}
         new = [c for c in found if (c["gscn"], c["pci"]) not in seen]
@@ -629,6 +668,137 @@ def sib1_second_chance(args, cell, b):
     else:
         cell["sib1_status"] = (again.get("sib1_status") or "SIB1 not decoded") + " (also in a %.0f ms recording)" % (
             args.sib1_secs * 1000)
+
+
+_DIFF_TPL = {}
+
+
+def has_signal(x_list):
+    """True when the recording's spectrum is not flat (something is transmitting): 90th vs 10th percentile of the
+    power per 30 kHz, at least 3 dB apart."""
+    x = x_list[-1][:1024 * 256].reshape(-1, 1024)
+    p = np.mean(np.abs(np.fft.fft(x * np.hanning(1024), axis=1)) ** 2, axis=0)
+    p = np.delete(p, [0, 1, 1023])                           # DC
+    lo, hi = np.percentile(p, [10, 90])
+    return hi > 2.0 * lo
+
+
+def search_anyfreq(x_list, fc, b, args, secs=0.022, thr=0.12, max_cands=40):
+    """Sync search at ANY frequency, not only the raster: non-standalone cells (most UK 3.5 GHz 5G) may put their
+    SS/PBCH block anywhere on the channel raster - phones are told where by 4G.
+    Every `step` samples (less than a cyclic prefix, so one window always lies inside each symbol) the recording is
+    transformed with the 5G symbol length; neighbouring subcarriers are multiplied (Y[k] * conj(Y[k+1])), which removes
+    the unknown timing within the symbol, and that is correlated across all frequency positions with the same product
+    of each PSS. A hit gives the PSS's subcarrier position and rough time, then timing and the fraction of a
+    subcarrier are refined coherently. -> candidate detections like search_at() (gscn 0 = off the raster)."""
+    scs = b["scs"] * 1e3
+    n = int(round(FS / scs))
+    step = int(round(n * 144 / 2048))                        # one cyclic prefix: a window always fits in a symbol
+    usable = USABLE_HALF - (3.6e6 if b["scs"] == 30 else 1.8e6)
+    if n not in _DIFF_TPL:
+        t = np.zeros((3, n))
+        for nid2 in range(3):
+            d = pss_seq(nid2)
+            t[nid2, :126] = d[:-1] * d[1:]
+        ones = np.zeros(n)
+        ones[:126] = 1.0
+        _DIFF_TPL[n] = (np.conj(np.fft.fft(t, axis=1)), np.conj(np.fft.fft(ones)))
+    T, O = _DIFF_TPL[n]
+    nfr = (min(len(x_list[0]), int(FS * secs)) - n) // step
+    hits = []
+    for x0 in range(0, nfr, 512):
+        idx = (np.arange(x0, min(nfr, x0 + 512))[:, None] * step + np.arange(n)[None, :])
+        num, den = 0, 0
+        for x in x_list:
+            Y = np.fft.fft(x[idx], axis=1)
+            D = Y * np.conj(np.roll(Y, -1, axis=1))
+            FD = np.fft.fft(D, axis=1)
+            c = np.fft.ifft(FD[:, None, :] * T[None, :, :], axis=2)            # frames x 3 x bins
+            num = num + c
+            den = den + np.fft.ifft(np.fft.fft(np.abs(D), axis=1) * O[None, :], axis=1).real
+        m = np.abs(num) ** 2 / (den[:, None, :] ** 2 + 1e-30)
+        for fr, nid2, k0 in zip(*np.nonzero(m > thr)):
+            hits.append((float(m[fr, nid2, k0]), int(x0 + fr), int(nid2), int(k0)))
+    hits.sort(reverse=True)
+    picked = []
+    for metric, fr, nid2, k0 in hits:
+        kc = (k0 + 64) % n                                      # SSB centre bin (PSS n=0 sits 64 below it)
+        f0 = (kc if kc < n // 2 else kc - n) * scs
+        if abs(f0) > usable:
+            continue
+        if any(abs(f0 - p["f0"]) < 2 * scs and abs(fr - p["fr"]) * step < 4 * n for p in picked):
+            continue
+        picked.append(dict(f0=f0, fr=fr, nid2=nid2, metric=metric, k0=k0))
+        if len(picked) >= max_cands:
+            break
+    if not picked:
+        return []
+    # refine: the fraction of a subcarrier once per distinct frequency (on a short segment around its strongest hit),
+    # then the exact PSS timing of every hit at that frequency (coherent correlation on the decimated slice)
+    groups = []
+    for p in picked:
+        g = next((g for g in groups if g["nid2"] == p["nid2"] and abs(g["f0"] - p["f0"]) < 2 * scs), None)
+        if g is None:
+            groups.append(dict(f0=p["f0"], nid2=p["nid2"], hits=[p]))
+        else:
+            g["hits"].append(p)
+    nx = len(x_list[0]) // 8 * 8
+    spectra = None
+    out = []
+    ratio_dec = int(round(n / 256))                          # decimation to 256 samples per symbol
+    for g in groups:
+        p = max(g["hits"], key=lambda h: h["metric"])
+        t_c = p["fr"] * step
+        a0 = max(0, t_c - 2 * n)
+        segs = [x[a0:a0 + 6 * n].astype(np.complex128) for x in x_list]
+        if len(segs[0]) < 6 * n:
+            continue
+        tpl = pss_template(p["nid2"], 256)
+        best = (0.0, None)
+        tt = (a0 + np.arange(len(segs[0]))) / FS
+        for frac in (-0.375, -0.125, 0.125, 0.375):
+            f_try = p["f0"] + frac * scs
+            corr, e = 0, 0
+            for seg in segs:                                 # antennas added
+                y = seg * np.exp(-2j * np.pi * f_try * tt)
+                Ys = np.fft.fft(y)
+                ms = len(y) // ratio_dec
+                ys = np.fft.ifft(Ys[np.round(np.fft.fftfreq(ms) * ms).astype(int) % len(y)])
+                cc = np.abs(np.correlate(ys, tpl, mode="valid")) ** 2
+                corr = corr + cc
+                e = e + np.convolve(np.abs(ys) ** 2, np.ones(256), mode="valid")[:len(cc)]
+            r = float(np.max(corr / (e * 127.0 / 256 + 1e-30)))
+            if r > best[0]:
+                best = (r, f_try)
+        if best[1] is None or best[0] < args.pss_min:
+            continue
+        if spectra is None:
+            spectra = [np.fft.fft(x[:nx]) for x in x_list]
+        band = Band(spectra, nx, best[1], b["scs"])
+        y = band.y()
+        tpl_b = pss_template(g["nid2"], band.nfft)
+        for h in g["hits"]:
+            lo = max(0, int((h["fr"] * step - 2 * n) * band.rate / FS))
+            corr, e = 0, 0
+            for yy in y:                                     # antennas added
+                seg_b = yy[lo:lo + 4 * band.nfft + band.nfft]
+                if len(seg_b) <= band.nfft:
+                    break
+                cc = np.abs(np.correlate(seg_b, tpl_b, mode="valid")) ** 2
+                corr = corr + cc
+                e = e + np.convolve(np.abs(seg_b) ** 2, np.ones(band.nfft), mode="valid")[:len(cc)]
+            if np.isscalar(corr):
+                continue
+            r = corr / (e * 127.0 / band.nfft + 1e-30)
+            i = int(np.argmax(r))
+            if r[i] >= args.pss_min:
+                out.append(dict(gscn=0, mhz=(fc + band.off_hz) / 1e6, band=band, nid2=g["nid2"], t=lo + i,
+                                ratio=float(r[i])))
+    if getattr(args, "debug", False):
+        C.info("    debug any-frequency %.1f MHz: %d hits, %d positions, %d confirmed: %s" % (
+            fc / 1e6, len(hits), len(picked), len(out), ", ".join("%.3f MHz N_ID2 %d %.0f" % (o["mhz"], o["nid2"],
+                                                                                              o["ratio"]) for o in out[:6])))
+    return out
 
 
 def search_offraster(x_list, fc, b, args):
@@ -732,6 +902,8 @@ def main():
     ap.add_argument("--csv", default="~/field/nr_cells.csv", help="CSV file results are added to ('' = none)")
     ap.add_argument("--selftest", action="store_true", help="decode synthetic 5G cells (no radio needed)")
     pcap_out.add_args(ap)
+    ap.add_argument("--raster-only", action="store_true",
+                    help="only the standard sync positions (GSCN); skip the any-frequency search for off-raster cells")
     ap.add_argument("--debug", action="store_true", help="show the sync peaks and MIB checks of every recording")
     ap.add_argument("--no-color", action="store_true", help="plain text output")
     args = ap.parse_args()
@@ -860,7 +1032,7 @@ def synth(gen, tmp, b, fc, cells, rng, secs=0.045, gains=(1.0,)):
         table = CORESET0[(b["scs"], b["scs"])]
         entry = table[c0] if kssb <= 23 else (48, 1, 0)
         nrb, nsym = entry[0], entry[1]
-        f_ssb = gscn_to_mhz(gscn) * 1e6
+        f_ssb = gscn * 1e3 if gscn > 100000 else gscn_to_mhz(gscn) * 1e6   # > 100000: a frequency in kHz
         extra = []
         if kssb <= 23:                              # sync blocks in the SIB1 slot: the PDSCH goes around them
             cell0 = dict(mhz=f_ssb / 1e6, mib=dict(kssb=kssb, coreset0=c0, scs_common=b["scs"]))

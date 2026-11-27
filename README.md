@@ -313,5 +313,11 @@ updating the repository run the rebuild command there). How it decodes:
   transmitters add, both antennas); srsRAN decodes (PBCH, PDCCH, PDSCH, ASN.1). srsRAN's own 5G receiver assumes
   4G symbol timing, which breaks 30 kHz (3.5 GHz) cells, and lacks the 3.5 GHz CORESET 0 table: both are handled
   here.
+- Off-raster cells: non-standalone cells (most UK 3.5 GHz 5G) may put their sync block anywhere on the channel
+  raster, not only on the standard search positions (phones are told where by 4G). Every recording with a signal
+  in it is also searched at every frequency (neighbouring-subcarrier products correlated against each PSS, then
+  refined), about 1.5-5 s per recording; `--raster-only` skips it.
+- SIB1 data that fails after its control message decoded is retried on those slots with small frequency
+  corrections and with each antenna alone.
 - Weak cells: SIB1 control-message candidates are not dropped by srsRAN's pilot gate (the checksum decides),
   and SIB1 repeats are combined. Self-test: MIB down to -10 dB, SIB1 to about -8 dB (synthetic signals).
