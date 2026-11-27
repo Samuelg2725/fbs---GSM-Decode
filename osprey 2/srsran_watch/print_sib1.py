@@ -63,6 +63,7 @@ def main():
     shutil.copy(SOURCE, EXAMPLES / "sib1_print.cc")
     shutil.copy(SOURCE.parent / "sib1_regen.c", EXAMPLES / "sib1_regen.c")
     shutil.copy(SOURCE.parent / "nr_decode.cc", EXAMPLES / "nr_decode.cc")
+    shutil.copy(SOURCE.parent / "mib_stream.c", EXAMPLES / "mib_stream.c")
     if (SOURCE.parent / "nr_testgen.cc").is_file():
         shutil.copy(SOURCE.parent / "nr_testgen.cc", EXAMPLES / "nr_testgen.cc")
 
@@ -140,6 +141,11 @@ def main():
         cmake_text += ("\n# 5G NR MIB / SIB1 decoding for nr_decode.py\n"
                        "add_executable(nr_decode nr_decode.cc)\n"
                        "target_link_libraries(nr_decode srsran_phy srsran_common rrc_nr_asn1 asn1_utils pthread)\n")
+        changed = True
+    if "mib_stream" not in cmake_text:
+        cmake_text += ("\n# LTE MIB of every frame of one cell for lte_mib_stream.py\n"
+                       "add_executable(mib_stream mib_stream.c)\n"
+                       "target_link_libraries(mib_stream srsran_phy srsran_common pthread)\n")
         changed = True
     if "nr_testgen" not in cmake_text and (EXAMPLES / "nr_testgen.cc").is_file():
         cmake_text += ("\n# 5G NR test signals (SS/PBCH block + SIB1) for checking nr_decode.py\n"

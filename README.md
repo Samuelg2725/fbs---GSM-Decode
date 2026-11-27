@@ -201,13 +201,13 @@ once (setup step 3).
    sudo apt install -y build-essential cmake libfftw3-dev libmbedtls-dev libboost-program-options-dev libconfig++-dev libsctp-dev
    cd ~ && git clone --depth 1 https://github.com/srsran/srsRAN_4G.git
    python3 ~/fbs-upload/"osprey 2"/srsran_watch/print_sib1.py
-   mkdir -p ~/srsRAN_4G/build && cd ~/srsRAN_4G/build && cmake .. && make -j3 pdsch_ue sib1_regen nr_decode nr_testgen
+   mkdir -p ~/srsRAN_4G/build && cd ~/srsRAN_4G/build && cmake .. && make -j3 pdsch_ue sib1_regen nr_decode nr_testgen mib_stream
    ```
    The patch makes srsRAN print the decoded cell identity and the raw MIB / SIB bytes (for the pcap files), adds
    SIB1 combining and the PHICH fix, and builds the `sib1_regen` helper used by interference cancellation.
    Re-run these whenever anything in `osprey 2/srsran_watch` changes:
    ```bash
-   python3 ~/fbs-upload/"osprey 2"/srsran_watch/print_sib1.py && cd ~/srsRAN_4G/build && cmake .. && make -j3 pdsch_ue sib1_regen nr_decode nr_testgen
+   python3 ~/fbs-upload/"osprey 2"/srsran_watch/print_sib1.py && cd ~/srsRAN_4G/build && cmake .. && make -j3 pdsch_ue sib1_regen nr_decode nr_testgen mib_stream
    ```
 4. Optional check that the fast LTE search gives the same answers as the original code:
    `python3 lte_fastsync.py` (ends with `OK`).
@@ -321,3 +321,18 @@ updating the repository run the rebuild command there). How it decodes:
   corrections and with each antenna alone.
 - Weak cells: SIB1 control-message candidates are not dropped by srsRAN's pilot gate (the checksum decides),
   and SIB1 repeats are combined. Self-test: MIB down to -10 dB, SIB1 to about -8 dB (synthetic signals).
+
+## Every MIB with its exact time: `lte_mib_stream.py`
+
+    python3 lte_mib_stream.py --earfcn 1363                  # every cell on the carrier, 1 s = 100 MIBs each
+    python3 lte_mib_stream.py --earfcn 1363 --pci 21 199 --secs 2 --loop --dual
+
+Finds every cell on the EARFCN (lte_decode.py's decoder, Cell ID once from SIB1), lines each cell up on its own
+frame timing and demodulates the MIB of every 10 ms frame on its own (srsRAN PBCH via the `mib_stream` helper,
+no combining across frames). Each MIB is printed with its time to the microsecond: the recording start (Pi clock)
++ the sample position of that frame's subframe 0, so the timing between MIBs and between cells is exact to one
+sample (65 ns at 15.36 Msps) and the absolute time is as good as the Pi's clock (NTP, a few ms). A cell under a
+stronger one is read again with the others removed (interference cancellation) when MIBs are missed. The table
+per recording gives MIBs decoded per cell and each cell's frame timing relative to the first.
+Output: ~/field/lte_mib_stream.csv and ~/field/pcap/lte_mib_<earfcn>_<time>.pcapng (every MIB at its exact time).
+Build the helper with the srsRAN patch (setup step 3: `make ... mib_stream`).
