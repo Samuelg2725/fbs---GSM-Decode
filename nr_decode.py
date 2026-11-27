@@ -218,7 +218,18 @@ _TPL = {}
 
 
 def correlate(band):
-    """PSS correlation of each N_ID2 (antennas added) -> list of (nid2, power array)."""
+    """PSS correlation of each N_ID2 (antennas added) -> list of (nid2, normalised power array).
+    Normalised by the signal energy under the template at each position (not the recording's average), so strong
+    bursty signals - TDD traffic switching on and off, a loud neighbouring 4G carrier - do not produce false peaks:
+    for noise or unrelated signals the value averages 1, a PSS gives a sharp peak."""
+    ys = band.y()
+    den = 0
+    for s, y in zip(band.spec, ys):
+        e = np.abs(y) ** 2
+        c = np.concatenate([np.zeros(1), np.cumsum(np.concatenate([e, e[:band.nfft]]))])
+        local = c[band.nfft:band.nfft + len(e)] - c[:len(e)]          # energy of y[n : n+nfft] (circular)
+        den = den + local * (127.0 / band.nfft)
+    den = den + 1e-6 * float(np.mean(den)) + 1e-30
     out = []
     for nid2 in range(3):
         key = (band.m, nid2)
@@ -229,7 +240,7 @@ def correlate(band):
         p = 0
         for s in band.spec:
             p = p + np.abs(np.fft.ifft(s * _TPL[key])) ** 2
-        out.append((nid2, p))
+        out.append((nid2, p / den))
     return out
 
 
@@ -306,12 +317,15 @@ def combine(grids, nid1, nid2):
 
 def search_recording(x_list, fc, band_name, gscns, args, show):
     """All SSB frequencies of one recording -> list of candidate detections (not yet MIB-checked)."""
-    b = BANDS[band_name]
+    return search_at(x_list, fc, BANDS[band_name], [(g, gscn_to_mhz(g) * 1e6) for g in gscns], args)
+
+
+def search_at(x_list, fc, b, targets, args):
+    """Sync search at the given (GSCN, SSB frequency Hz) positions of one recording -> candidate detections."""
     nx = len(x_list[0]) // 8 * 8
     spectra = [np.fft.fft(x[:nx]) for x in x_list]
     found = []
-    for g in gscns:
-        f = gscn_to_mhz(g) * 1e6
+    for g, f in targets:
         off = f - fc
         if abs(off) > USABLE_HALF - (3.6e6 if b["scs"] == 30 else 1.8e6):
             continue
@@ -383,7 +397,7 @@ def coreset0_layouts(cell, b):
     return out
 
 
-def slot_grids(x_list, fc, frame0, f_low, nrb, scs, cfo, weights, nslots_max=200):
+def slot_grids(x_list, fc, frame0, f_low, nrb, scs, cfo, weights, nslots_max=800):
     """Resource grids (14 x nrb*12) of every complete slot in the recording, lowest subcarrier = f_low.
     frame0: sample index of a frame start; returns [(slot_index_in_frame, sample_start, grid)]."""
     mu = 1 if scs == 30e3 else 0
@@ -549,6 +563,8 @@ def scan_band(args, band_name, freqs=None, signal=None):
                 C.status("  PCI %d: decoding SIB1..." % cell["pci"])
                 decode_sib1(cell, x_list, fc, b, args)
                 C.clear_status()
+                if not cell.get("ident") and coreset0_layouts(cell, b) and signal is None and args.sib1_secs > 0:
+                    sib1_second_chance(args, cell, b)
             show_cell(cell)
             write_pcap(cell)
         cells += new
@@ -558,6 +574,42 @@ def scan_band(args, band_name, freqs=None, signal=None):
                                                                                  else "s"), time.time() - t0),
                       "grey"), flush=True)
     return cells
+
+
+def sib1_second_chance(args, cell, b):
+    """A cell whose MIB decoded but whose SIB1 did not: record again for longer (--sib1-secs, default 0.19 s), centred
+    on its CORESET 0 - SIB1 may be sent only every 40-160 ms, and more repeats are combined - and try again."""
+    f_low, nrb, _nsym, scs = coreset0_layouts(cell, b)[0]
+    fc2 = f_low + nrb * 6 * scs
+    C.status("  PCI %d: SIB1 not in the first recording - recording %.0f ms centred on its CORESET 0..." % (
+        cell["pci"], args.sib1_secs * 1000))
+    keep, args.secs = args.secs, args.sib1_secs
+    L.SHOW_LEVELS[0] = False
+    try:
+        x_list = record(args, fc2)
+    finally:
+        args.secs = keep
+        L.SHOW_LEVELS[0] = True
+    if x_list is None:
+        C.clear_status()
+        return
+    found = check_candidates(search_at(x_list, fc2, b, [(cell["gscn"], cell["mhz"] * 1e6)], args), args, b)
+    again = next((c for c in found if c["pci"] == cell["pci"]), None)
+    if again is None:
+        C.clear_status()
+        cell["sib1_status"] = (cell.get("sib1_status") or "") + "; not found again in the longer recording"
+        return
+    again.update(fc=fc2, band=cell["band"])
+    decode_sib1(again, x_list, fc2, b, args)
+    C.clear_status()
+    for k in ("ident", "sib1_hex"):
+        if again.get(k):
+            cell[k] = again[k]
+    if again.get("ident"):
+        cell["how"] = "longer recording"
+    else:
+        cell["sib1_status"] = (again.get("sib1_status") or "SIB1 not decoded") + " (also in a %.0f ms recording)" % (
+            args.sib1_secs * 1000)
 
 
 def search_offraster(x_list, fc, b, args):
@@ -653,6 +705,9 @@ def main():
                     help="sync peak threshold, x the average (default 18: noise alone peaks at ~14, a cell whose MIB "
                          "still decodes is at 40+; lower = more false peaks to check, slower)")
     ap.add_argument("--no-sib1", action="store_true", help="stop at the MIB (no Cell ID)")
+    ap.add_argument("--sib1-secs", type=float, default=0.19,
+                    help="a cell whose SIB1 was not in the first recording is recorded again this long, centred on "
+                         "it (default 0.19 s: 180 ms after the radio's first 10 ms; 0 = off)")
     ap.add_argument("--loop", action="store_true", help="scan again and again (Ctrl-C to stop)")
     ap.add_argument("--low-if-mhz", type=float, default=0.6, help="radio tuned this far above (default 0.6)")
     ap.add_argument("--csv", default="~/field/nr_cells.csv", help="CSV file results are added to ('' = none)")
