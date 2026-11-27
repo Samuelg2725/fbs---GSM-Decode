@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""Point the CALYX modem (ALA440) at exact EARFCNs: lock it to one carrier at a time and list every cell (PCI)
-it measures there, with Cell IDs where the modem decodes them.
+"""Point the CALYX modem (ALA440) at exact carriers or exact cells and read the Cell ID it finds there.
 
-  sudo python3 modem_lock.py --earfcn 6300 6400 76
-  sudo python3 modem_lock.py --earfcn 6300 --secs 60 --raw
+  sudo python3 modem_lock.py --earfcn 6300 76              # lock to each carrier: which cell does it camp on?
+  sudo python3 modem_lock.py --cells 6300:21,94 76:229     # lock to each exact cell (EARFCN:PCI): its Cell ID
+  sudo python3 modem_lock.py --cells 6300:21 --raw         # show every AT command and answer
 
-For each EARFCN:
-  1. radio off (AT+CFUN=0), lock to the EARFCN (AT^CELLLOCK=1,3,0,<earfcn>), radio on (AT+CFUN=1)
-  2. for --secs seconds, every 2 s: the serving cell (AT^CELLINFO=1) and the cells it measures on that
-     EARFCN (AT^CELLINFO=2, "intra" = same carrier) - PCI and RSRP
-  3. a band scan (AT^NETSCAN) for the Cell IDs on that EARFCN
-The manual says a lock only fully clears after a modem restart, so if the modem does not move to the next
-EARFCN it is restarted (AT+RESET, about 30 s) and locked again. At the end the lock is removed and the modem
-restarted, so it is back to normal (--keep-lock to skip that).
+For each target:
+  1. radio off (AT+CFUN=0), remove any lock, lock (AT^CELLLOCK: to the EARFCN, or to the EARFCN + PCI), radio on
+  2. wait until the modem camps on a cell. Without a SIM it has "limited service" only, but it still reports the
+     cell it camps on in its registration status (+CEREG: TAC and Cell ID) - that is what is read here
+  3. a band scan (AT^NETSCAN) of the target's band, to match the Cell ID to its PCI
+With --cells the result is a check of each cell's identity by a second, independent receiver: compare the
+Cell ID column with what lte_decode.py decoded for the same EARFCN:PCI (shown in the SDR column).
 
-Slower than modem_scan.py (about 1 minute per EARFCN), but it lists every PCI the modem measures on that carrier,
-not only the best cell per operator. Results: ~/field/modem_lock.csv; raw answers in ~/field/modem_scan_raw.txt.
+Without a SIM the modem does not measure other cells, so it reports one cell per lock: use --cells to visit each
+PCI the SDR found. If the modem does not camp within --secs, it is restarted (AT+RESET, about 30 s) and locked
+again once. At the end the lock is removed and the modem restarted, so it is back to normal (--keep-lock skips
+that). Results: ~/field/modem_lock.csv; raw answers in ~/field/modem_scan_raw.txt.
 """
 import argparse
 import os
@@ -30,6 +31,8 @@ import modem_scan as M                               # noqa: E402
 from modem_probe import open_port, command          # noqa: E402
 
 OUT = os.path.join(M.FIELD, "modem_lock.csv")
+# +CEREG: [<n>,]<stat>,"<tac>","<ci>"[,<act>]  (TAC and Cell ID in hex) - as a reply to AT+CEREG? or unsolicited
+CEREG_RE = re.compile(r'\+CEREG:\s*(?:\d+\s*,\s*)?(\d+)\s*,\s*"([0-9A-Fa-f]+)"\s*,\s*"([0-9A-Fa-f]+)"')
 
 
 def log(text):
@@ -45,20 +48,14 @@ def ask(fd, cmd, timeout=5.0, raw=False):
     return reply
 
 
-def serving(text):
-    """AT^CELLINFO=1 LTE line -> {pci, earfcn, cell_id, tac, plmn} or None (e.g. NO SERVICE)."""
-    for line in text.splitlines():
-        if "^CELLINFO:" not in line or "NO SERVICE" in line.upper():
-            continue
-        f = [x.strip().strip('"') for x in line.split(":", 1)[1].split(",")]
-        if len(f) < 12 or "LTE" not in f[0].upper():
-            continue
-        try:
-            return {"plmn": f[2] + f[3], "cell_id": M.num(f[4]), "pci": int(f[5]), "tac": M.num(f[8]),
-                    "earfcn": int(f[11])}
-        except (ValueError, IndexError):
-            continue
-    return None
+def camped(text):
+    """Last cell the modem reported in a +CEREG line -> {tac, cell_id} or None."""
+    found = None
+    for m in CEREG_RE.finditer(text):
+        tac, ci = int(m.group(2), 16), int(m.group(3), 16)
+        if ci and ci != 0xFFFFFFF:
+            found = {"tac": tac, "cell_id": ci}
+    return found
 
 
 def reconnect(port, wait=120):
@@ -73,6 +70,7 @@ def reconnect(port, wait=120):
                 if "OK" in command(fd, "AT", 1.5):
                     C.clear_status()
                     command(fd, "ATE0", 2)
+                    command(fd, "AT+CEREG=2", 2)
                     return fd
                 os.close(fd)
             except OSError:
@@ -91,49 +89,57 @@ def restart(fd, port):
     return reconnect(port)
 
 
-def lock(fd, earfcn, raw):
-    ask(fd, "AT+CFUN=0", 15, raw)
-    ask(fd, "AT^CELLLOCK=0", 5, raw)
-    r = ask(fd, 'AT^CELLLOCK=1,3,0,%d' % earfcn, 5, raw)
+def lock(fd, earfcn, pci, raw):
+    """Lock to the carrier (pci None) or to one cell. Returns (accepted, text of the answers)."""
+    text = ask(fd, "AT+CFUN=0", 15, raw)
+    text += ask(fd, "AT^CELLLOCK=0", 5, raw)
+    cmd = "AT^CELLLOCK=1,3,0,%d" % earfcn if pci is None else "AT^CELLLOCK=1,3,1,%d,%d" % (earfcn, pci)
+    r = ask(fd, cmd, 5, raw)
+    ask(fd, "AT+CEREG=2", 3, raw)                # registration reports with TAC and Cell ID
     ask(fd, "AT+CFUN=1", 15, raw)
     return "OK" in r
 
 
-def watch(fd, earfcn, secs, raw):
-    """Poll serving + neighbour info; -> (cells {pci: {...}}, on_earfcn)."""
-    cells, on, t0 = {}, False, time.time()
+def wait_camp(fd, label, secs, raw):
+    """Poll until the modem reports the cell it camps on -> {tac, cell_id} or None."""
+    t0, cell = time.time(), None
     while time.time() - t0 < secs:
-        C.status("  EARFCN %d: listening %.0f/%.0f s, %d PCIs so far" % (earfcn, time.time() - t0, secs, len(cells)))
-        s = serving(ask(fd, "AT^CELLINFO=1", 5, raw))
-        if s and s["earfcn"] == earfcn:
-            on = True
-            c = cells.setdefault(s["pci"], {"pci": s["pci"], "rsrp": None})
-            c.update(cell_id=s["cell_id"], tac=s["tac"], plmn=s["plmn"], how="serving cell")
-        text = ask(fd, "AT^CELLINFO=2", 5, raw)
-        for m in M.NEIGH_RE.finditer(text):
-            if int(m.group(2)) != earfcn or int(m.group(3)) > 503:
-                continue
-            if m.group(1) == "intra":
-                on = True
-            pci, rsrp = int(m.group(3)), float(m.group(5))
-            c = cells.setdefault(pci, {"pci": pci, "rsrp": rsrp, "how": "measured"})
-            if c.get("rsrp") is None or rsrp > c["rsrp"]:
-                c["rsrp"] = rsrp
+        C.status("  %s: waiting for the modem to camp... %.0f/%.0f s" % (label, time.time() - t0, secs))
+        text = ask(fd, "AT+CEREG?", 3, raw)
+        cell = camped(text) or cell
+        if cell:
+            break
         time.sleep(2)
     C.clear_status()
-    return cells, on
+    return cell
+
+
+def parse_targets(args, ap):
+    """-> [(earfcn, pci or None)]"""
+    out = [(e, None) for e in (args.earfcn or [])]
+    for item in args.cells or []:
+        try:
+            e, pcis = item.split(":")
+            out += [(int(e), int(p)) for p in pcis.split(",") if p.strip()]
+        except ValueError:
+            ap.error("--cells takes EARFCN:PCI,PCI (e.g. 6300:21,94), not '%s'" % item)
+    if not out:
+        ap.error("give --earfcn and/or --cells")
+    return out
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Lock the CALYX modem to each EARFCN and list the cells there.",
+    ap = argparse.ArgumentParser(description="Lock the CALYX modem to exact carriers / cells and read the Cell ID.",
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
-    ap.add_argument("--earfcn", type=int, nargs="+", required=True, help="LTE carriers to visit")
-    ap.add_argument("--secs", type=float, default=30, help="seconds to listen on each EARFCN (default 30)")
+    ap.add_argument("--earfcn", type=int, nargs="+", help="LTE carriers to lock to")
+    ap.add_argument("--cells", nargs="+", metavar="EARFCN:PCI,PCI", help="exact cells to lock to")
+    ap.add_argument("--secs", type=float, default=30, help="seconds to wait for the modem to camp (default 30)")
     ap.add_argument("--port", help="modem AT port (default: find it)")
     ap.add_argument("--keep-lock", action="store_true", help="leave the modem locked at the end")
-    ap.add_argument("--no-netscan", action="store_true", help="skip the band scan for Cell IDs")
+    ap.add_argument("--no-netscan", action="store_true", help="skip the band scan that matches Cell IDs to PCIs")
     ap.add_argument("--raw", action="store_true", help="print every AT command and answer")
     args = ap.parse_args()
+    targets = parse_targets(args, ap)
     if os.geteuid() != 0:
         sys.exit("Run with sudo (the modem port needs it).")
     os.makedirs(M.FIELD, exist_ok=True)
@@ -141,31 +147,36 @@ def main():
     fd = open_port(port)
     command(fd, "ATE0", 2)
     C.info("modem on %s" % port)
-    results = {}
+    results, scans = [], {}
     try:
-        for earfcn in args.earfcn:
-            C.heading("EARFCN %d (band %s)" % (earfcn, M.band_of(earfcn) or "?"))
-            if not lock(fd, earfcn, args.raw):
+        for earfcn, pci in targets:
+            label = "EARFCN %d" % earfcn + ("  PCI %d" % pci if pci is not None else "")
+            C.heading("%s (band %s)" % (label, M.band_of(earfcn) or "?"))
+            if not lock(fd, earfcn, pci, args.raw):
                 C.warn("  the modem refused the lock (see --raw)")
-            time.sleep(3)
-            cells, on = watch(fd, earfcn, args.secs, args.raw)
-            if not on:
-                C.info("  modem not on EARFCN %d yet - restarting it and locking again" % earfcn)
+            cell = wait_camp(fd, label, args.secs, args.raw)
+            if cell is None:
+                C.info("  the modem has not camped - restarting it and locking again")
                 fd = restart(fd, port)
-                lock(fd, earfcn, args.raw)
-                time.sleep(3)
-                more, on = watch(fd, earfcn, args.secs, args.raw)
-                cells.update(more)
-            if not args.no_netscan and M.band_of(earfcn):
-                lines = M.scan(fd, M.RAT["lte"], M.band_of(earfcn), 300)
-                for c in M.parse(lines):
-                    if c["freq"] != earfcn:
-                        continue
-                    x = cells.setdefault(c["pci"], {"pci": c["pci"], "rsrp": c["level"], "how": "band scan"})
-                    x.update(cell_id=c["cell_id"], tac=c["tac"], plmn=c["plmn"])
-            results[earfcn] = (cells, on)
-            print("  %s: %s" % ("on the carrier" if on else C.c("never reached this carrier", "red"),
-                                " ".join("PCI %d" % p for p in sorted(cells)) or "no cells"), flush=True)
+                lock(fd, earfcn, pci, args.raw)
+                cell = wait_camp(fd, label, args.secs, args.raw)
+            band = M.band_of(earfcn)
+            if cell and not args.no_netscan and band and band not in scans:
+                scans[band] = M.parse(M.scan(fd, M.RAT["lte"], band, 300))
+            match = None
+            if cell:
+                match = next((c for c in scans.get(M.band_of(earfcn), []) if c["cell_id"] == cell["cell_id"]), None)
+            row = {"earfcn": earfcn, "pci": pci, "cell": cell,
+                   "seen_pci": match["pci"] if match else None, "seen_earfcn": match["freq"] if match else None,
+                   "plmn": match["plmn"] if match else "", "rsrp": match["level"] if match else None}
+            results.append(row)
+            if cell:
+                print("  camped on Cell ID %d (eNB %d, sector %d), TAC %d%s" % (
+                    cell["cell_id"], cell["cell_id"] >> 8, cell["cell_id"] & 255, cell["tac"],
+                    "  = PCI %d on EARFCN %d" % (match["pci"], match["freq"]) if match else ""), flush=True)
+            else:
+                print("  " + C.c("the modem did not camp on this %s" % ("cell" if pci is not None else "carrier"),
+                                 "red"), flush=True)
     except KeyboardInterrupt:
         print("")
         C.clear_status()
@@ -181,25 +192,41 @@ def main():
             os.close(fd)
         except OSError:
             pass
-    t = C.Table(["EARFCN", "PCI", "RSRP", "Operator", "TAC", "Cell ID", "From"],
-                align={k: "right" for k in ("EARFCN", "PCI", "RSRP", "TAC", "Cell ID")})
+    sdr = M.sdr_results()
+    t = C.Table(["Locked to", "Operator", "TAC", "eNB", "Sector", "Cell ID", "PCI (scan)", "RSRP", "SDR"],
+                align={k: "right" for k in ("TAC", "eNB", "Sector", "Cell ID", "PCI (scan)", "RSRP")})
     new = not os.path.exists(OUT)
     with open(OUT, "a") as fh:
         if new:
-            fh.write("utc,earfcn,pci,rsrp,plmn,tac,cell_id,source\n")
-        for earfcn, (cells, on) in results.items():
-            if not cells:
-                t.add([earfcn, "-", "-", "-", "-", "-", ("no cells" if on else "not reached", "red")])
-            for c in sorted(cells.values(), key=lambda c: -(c.get("rsrp") or -999)):
-                t.add([earfcn, c["pci"], "%g" % c["rsrp"] if c.get("rsrp") is not None else "-",
-                       C.op_cell(M.operator(c.get("plmn", ""))) if c.get("plmn") else "-", c.get("tac", "-"),
-                       (c["cell_id"], "green+bold") if c.get("cell_id") else "-", c.get("how", "")])
-                fh.write("%s,%d,%d,%s,%s,%s,%s,%s\n" % (C.utc_iso(), earfcn, c["pci"], c.get("rsrp", ""),
-                                                        c.get("plmn", ""), c.get("tac", ""), c.get("cell_id", ""),
-                                                        c.get("how", "")))
+            fh.write("utc,earfcn,locked_pci,tac,cell_id,scan_pci,scan_earfcn,plmn,rsrp\n")
+        for r in results:
+            c = r["cell"]
+            locked = "%d" % r["earfcn"] + (":%d" % r["pci"] if r["pci"] is not None else "")
+            pci = r["pci"] if r["pci"] is not None else r["seen_pci"]
+            got = sdr.get((r["earfcn"], pci)) if pci is not None else None
+            if not c:
+                mark = ("-", "")
+            elif got and c["cell_id"] in got:
+                mark = ("same Cell ID", "green")
+            elif got:
+                mark = ("SDR has %s" % ",".join(map(str, sorted(got))), "yellow")
+            else:
+                mark = ("not decoded by SDR", "red")
+            if c:
+                t.add([locked, C.op_cell(M.operator(r["plmn"])) if r["plmn"] else "-", c["tac"], c["cell_id"] >> 8,
+                       c["cell_id"] & 255, (c["cell_id"], "green+bold"),
+                       r["seen_pci"] if r["seen_pci"] is not None else "-",
+                       r["rsrp"] if r["rsrp"] is not None else "-", mark])
+            else:
+                t.add([locked, "-", "-", "-", "-", ("did not camp", "red"), "-", "-", mark])
+            fh.write("%s,%d,%s,%s,%s,%s,%s,%s,%s\n" % (
+                C.utc_iso(), r["earfcn"], "" if r["pci"] is None else r["pci"], c["tac"] if c else "",
+                c["cell_id"] if c else "", "" if r["seen_pci"] is None else r["seen_pci"],
+                "" if r["seen_earfcn"] is None else r["seen_earfcn"], r["plmn"],
+                "" if r["rsrp"] is None else r["rsrp"]))
     M.give_back(OUT)
     M.give_back(M.RAW)
-    t.show("Cells the modem measured on each EARFCN")
+    t.show("What the modem camped on for each lock")
     C.info("results added to %s" % OUT)
     return 0
 
