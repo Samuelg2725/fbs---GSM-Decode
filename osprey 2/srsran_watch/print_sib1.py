@@ -62,6 +62,9 @@ def main():
         sys.exit("srsRAN examples were not found at %s" % EXAMPLES)
     shutil.copy(SOURCE, EXAMPLES / "sib1_print.cc")
     shutil.copy(SOURCE.parent / "sib1_regen.c", EXAMPLES / "sib1_regen.c")
+    shutil.copy(SOURCE.parent / "nr_decode.cc", EXAMPLES / "nr_decode.cc")
+    if (SOURCE.parent / "nr_testgen.cc").is_file():
+        shutil.copy(SOURCE.parent / "nr_testgen.cc", EXAMPLES / "nr_testgen.cc")
 
     pdsch = EXAMPLES / "pdsch_ue.c"
     text = pdsch.read_text()
@@ -132,6 +135,16 @@ def main():
         cmake_text += ("\n# SIB1 subframe rebuild for interference cancellation (lte_cancel.py)\n"
                        "add_executable(sib1_regen sib1_regen.c)\n"
                        "target_link_libraries(sib1_regen srsran_phy srsran_common pthread)\n")
+        changed = True
+    if "nr_decode" not in cmake_text:
+        cmake_text += ("\n# 5G NR MIB / SIB1 decoding for nr_decode.py\n"
+                       "add_executable(nr_decode nr_decode.cc)\n"
+                       "target_link_libraries(nr_decode srsran_phy srsran_common rrc_nr_asn1 asn1_utils pthread)\n")
+        changed = True
+    if "nr_testgen" not in cmake_text and (EXAMPLES / "nr_testgen.cc").is_file():
+        cmake_text += ("\n# 5G NR test signals (SS/PBCH block + SIB1) for checking nr_decode.py\n"
+                       "add_executable(nr_testgen nr_testgen.cc)\n"
+                       "target_link_libraries(nr_testgen srsran_phy srsran_common rrc_nr_asn1 asn1_utils pthread)\n")
         changed = True
     if changed:
         cmake.write_text(cmake_text)

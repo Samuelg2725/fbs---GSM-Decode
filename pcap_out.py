@@ -88,6 +88,41 @@ class PcapWriter(object):
             pass
 
 
+class NRPcapWriter(object):
+    """5G NR RRC messages (MIB, SIB1) for Wireshark. GSMTAP has no NR type, so this uses Wireshark's own
+    "exported PDU" link type (252): each packet names the NR RRC dissector to use (nr-rrc.bcch.bch,
+    nr-rrc.bcch.dl.sch) and Wireshark decodes it with that, as if it had captured it itself."""
+
+    def __init__(self, path):
+        self.path = os.path.expanduser(path)
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        self.fh = open(self.path, "wb")
+        self.fh.write(struct.pack("<IHHiIII", 0xa1b2c3d4, 2, 4, 0, 0, 65535, 252))
+        self.fh.flush()
+        self.count = 0
+        self.lock = threading.Lock()
+
+    def nr_rrc(self, dissector, payload, ts=None):
+        if not payload:
+            return
+        name = dissector.encode()
+        padded = name + b"\0" * (-len(name) % 4)
+        # tag 12 = protocol (dissector) name, tag 0 = end of tags
+        frame = struct.pack(">HH", 12, len(name)) + padded + struct.pack(">HH", 0, 0) + bytes(payload)
+        ts = time.time() if ts is None else ts
+        sec = int(ts)
+        with self.lock:
+            self.fh.write(struct.pack("<IIII", sec, int((ts - sec) * 1e6), len(frame), len(frame)) + frame)
+            self.fh.flush()
+            self.count += 1
+
+    def close(self):
+        try:
+            self.fh.close()
+        except OSError:
+            pass
+
+
 def mib_sfn(payload):
     """System frame number in a MIB (3 bytes): bandwidth 3 bits, PHICH 3 bits, then the SFN's top 8 bits."""
     if len(payload) < 3:
@@ -102,11 +137,11 @@ def add_args(ap):
     ap.add_argument("--no-pcap", action="store_true", help="do not write a pcap file")
 
 
-def open_from_args(args, tool):
-    """PcapWriter for the tool's --pcap / --no-pcap options, or None."""
+def open_from_args(args, tool, nr=False):
+    """PcapWriter (NRPcapWriter with nr=True) for the tool's --pcap / --no-pcap options, or None."""
     if getattr(args, "no_pcap", False):
         return None
-    return PcapWriter(args.pcap or default_path(tool))
+    return (NRPcapWriter if nr else PcapWriter)(args.pcap or default_path(tool))
 
 
 def report(writer):
