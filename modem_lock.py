@@ -14,8 +14,8 @@ With --cells the result is a check of each cell's identity by a second, independ
 Cell ID column with what lte_decode.py decoded for the same EARFCN:PCI (shown in the SDR column).
 
 Without a SIM the modem does not measure other cells, so it reports one cell per lock: use --cells to visit each
-PCI the SDR found. If the modem does not camp within --secs, it is restarted (AT+RESET, about 30 s) and locked
-again once. At the end the lock is removed and the modem restarted, so it is back to normal (--keep-lock skips
+PCI the SDR found. If the modem does not camp within --secs the target is reported as not camped (the cell is
+not there or too weak; --restart-retry restarts the modem and tries once more). At the end the lock is removed and the modem restarted, so it is back to normal (--keep-lock skips
 that). Results: ~/field/modem_lock.csv; raw answers in ~/field/modem_scan_raw.txt.
 """
 import argparse
@@ -133,7 +133,10 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--earfcn", type=int, nargs="+", help="LTE carriers to lock to")
     ap.add_argument("--cells", nargs="+", metavar="EARFCN:PCI,PCI", help="exact cells to lock to")
-    ap.add_argument("--secs", type=float, default=30, help="seconds to wait for the modem to camp (default 30)")
+    ap.add_argument("--secs", type=float, default=15,
+                    help="seconds to wait for the modem to camp (default 15; a cell that is there camps in a few)")
+    ap.add_argument("--restart-retry", action="store_true",
+                    help="if the modem does not camp, restart it and try once more (slow, rarely helps)")
     ap.add_argument("--port", help="modem AT port (default: find it)")
     ap.add_argument("--keep-lock", action="store_true", help="leave the modem locked at the end")
     ap.add_argument("--no-netscan", action="store_true", help="skip the band scan that matches Cell IDs to PCIs")
@@ -155,7 +158,7 @@ def main():
             if not lock(fd, earfcn, pci, args.raw):
                 C.warn("  the modem refused the lock (see --raw)")
             cell = wait_camp(fd, label, args.secs, args.raw)
-            if cell is None:
+            if cell is None and args.restart_retry:
                 C.info("  the modem has not camped - restarting it and locking again")
                 fd = restart(fd, port)
                 lock(fd, earfcn, pci, args.raw)
