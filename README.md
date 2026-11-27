@@ -145,17 +145,23 @@ UK carriers seen during testing (EARFCN → MHz): 6175 → 793.5, 6225 → 798.5
 
 ## pcap files
 
-Every tool writes the messages it decodes to `~/field/pcap/<tool>_<date>_<time>.pcap` (`--pcap FILE` to choose
+Every tool writes the messages it decodes to `~/field/pcap/<tool>_<date>_<time>.pcapng` (`--pcap FILE` to choose
 the name, `--no-pcap` to turn it off). Messages are stored as GSMTAP (UDP port 4729), which Wireshark decodes:
 
 - **GSM:** every message gr-gsm decodes - System Information 1-4, 2bis/2ter/2quater, paging and other BCCH/CCCH
   messages. With two antennas the GSMTAP antenna field says which receiver decoded it (0 = RX1, 1 = RX2).
-- **LTE:** the MIB (LTE RRC BCCH-BCH) and SIB1 (BCCH-DL-SCH) of every decoded cell, with the EARFCN in the
-  GSMTAP ARFCN field and the PCI in the frame-number field.
+- **LTE:** the MIB (LTE RRC BCCH-BCH) and SIB1 (BCCH-DL-SCH) of every decoded cell. ARFCN field = EARFCN,
+  frame number = the LTE SFN, UDP source port = 10000 + PCI.
+
+**Time:** every packet carries its on-air time (when the cell sent it, not when it was decoded), and the
+packets are in time order. Each packet also has a comment spelling it out, for example
+`2026-11-27 13:15:51.123456 UTC | LTE EARFCN 6300 | PCI 21 | SIB | SFN 244 | SIB1 | Cell ID 4968724 | TAC 57379 |
+Vodafone 234-15`. In Wireshark: the comment is under "Packet comments" (right-click it > Apply as Column to have
+it in the list); for clock times in the Time column use View > Time Display Format > UTC Date and Time of Day.
 
 ```bash
-wireshark ~/field/pcap/lte_20261126_103300.pcap
-tshark -r ~/field/pcap/gsm_scan_20261126_103300.pcap -V | less
+wireshark ~/field/pcap/lte_20261126_103300.pcapng
+tshark -r ~/field/pcap/gsm_scan_20261126_103300.pcapng -V | less
 ```
 
 The LTE bytes come from the srsRAN patch: after updating the repository, re-run the patch and rebuild srsRAN

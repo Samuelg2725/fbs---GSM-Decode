@@ -30,34 +30,67 @@ LTE_RRC_BCCH_DL_SCH = 5        # SIB1 and the other system information blocks
 def default_path(tool):
     folder = os.path.expanduser("~/field/pcap")
     os.makedirs(folder, exist_ok=True)
-    return os.path.join(folder, "%s_%s.pcap" % (tool, time.strftime("%Y%m%d_%H%M%S")))
+    return os.path.join(folder, "%s_%s.pcapng" % (tool, time.strftime("%Y%m%d_%H%M%S")))
+
+
+def utc_text(ts):
+    """'2026-11-27 13:15:51.123456 UTC' for a packet comment."""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts)) + (".%06d UTC" % int(round((ts % 1) * 1e6) % 1000000))
 
 
 class PcapWriter(object):
-    """Appends packets to a pcap file (Ethernet link type). Safe to call from several threads."""
+    """Writes packets to a pcapng file (Ethernet link type), in time order, each with a comment that spells out
+    when it was on air and what it is (shown by Wireshark under "Packet comments", and as a column with
+    right-click > Apply as Column). Safe to call from several threads.
 
-    def __init__(self, path):
+    Packets are kept until flush() (or close()), then written sorted by their on-air time: decoding finishes
+    cell by cell, so without this a later-decoded cell's earlier messages would appear after later ones."""
+
+    def __init__(self, path, buffered=True):
         self.path = os.path.expanduser(path)
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         self.fh = open(self.path, "wb")
-        # pcap global header: magic, version 2.4, timezone 0, accuracy 0, snap length, link type 1 (Ethernet)
-        self.fh.write(struct.pack("<IHHiIII", 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1))
+        # Section Header Block (byte order magic, version 1.0, section length unknown)
+        shb = struct.pack("<IHHq", 0x1A2B3C4D, 1, 0, -1)
+        self.fh.write(struct.pack("<II", 0x0A0D0D0A, 12 + len(shb)) + shb + struct.pack("<I", 12 + len(shb)))
+        # Interface Description Block: Ethernet, timestamps in microseconds (the default)
+        idb = struct.pack("<HHI", 1, 0, 65535)
+        self.fh.write(struct.pack("<II", 1, 12 + len(idb)) + idb + struct.pack("<I", 12 + len(idb)))
         self.fh.flush()
         self.count = 0
         self.lock = threading.Lock()
+        self.buffered = buffered
+        self.pending = []
 
-    def _packet(self, gsmtap, ts=None, sport=GSMTAP_PORT):
+    def _packet(self, gsmtap, ts=None, sport=GSMTAP_PORT, comment=None):
         ts = time.time() if ts is None else ts
         udp = struct.pack(">HHHH", sport, GSMTAP_PORT, 8 + len(gsmtap), 0) + gsmtap
         ip = struct.pack(">BBHHHBBH4s4s", 0x45, 0, 20 + len(udp), 0, 0x4000, 64, 17, 0,
                          bytes([127, 0, 0, 1]), bytes([127, 0, 0, 1]))
         ip = ip[:10] + struct.pack(">H", _ip_checksum(ip)) + ip[12:]
         frame = b"\x00" * 12 + b"\x08\x00" + ip + udp
-        sec = int(ts)
+        text = utc_text(ts) + (" | " + comment if comment else "")
         with self.lock:
-            self.fh.write(struct.pack("<IIII", sec, int((ts - sec) * 1e6), len(frame), len(frame)) + frame)
-            self.fh.flush()
+            self.pending.append((ts, len(self.pending) + self.count, frame, text))
+            if not self.buffered or len(self.pending) >= 2000:
+                self._write_pending()
+
+    def _write_pending(self):
+        for ts, _n, frame, text in sorted(self.pending, key=lambda p: (p[0], p[1])):
+            us = int(round(ts * 1e6))
+            data = frame + b"\0" * (-len(frame) % 4)
+            c = text.encode("utf-8")
+            opts = struct.pack("<HH", 1, len(c)) + c + b"\0" * (-len(c) % 4) + struct.pack("<HH", 0, 0)
+            body = struct.pack("<IIIII", 0, us >> 32, us & 0xffffffff, len(frame), len(frame)) + data + opts
+            self.fh.write(struct.pack("<II", 6, 12 + len(body)) + body + struct.pack("<I", 12 + len(body)))
             self.count += 1
+        self.pending = []
+        self.fh.flush()
+
+    def flush(self):
+        """Write the packets kept so far, in time order (call when a recording has been fully decoded)."""
+        with self.lock:
+            self._write_pending()
 
     def gsm(self, blob, antenna=0, ts=None):
         """A gr-gsm message (GSMTAP header + GSM frame). antenna: 0 = RX1, 1 = RX2."""
@@ -66,9 +99,12 @@ class PcapWriter(object):
         blob = bytearray(blob)
         if antenna:
             blob[13] = antenna & 0xff                   # GSMTAP antenna number
-        self._packet(bytes(blob), ts)
+        arfcn = ((blob[4] << 8) | blob[5]) & 0x3fff
+        fn = int.from_bytes(bytes(blob[8:12]), "big")
+        self._packet(bytes(blob), ts, comment="GSM ARFCN %d | frame %d%s" % (arfcn, fn,
+                                                                           " | RX2" if antenna else ""))
 
-    def lte_rrc(self, subtype, payload, earfcn=0, pci=0, ts=None, sfn=None):
+    def lte_rrc(self, subtype, payload, earfcn=0, pci=0, ts=None, sfn=None, note=None):
         """An LTE RRC message: subtype LTE_RRC_BCCH_BCH (MIB) or LTE_RRC_BCCH_DL_SCH (SIBs).
         ts: when it was on air; sfn: its system frame number (for a MIB it is read from the MIB itself)."""
         if not payload:
@@ -79,10 +115,15 @@ class PcapWriter(object):
         # signal dBm, SNR dB, frame number, sub type, antenna, sub slot, reserved
         hdr = struct.pack(">BBBBHbbIBBBB", 2, 4, GSMTAP_TYPE_LTE_RRC, 0, int(earfcn or 0) & 0x3fff, 0, 0,
                           int(sfn or 0) & 0x3ff, subtype, 0, 0, 0)
-        self._packet(hdr + bytes(payload), ts, sport=10000 + int(pci or 0))
+        what = "MIB" if subtype == LTE_RRC_BCCH_BCH else "SIB"
+        comment = "LTE EARFCN %d | PCI %d | %s | SFN %s%s" % (int(earfcn or 0), int(pci or 0), what,
+                                                            "?" if sfn is None else sfn, " | " + note if note else "")
+        self._packet(hdr + bytes(payload), ts, sport=10000 + int(pci or 0), comment=comment)
 
     def close(self):
         try:
+            with self.lock:
+                self._write_pending()
             self.fh.close()
         except OSError:
             pass
@@ -149,6 +190,9 @@ def report(writer):
         import common as C
         writer.close()
         C.info("%d decoded message(s) saved to %s (open with Wireshark)" % (writer.count, writer.path))
+        if writer.count:
+            C.info("Wireshark: each packet's comment gives its UTC time, channel and cell. For clock times in the "
+                   "Time column: View > Time Display Format > UTC Date and Time of Day")
 
 
 def _ip_checksum(header):
@@ -160,7 +204,8 @@ def _ip_checksum(header):
 
 if __name__ == "__main__":
     # self-check: a file with one LTE MIB and one GSM-looking packet
-    w = PcapWriter("/tmp/pcap_out_selftest.pcap")
-    w.lte_rrc(LTE_RRC_BCCH_BCH, bytes.fromhex("a8f080"), earfcn=6300, pci=430)
+    w = PcapWriter("/tmp/pcap_out_selftest.pcapng")
+    w.lte_rrc(LTE_RRC_BCCH_BCH, bytes.fromhex("a8f080"), earfcn=6300, pci=430, ts=time.time() + 1)
+    w.lte_rrc(LTE_RRC_BCCH_BCH, bytes.fromhex("a8f480"), earfcn=6300, pci=21, ts=time.time())
     w.close()
     print("wrote %d packet(s) to %s" % (w.count, w.path))

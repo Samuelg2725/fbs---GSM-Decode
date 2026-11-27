@@ -848,8 +848,11 @@ def write_pcap(args, pci, rate, out, pdus):
             n_bch += 1
         else:
             sfn = None if sfn0 is None else (sfn0 + 2 * n_sch) & 0x3ff
+            x = out.get("ident") or {}
+            note = ("SIB1 | Cell ID %d | TAC %d | %s %s-%s" % (x["cell_id"], x["tac"], x.get("operator") or "?",
+                                                              x["mcc"], x["mnc"])) if x else None
             PCAP[0].lte_rrc(pcap_out.LTE_RRC_BCCH_DL_SCH, data, earfcn=earfcn, pci=pci,
-                            ts=t0 + 0.005 + 0.020 * n_sch, sfn=sfn)
+                            ts=t0 + 0.005 + 0.020 * n_sch, sfn=sfn, note=note)
             n_sch += 1
 
 
@@ -1093,6 +1096,8 @@ def decode_carrier(args, freq_mhz):
     if not results:
         rows.append({"mhz": freq_mhz, "earfcn": earfcn, "band": band, "pci": None, "status": "no LTE cell found"})
     C.info("  carrier done in %.1f s" % (time.time() - t0))
+    if PCAP[0] is not None:
+        PCAP[0].flush()                          # this recording's messages, in on-air order
     return rows
 
 

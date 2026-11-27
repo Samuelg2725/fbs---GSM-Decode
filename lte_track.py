@@ -368,6 +368,8 @@ def track(args):
                     args.iq_dir, "none": "not saved"}[args.save_iq]))
     try:
         while args.cycles == 0 or cycles < args.cycles:
+            if L.PCAP[0] is not None:
+                L.PCAP[0].flush()                # last cycle's messages, in on-air order
             cycles += 1
             t0 = time.time()
             full = cycles == 1 or args.save_iq == "all" or work_due(args, cells, cycles)
