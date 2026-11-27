@@ -240,7 +240,7 @@ def correlate(band):
         p = 0
         for s in band.spec:
             p = p + np.abs(np.fft.ifft(s * _TPL[key])) ** 2
-        out.append((nid2, p / den))
+        out.append((nid2, p / den, p))
     return out
 
 
@@ -331,9 +331,23 @@ def search_at(x_list, fc, b, targets, args):
             continue
         band = Band(spectra, nx, off, b["scs"])
         sym = band.nfft + int(round(band.nfft * 144 / 2048))
-        for nid2, p in correlate(band):
-            for t, ratio in find_peaks(p, args.pss_min, sym):
+        for nid2, p_local, p_raw in correlate(band):
+            # two measures, either can find a cell: against the signal level at that moment (no false peaks from
+            # bursty TDD traffic) and against the recording's average (strong cells inside busy FDD carriers)
+            peaks = find_peaks(p_local, args.pss_min, sym, max_peaks=16)
+            for t, ratio in find_peaks(p_raw, args.pss_min, sym, max_peaks=8):
+                if all(abs(t - u) > sym for u, _ in peaks):
+                    peaks.append((t, ratio))
+            for t, ratio in peaks:
                 found.append(dict(gscn=g, mhz=f / 1e6, band=band, nid2=nid2, t=t, ratio=ratio))
+    if getattr(args, "debug", False):
+        best = {}
+        for c in found:
+            k = (c["gscn"], c["nid2"])
+            best[k] = max(best.get(k, 0), c["ratio"])
+        top = sorted(best.items(), key=lambda kv: -kv[1])[:6]
+        C.info("    debug %.1f MHz: %d peaks; strongest: %s" % (fc / 1e6, len(found), ", ".join(
+            "%.2f MHz N_ID2 %d %.0f" % (gscn_to_mhz(g) if g else fc / 1e6, n2, r) for (g, n2), r in top)))
     return found
 
 
@@ -353,9 +367,14 @@ def check_candidates(cands, args, b):
         return []
     path = write_cf32(items)
     try:
-        text = run_helper(["mib", path, b["lmax"], b["scs"]] + [m["pci"] for m in meta])
+        text = run_helper(["mib", path, b["lmax"], b["scs"]] + [m["pci"] for m in meta],
+                          timeout=60 + 0.05 * len(meta))
     finally:
-        os.unlink(path)
+        if os.path.exists(path):
+            os.unlink(path)
+    if getattr(args, "debug", False):
+        C.info("    debug MIB check: %d candidate blocks, %d MIBs decoded%s" % (
+            len(meta), len(MIB_RE.findall(text)), "" if text else " (helper gave no answer)"))
     cells = {}
     for m in MIB_RE.finditer(text):
         i = int(m.group(1))
@@ -619,8 +638,8 @@ def search_offraster(x_list, fc, b, args):
     band = Band(spectra, nx, 0.0, b["scs"])
     sym = band.nfft + int(round(band.nfft * 144 / 2048))
     out = []
-    for nid2, p in correlate(band):
-        for t, ratio in find_peaks(p, args.pss_min, sym):
+    for nid2, p_local, p_raw in correlate(band):
+        for t, ratio in find_peaks(p_local, args.pss_min, sym) + find_peaks(p_raw, args.pss_min, sym, max_peaks=8):
             out.append(dict(gscn=0, mhz=fc / 1e6, band=band, nid2=nid2, t=t, ratio=ratio))
     return out
 
@@ -713,6 +732,7 @@ def main():
     ap.add_argument("--csv", default="~/field/nr_cells.csv", help="CSV file results are added to ('' = none)")
     ap.add_argument("--selftest", action="store_true", help="decode synthetic 5G cells (no radio needed)")
     pcap_out.add_args(ap)
+    ap.add_argument("--debug", action="store_true", help="show the sync peaks and MIB checks of every recording")
     ap.add_argument("--no-color", action="store_true", help="plain text output")
     args = ap.parse_args()
     if args.no_color:
