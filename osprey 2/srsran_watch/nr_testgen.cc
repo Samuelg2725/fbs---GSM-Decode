@@ -242,14 +242,15 @@ int main(int argc, char** argv)
     }
   }
   srsran_sch_cfg_nr_t pdsch_cfg = {};
-  uint32_t            len_rb    = nrb / 2;
+  uint32_t            len_rb    = has_rvd ? 4 : nrb / 2;
   bool                ok        = false;
   for (; len_rb <= nrb && !ok; len_rb++) {    // smallest allocation whose transport block holds the SIB1
+    // with sync blocks in the slot the SIB1 goes beside them (below their resource blocks), as gNBs do
+    if (has_rvd && len_rb > ssb_rvd.rb_begin) {
+      break;
+    }
     dci.freq_domain_assigment = srsran_ra_nr_type1_riv(nrb, 0, len_rb);
     pdsch_cfg                 = {};
-    if (has_rvd) { // SS/PBCH REs are not used by the PDSCH (also counted in the allocation)
-      srsran_re_pattern_merge(&pdsch_cfg.rvd_re, &ssb_rvd);
-    }
     if (srsran_ra_dl_dci_to_grant_nr(&carrier, &slot, &hl, &dci, &pdsch_cfg, &pdsch_cfg.grant) < SRSRAN_SUCCESS) {
       fprintf(stderr, "grant\n");
       return 1;

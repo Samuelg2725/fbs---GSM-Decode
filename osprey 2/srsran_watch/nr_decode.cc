@@ -340,44 +340,56 @@ static int cmd_sib1(int argc, char** argv)
     if (n < 1) {
       continue;
     }
+    // First as scheduled; then, if the slot has SS/PBCH blocks, with their REs taken out of the PDSCH (TS 38.214
+    // 5.1.4; gNBs usually schedule SIB1 beside the blocks instead, which the first try covers)
     srsran_sch_cfg_nr_t pdsch_cfg = {};
-    // SS/PBCH block REs are not used by the PDSCH (TS 38.214 5.1.4); set before the allocation is worked out
-    if (slots[i].nrb > 0 && slots[i].mask != 0) {
-      srsran_re_pattern_t p = {};
-      p.rb_begin            = slots[i].rb0;
-      p.rb_end              = SRSRAN_MIN(slots[i].rb0 + slots[i].nrb, nrb);
-      p.rb_stride           = 1;
-      for (uint32_t k = 0; k < SRSRAN_NRE; k++) {
-        p.sc[k] = true;
+    bool                decoded   = false;
+    bool                shown     = false;
+    for (int attempt = 0; attempt < 2 && !decoded; attempt++) {
+      pdsch_cfg = {};
+      if (attempt == 1) {
+        if (slots[i].nrb == 0 || slots[i].mask == 0) {
+          break;
+        }
+        srsran_re_pattern_t p = {};
+        p.rb_begin            = slots[i].rb0;
+        p.rb_end              = SRSRAN_MIN(slots[i].rb0 + slots[i].nrb, nrb);
+        p.rb_stride           = 1;
+        for (uint32_t k = 0; k < SRSRAN_NRE; k++) {
+          p.sc[k] = true;
+        }
+        for (uint32_t l = 0; l < SRSRAN_NSYMB_PER_SLOT_NR; l++) {
+          p.symbol[l] = (slots[i].mask >> l) & 1U;
+        }
+        srsran_re_pattern_merge(&pdsch_cfg.rvd_re, &p);
       }
-      for (uint32_t l = 0; l < SRSRAN_NSYMB_PER_SLOT_NR; l++) {
-        p.symbol[l] = (slots[i].mask >> l) & 1U;
+      if (srsran_ra_dl_dci_to_grant_nr(&carrier, &slot, &hl, &dci, &pdsch_cfg, &pdsch_cfg.grant) < SRSRAN_SUCCESS) {
+        continue;
       }
-      srsran_re_pattern_merge(&pdsch_cfg.rvd_re, &p);
+      if (!shown) {
+        uint32_t nof_rb = 0;
+        for (uint32_t k = 0; k < SRSRAN_MAX_PRB_NR; k++) {
+          nof_rb += pdsch_cfg.grant.prb_idx[k] ? 1 : 0;
+        }
+        printf("DCI slot=%u L=%u ncce=%u mcs=%u rv=%u rbs=%u symbols=%u+%u tbs=%u\n",
+               slot.idx,
+               dci.ctx.location.L,
+               dci.ctx.location.ncce,
+               dci.mcs,
+               dci.rv,
+               nof_rb,
+               pdsch_cfg.grant.S,
+               pdsch_cfg.grant.L,
+               pdsch_cfg.grant.tb[0].tbs);
+        shown = true;
+      }
+      srsran_softbuffer_rx_reset(&softbuffer);
+      pdsch_cfg.grant.tb[0].softbuffer.rx = &softbuffer;
+      srsran_pdsch_res_nr_t res           = {};
+      res.tb[0].payload                   = data;
+      decoded = srsran_ue_dl_nr_decode_pdsch(&ue_dl, &slot, &pdsch_cfg, &res) == SRSRAN_SUCCESS && res.tb[0].crc;
     }
-    if (srsran_ra_dl_dci_to_grant_nr(&carrier, &slot, &hl, &dci, &pdsch_cfg, &pdsch_cfg.grant) < SRSRAN_SUCCESS) {
-      printf("DCI slot=%u grant-error\n", slot.idx);
-      continue;
-    }
-    uint32_t nof_rb = 0;
-    for (uint32_t k = 0; k < SRSRAN_MAX_PRB_NR; k++) {
-      nof_rb += pdsch_cfg.grant.prb_idx[k] ? 1 : 0;
-    }
-    printf("DCI slot=%u L=%u ncce=%u mcs=%u rv=%u rbs=%u symbols=%u+%u tbs=%u\n",
-           slot.idx,
-           dci.ctx.location.L,
-           dci.ctx.location.ncce,
-           dci.mcs,
-           dci.rv,
-           nof_rb,
-           pdsch_cfg.grant.S,
-           pdsch_cfg.grant.L,
-           pdsch_cfg.grant.tb[0].tbs);
-    srsran_softbuffer_rx_reset(&softbuffer);
-    pdsch_cfg.grant.tb[0].softbuffer.rx = &softbuffer;
-    srsran_pdsch_res_nr_t res           = {};
-    res.tb[0].payload                   = data;
-    if (srsran_ue_dl_nr_decode_pdsch(&ue_dl, &slot, &pdsch_cfg, &res) < SRSRAN_SUCCESS || !res.tb[0].crc) {
+    if (!decoded) {
       printf("PDSCH slot=%u crc=KO\n", slot.idx);
       fflush(stdout);
       continue;

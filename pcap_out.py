@@ -147,9 +147,8 @@ class NRPcapWriter(object):
         if not payload:
             return
         name = dissector.encode()
-        padded = name + b"\0" * (-len(name) % 4)
-        # tag 12 = protocol (dissector) name, tag 0 = end of tags
-        frame = struct.pack(">HH", 12, len(name)) + padded + struct.pack(">HH", 0, 0) + bytes(payload)
+        # tag 12 = protocol (dissector) name (Wireshark reads exactly its length: no padding), tag 0 = end of tags
+        frame = struct.pack(">HH", 12, len(name)) + name + struct.pack(">HH", 0, 0) + bytes(payload)
         ts = time.time() if ts is None else ts
         sec = int(ts)
         with self.lock:

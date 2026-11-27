@@ -722,15 +722,20 @@ def selftest(args):
          [(77, 7880, 30, 0, 100, 0, 0, "10", 8, 300.0, 8, 6)]),
         ("n28: 15 kHz FDD cell", "n28",
          [(301, 1950, 4, 8, 222, 987654321, 50496, "10", 6, 800.0, 4, 3)]),
+        ("n78: SIB1 in a slot with two sync blocks (PDSCH around them)", "n78",
+         [(222, 7895, 0, 12, 300, 1234567, 4242, "30", 8, 700.0, 8, 1)]),
+        ("n78: both antennas, weak cell, RX1 much weaker", "n78",
+         [(509, 7870, 4, 13, 900, 34359738367, 1, "15", -5, -900.0, 8, 6)], (0.35, 1.0 * np.exp(1.2j))),
     ]
-    for name, band_name, cells in tests:
+    for test in tests:
+        name, band_name, cells = test[:3]
+        gains = test[3] if len(test) > 3 else (1.0,)
         b = BANDS[band_name]
         fc = gscn_to_mhz(cells[0][1]) * 1e6 + 3.3e6
-        x = synth(gen, tmp, b, fc, cells, rng)
-        args.dual, args.pss_min, args.no_sib1 = False, 10.0, False
+        x_list = synth(gen, tmp, b, fc, cells, rng, gains=gains)
+        args.dual, args.pss_min, args.no_sib1 = len(x_list) > 1, 10.0, False
         C.heading("Self-test: %s" % name)
-        found = scan_band(args, band_name, None, signal=lambda f, x=x: [x]) if False else \
-            selftest_scan(args, band_name, fc, [x])
+        found = selftest_scan(args, band_name, fc, x_list)
         for spec in cells:
             pci, nci = spec[0], spec[5]
             got = next((c for c in found if c["pci"] == pci), None)
@@ -758,8 +763,9 @@ def selftest_scan(args, band_name, fc, x_list):
     return found
 
 
-def synth(gen, tmp, b, fc, cells, rng, secs=0.045):
-    """A recording centred at fc holding the given cells: SS/PBCH bursts every 20 ms and SIB1 every 20 ms."""
+def synth(gen, tmp, b, fc, cells, rng, secs=0.045, gains=(1.0,)):
+    """A recording centred at fc holding the given cells: SS/PBCH bursts every 20 ms and SIB1 every 20 ms.
+    One signal per antenna gain given (each antenna: the cells times its gain, plus its own noise)."""
     nsamp = int(FS * secs)
     x = np.zeros(nsamp, complex)
     scs_ssb = b["scs"] * 1e3
@@ -774,14 +780,25 @@ def synth(gen, tmp, b, fc, cells, rng, secs=0.045):
         table = CORESET0[(b["scs"], b["scs"])]
         entry = table[c0] if kssb <= 23 else (48, 1, 0)
         nrb, nsym = entry[0], entry[1]
+        f_ssb = gscn_to_mhz(gscn) * 1e6
+        extra = []
+        if kssb <= 23:                              # sync blocks in the SIB1 slot: the PDSCH goes around them
+            cell0 = dict(mhz=f_ssb / 1e6, mib=dict(kssb=kssb, coreset0=c0, scs_common=b["scs"]))
+            k0 = (f_ssb - 120 * scs_ssb - coreset0_layouts(cell0, b)[0][0]) / scs_ssb
+            mask = 0
+            for i in range(beams):
+                if lfirst[i] // 14 == sib1_slot:
+                    mask |= 0xF << (lfirst[i] % 14)
+            if mask:
+                rb0 = int(np.floor(k0 / 12))
+                extra = [rb0, int(np.ceil((k0 + 240) / 12)) - rb0, "%x" % mask]
         r = subprocess.run([str(a) for a in (gen, out, pci, b["scs"], b["lmax"], sfn, kssb, c0, 0, 2, nrb, nsym,
-                                             sib1_slot, nci, tac, "234", mnc)],
+                                             sib1_slot, nci, tac, "234", mnc)] + [str(e) for e in extra],
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if r.returncode:
             sys.exit("nr_testgen failed: %s" % r.stdout.decode())
         ssb = np.fromfile(out + "_ssb.cf32", np.complex64).reshape(b["lmax"], 4, 240)
         slot = np.fromfile(out + "_slot.cf32", np.complex64).reshape(14, nrb * 12)
-        f_ssb = gscn_to_mhz(gscn) * 1e6
         amp = 1.0
         sig = np.zeros(nsamp, complex)
 
@@ -821,8 +838,11 @@ def synth(gen, tmp, b, fc, cells, rng, secs=0.045):
         sig *= np.exp(2j * np.pi * cfo * np.arange(nsamp) / FS)
         x += sig
         noise_p = max(noise_p, 10 ** (-snr_db / 10))
-    x += np.sqrt(max(noise_p, 1e-3) / 2) * (rng.standard_normal(nsamp) + 1j * rng.standard_normal(nsamp))
-    return (x / 4).astype(np.complex64)
+    out = []
+    for g in gains:
+        noise = np.sqrt(max(noise_p, 1e-3) / 2) * (rng.standard_normal(nsamp) + 1j * rng.standard_normal(nsamp))
+        out.append(((g * x + noise) / 4).astype(np.complex64))
+    return out
 
 
 if __name__ == "__main__":
