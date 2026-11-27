@@ -155,7 +155,9 @@ def main():
                 per_tech.setdefault(tech, [0.0, 0])
                 per_tech[tech][0] += total
                 per_tech[tech][1] += len(cells)
-                if err:
+                # the modem sometimes ends a scan that found cells with ERROR instead of OK: the cells count
+                answered = cells or any("^NETSCAN" in l for _, l in lines)
+                if err and not answered:
                     why = ("band not supported by the modem" if "50" in err else
                            "nothing found (the modem gave up after %.0f s)" % total if total > 30 else err)
                     print("  %-24s %6.1f s   %s" % (label, total, C.c(why, "grey")), flush=True)
@@ -176,7 +178,8 @@ def main():
             C.heading("Everything at once (AT^NETSCAN=3, all technologies, all bands)")
             lines, total, err = timed_scan(fd, 3, None, args.timeout)
             cells = cells_from(lines)
-            print("  all technologies       %6.1f s   %s" % (total, err or "%d cells" % len(cells)), flush=True)
+            print("  all technologies       %6.1f s   %s" % (total, "%d cells" % len(cells) if cells else err or "0 cells"),
+                  flush=True)
             for c in cells:
                 op, chan, ident, level = describe(c)
                 print("      at %5.1f s  %s  %-9s %s  %s" % (c["t"], c["tech"], C.c(*C.op_cell(op)), ident, level),
@@ -184,7 +187,7 @@ def main():
             summary.add(["all", "everything at once", "%.1f" % total,
                          "%.1f" % min(c["t"] for c in cells) if cells else "-", len(cells),
                          ", ".join(sorted({describe(c)[0] for c in cells})) or "-",
-                         (err, "red") if err else ("found cells", "green") if cells else ("nothing found", "yellow")])
+                         ("found cells", "green") if cells else (err, "red") if err else ("nothing found", "yellow")])
     except KeyboardInterrupt:
         print("")
         C.clear_status()
