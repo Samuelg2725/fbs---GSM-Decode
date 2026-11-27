@@ -236,6 +236,9 @@ At the end it prints the `lte_decode.py --cells ...` command for the cells the S
     sudo python3 modem_scan.py --rat all       # LTE + GSM
     sudo python3 modem_scan.py --sdr           # then the SDR decodes the same cells, and the two are compared
 
+`sudo python3 modem_lock.py --earfcn 6300 76` locks the modem to each EARFCN in turn and lists every PCI it
+measures there (about 1 minute per EARFCN; the modem is restarted at the end to undo the lock).
+
 `modem_probe.py --cmd 'AT...'` sends any single AT command. Other useful ALA440 commands:
 `AT^CELLINFO=1` (serving cell), `AT^CELLINFO=2` (neighbour cells with PCI and RSRP),
 `AT^CELLLOCK=1,3,1,<earfcn>,<pci>` (lock onto one cell; set it in flight mode `AT+CFUN=0`, then `AT+CFUN=1`;
