@@ -57,7 +57,7 @@ fi
 python3 "$REPO/osprey 2/srsran_watch/print_sib1.py"
 mkdir -p "$HOME/srsRAN_4G/build" && cd "$HOME/srsRAN_4G/build"
 cmake .. >/dev/null
-make -j"$JOBS" pdsch_ue sib1_regen
+make -j"$JOBS" pdsch_ue sib1_regen nr_decode nr_testgen
 cd "$REPO"
 
 step "6/6 Checks"

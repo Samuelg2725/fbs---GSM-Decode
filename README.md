@@ -201,13 +201,13 @@ once (setup step 3).
    sudo apt install -y build-essential cmake libfftw3-dev libmbedtls-dev libboost-program-options-dev libconfig++-dev libsctp-dev
    cd ~ && git clone --depth 1 https://github.com/srsran/srsRAN_4G.git
    python3 ~/fbs-upload/"osprey 2"/srsran_watch/print_sib1.py
-   mkdir -p ~/srsRAN_4G/build && cd ~/srsRAN_4G/build && cmake .. && make -j3 pdsch_ue sib1_regen
+   mkdir -p ~/srsRAN_4G/build && cd ~/srsRAN_4G/build && cmake .. && make -j3 pdsch_ue sib1_regen nr_decode nr_testgen
    ```
    The patch makes srsRAN print the decoded cell identity and the raw MIB / SIB bytes (for the pcap files), adds
    SIB1 combining and the PHICH fix, and builds the `sib1_regen` helper used by interference cancellation.
    Re-run these whenever anything in `osprey 2/srsran_watch` changes:
    ```bash
-   python3 ~/fbs-upload/"osprey 2"/srsran_watch/print_sib1.py && cd ~/srsRAN_4G/build && cmake .. && make -j3 pdsch_ue sib1_regen
+   python3 ~/fbs-upload/"osprey 2"/srsran_watch/print_sib1.py && cd ~/srsRAN_4G/build && cmake .. && make -j3 pdsch_ue sib1_regen nr_decode nr_testgen
    ```
 4. Optional check that the fast LTE search gives the same answers as the original code:
    `python3 lte_fastsync.py` (ends with `OK`).
@@ -291,3 +291,27 @@ Each technology is scanned in full (all its bands in one command, which finds th
 repeated, because each modem scan is a snapshot and weak cells come and go. Every cell found in any round is kept,
 with how many rounds saw it and when it was first found; each scan is timed. `--per-band` adds the quick 4G
 band-by-band scans. Results: ~/field/modem_timing.csv.
+
+## 5G NR: `nr_decode.py`
+
+    python3 nr_decode.py                      # UK 5G bands n78 (3.3-3.8 GHz) and n28 (700 MHz)
+    python3 nr_decode.py --dual               # both antennas
+    python3 nr_decode.py --bands n78 n1 n3    # other bands: n78 n77 n40 n28 n20 n8 n3 n1 n7
+    python3 nr_decode.py --freq-mhz 3549.12   # one SSB frequency
+    python3 nr_decode.py --selftest           # synthetic 5G cells through the whole decoder (no radio)
+
+It records each band in 18.8 MHz steps (30.72 Msps, 55 ms), searches every sync-raster position (GSCN) for the
+5G sync signals, finds every PCI (several per frequency, every beam), decodes the MIB, and for standalone cells
+SIB1: NR Cell ID (NCI, 36 bits), TAC and operator. Non-standalone cells (5G added on top of 4G) broadcast no SIB1:
+their PCI, beams and signal are shown, but no Cell ID exists over the air for them.
+
+Results: table, `~/field/nr_cells.csv`, and `~/field/pcap/nr_<time>.pcap` (Wireshark decodes the MIB / SIB1 as
+NR RRC). The decoding runs in the `nr_decode` helper built with the srsRAN patch (setup step 3 builds it; after
+updating the repository run the rebuild command there). How it decodes:
+
+- Python does the radio side (search, timing, frequency offset, 5G symbol timing and the per-symbol phase 5G
+  transmitters add, both antennas); srsRAN decodes (PBCH, PDCCH, PDSCH, ASN.1). srsRAN's own 5G receiver assumes
+  4G symbol timing, which breaks 30 kHz (3.5 GHz) cells, and lacks the 3.5 GHz CORESET 0 table: both are handled
+  here.
+- Weak cells: SIB1 control-message candidates are not dropped by srsRAN's pilot gate (the checksum decides),
+  and SIB1 repeats are combined. Self-test: MIB down to -10 dB, SIB1 to about -8 dB (synthetic signals).

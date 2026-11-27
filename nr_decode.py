@@ -42,7 +42,10 @@ import lte_decode as L                               # noqa: E402  (radio, gain,
 import pcap_out                                      # noqa: E402
 
 FS = 30.72e6                                         # recording rate
-TUNE_STEP = 22e6                                     # band recordings overlap so every SSB is fully inside one
+# usable part of a recording: the radio's filter is 0.9 x the rate wide and the radio is tuned --low-if-mhz (0.6) above
+# the centre; an SS/PBCH block (7.2 MHz at 30 kHz, 3.6 MHz at 15 kHz) must lie fully inside, with 0.2 MHz to spare
+USABLE_HALF = 0.9 * 30.72e6 / 2 - 0.6e6 - 0.2e6       # 13.0 MHz either side of the centre, before the SSB's width
+TUNE_STEP = 2 * (USABLE_HALF - 3.6e6)                # 18.8 MHz: every 30 kHz SSB is fully inside one recording
 # band: SSB subcarrier spacing (kHz), SSB pattern case, max beams, GSCN range, duplex
 BANDS = {
     "n78": dict(scs=30, case="C", lmax=8, gscn=(7711, 8051), tdd=True),
@@ -310,7 +313,7 @@ def search_recording(x_list, fc, band_name, gscns, args, show):
     for g in gscns:
         f = gscn_to_mhz(g) * 1e6
         off = f - fc
-        if abs(off) > FS / 2 - (3.6e6 if b["scs"] == 30 else 1.8e6) - 0.3e6:
+        if abs(off) > USABLE_HALF - (3.6e6 if b["scs"] == 30 else 1.8e6):
             continue
         band = Band(spectra, nx, off, b["scs"])
         sym = band.nfft + int(round(band.nfft * 144 / 2048))
@@ -491,7 +494,8 @@ def tune_plan(band_name, freqs=None):
     lo, hi = gscn_to_mhz(b["gscn"][0]) * 1e6, gscn_to_mhz(b["gscn"][1]) * 1e6
     plan, fc = [], lo + TUNE_STEP / 2 - 1e6
     while fc - TUNE_STEP / 2 < hi:
-        gs = [g for g in range(b["gscn"][0], b["gscn"][1] + 1) if abs(gscn_to_mhz(g) * 1e6 - fc) <= TUNE_STEP / 2]
+        gs = [g for g in range(b["gscn"][0], b["gscn"][1] + 1)
+              if abs(gscn_to_mhz(g) * 1e6 - fc) <= USABLE_HALF - (3.6e6 if b["scs"] == 30 else 1.8e6)]
         if gs:
             plan.append((fc, gs))
         fc += TUNE_STEP
@@ -645,8 +649,9 @@ def main():
     ap.add_argument("--secs", type=float, default=0.055,
                     help="seconds recorded per step (default 0.055: the radio's first 10 ms are dropped, leaving "
                          "45 ms = two 20 ms sync bursts)")
-    ap.add_argument("--pss-min", type=float, default=10.0,
-                    help="sync peak threshold, x the average (default 10; lower finds weaker cells, slower)")
+    ap.add_argument("--pss-min", type=float, default=18.0,
+                    help="sync peak threshold, x the average (default 18: noise alone peaks at ~14, a cell whose MIB "
+                         "still decodes is at 40+; lower = more false peaks to check, slower)")
     ap.add_argument("--no-sib1", action="store_true", help="stop at the MIB (no Cell ID)")
     ap.add_argument("--loop", action="store_true", help="scan again and again (Ctrl-C to stop)")
     ap.add_argument("--low-if-mhz", type=float, default=0.6, help="radio tuned this far above (default 0.6)")
@@ -733,7 +738,7 @@ def selftest(args):
         b = BANDS[band_name]
         fc = gscn_to_mhz(cells[0][1]) * 1e6 + 3.3e6
         x_list = synth(gen, tmp, b, fc, cells, rng, gains=gains)
-        args.dual, args.pss_min, args.no_sib1 = len(x_list) > 1, 10.0, False
+        args.dual, args.pss_min, args.no_sib1 = len(x_list) > 1, 18.0, False
         C.heading("Self-test: %s" % name)
         found = selftest_scan(args, band_name, fc, x_list)
         for spec in cells:
