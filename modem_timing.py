@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Full 2G / 3G / 4G scan with the CALYX modem (ALA440), repeated for accuracy, with timings.
+"""Full 2G and 4G scan with the CALYX modem (ALA440), repeated for accuracy, with timings.
 
-  sudo python3 modem_timing.py                 # 2G, 3G and 4G, each a full scan, 3 rounds
+  sudo python3 modem_timing.py                 # 2G and 4G, each a full scan, 3 rounds
   sudo python3 modem_timing.py --rounds 5      # more rounds: weak cells that come and go are caught
-  sudo python3 modem_timing.py --rat 2g 4g     # only some technologies
+  sudo python3 modem_timing.py --rat 4g        # only one technology
   sudo python3 modem_timing.py --per-band      # 4G also band by band (fast but the modem checks less)
   sudo python3 modem_timing.py --3g-limit 0    # let the 3G scan run its full 60 s (default: cut off at 20 s)
 
@@ -32,10 +32,11 @@ import modem_scan as M                               # noqa: E402
 from modem_probe import open_port, command          # noqa: E402
 
 OUT = os.path.join(M.FIELD, "modem_timing.csv")
-FULL = [("2G", 0, "GSM, all bands (900 + 1800)"), ("3G", 1, "UMTS, all bands"), ("4G", 2, "LTE, all bands")]
-LTE_BANDS = [(20, "LTE 800 (band 20)"), (28, "LTE 700 (band 28)"), (8, "LTE 900 (band 8)"),
-             (3, "LTE 1800 (band 3)"), (1, "LTE 2100 (band 1)"), (7, "LTE 2600 (band 7)"),
-             (38, "LTE 2600 TDD (band 38)"), (40, "LTE 2300 TDD (band 40)")]
+# 3G is not scanned: UK 3G networks are switched off, and the modem only says so after waiting 60 s
+FULL = [("2G", 0, "2G (GSM 900 + 1800)"), ("4G", 2, "4G (LTE, all bands)")]
+LTE_BANDS = [(20, "4G band 20 (800)"), (28, "4G band 28 (700)"), (8, "4G band 8 (900)"),
+             (3, "4G band 3 (1800)"), (1, "4G band 1 (2100)"), (7, "4G band 7 (2600)"),
+             (38, "4G band 38 (2600 TDD)"), (40, "4G band 40 (2300 TDD)")]
 
 CELL_RE = re.compile(r'^\s*\d+\s*,\s*"?(2G|3G|4G)"?\s*,(.*)$', re.I)
 PAIR_RE = re.compile(r"([A-Za-z][A-Za-z ]*?)\s*:\s*(-?[0-9A-Fa-fx]+)")
@@ -157,9 +158,9 @@ def describe(c):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Full 2G/3G/4G modem scan, repeated for accuracy, with timings.",
+    ap = argparse.ArgumentParser(description="Full 2G and 4G modem scan, repeated for accuracy, with timings.",
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
-    ap.add_argument("--rat", choices=["2g", "3g", "4g"], nargs="+", help="only these technologies")
+    ap.add_argument("--rat", choices=["2g", "4g"], nargs="+", help="only these technologies")
     ap.add_argument("--rounds", type=int, default=3, help="full scans of each technology (default 3)")
     ap.add_argument("--per-band", action="store_true", help="4G also band by band in each round")
     ap.add_argument("--timeout", type=float, default=300, help="seconds per scan before giving up (default 300)")

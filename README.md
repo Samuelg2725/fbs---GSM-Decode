@@ -277,9 +277,9 @@ Cell ID, TAC, signal RSRP/RSRQ/SINR) and the SDR's normal output (search, decode
 side-by-side block per target (same / different / only one of them) and a summary table at the end.
 `--quiet-sdr` hides the SDR's own lines. Results: ~/field/sync_check.csv.
 
-### Full modem scan of 2G / 3G / 4G with timings: `modem_timing.py`
+### Full modem scan of 2G and 4G with timings: `modem_timing.py`
 
-    sudo python3 modem_timing.py               # full 2G, 3G and 4G scans, repeated 3 times (--rounds N)
+    sudo python3 modem_timing.py               # full 2G and 4G scans, repeated 3 times (--rounds N); no 3G (switched off in the UK)
 
 Each technology is scanned in full (all its bands in one command, which finds the most) and the whole set is
 repeated, because each modem scan is a snapshot and weak cells come and go. Every cell found in any round is kept,
