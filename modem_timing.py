@@ -5,6 +5,7 @@
   sudo python3 modem_timing.py --rounds 5      # more rounds: weak cells that come and go are caught
   sudo python3 modem_timing.py --rat 2g 4g     # only some technologies
   sudo python3 modem_timing.py --per-band      # 4G also band by band (fast but the modem checks less)
+  sudo python3 modem_timing.py --3g-limit 0    # let the 3G scan run its full 60 s (default: cut off at 20 s)
 
 The modem has no "accuracy" setting: each AT^NETSCAN is one snapshot, and a cell near the noise (about -100 dBm)
 is in some snapshots and not in others. So every technology is scanned in full (all its bands in one command,
@@ -21,6 +22,7 @@ import os
 import re
 import select
 import sys
+import termios
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -50,13 +52,46 @@ def num(v):
             return v
 
 
-def timed_scan(fd, mode, band, timeout):
-    """Send AT^NETSCAN and read its answer line by line -> (lines [(seconds, text)], total seconds, error)."""
+def drain(fd, secs):
+    """Read and drop whatever the modem sends for up to secs (stops early at a final OK / ERROR)."""
+    end, buf = time.time() + secs, ""
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if r:
+            try:
+                buf += os.read(fd, 65536).decode(errors="replace")
+            except BlockingIOError:
+                pass
+            if "OK" in buf or "ERROR" in buf:
+                break
+    termios.tcflush(fd, termios.TCIFLUSH)
+    return buf
+
+
+def timed_scan(fd, mode, band, timeout, limit=None):
+    """Send AT^NETSCAN and read its answer line by line -> (lines [(seconds, text)], total seconds, error).
+    limit: give up after this many seconds if the modem has sent nothing at all (it waits 60 s itself before
+    saying 'nothing found'): the scan is cancelled and the error says so. A scan that fails within 2 s with a
+    plain ERROR is usually the late answer of a cancelled scan: it is run once more."""
+    out = _timed_scan(fd, mode, band, timeout, limit)
+    lines, total, err = out
+    if err and total < 2 and "50" not in err and "skipped" not in err:
+        drain(fd, 1)
+        out = _timed_scan(fd, mode, band, timeout, limit)
+    return out
+
+
+def _timed_scan(fd, mode, band, timeout, limit):
     cmd = "AT^NETSCAN=%d" % mode + (",%d" % band if band is not None else "")
     os.write(fd, (cmd + "\r").encode())
     t0 = time.time()
     buf, lines, err = "", [], None
     while time.time() - t0 < timeout:
+        if limit and time.time() - t0 > limit and not lines:
+            os.write(fd, b"AT\r")                       # any input cancels a running command
+            drain(fd, 5)
+            err = "nothing found within %d s - skipped (the modem would wait 60 s)" % limit
+            break
         C.status("    %s ... %.1f s" % (cmd, time.time() - t0))
         r, _, _ = select.select([fd], [], [], 0.2)
         if not r:
@@ -128,6 +163,9 @@ def main():
     ap.add_argument("--rounds", type=int, default=3, help="full scans of each technology (default 3)")
     ap.add_argument("--per-band", action="store_true", help="4G also band by band in each round")
     ap.add_argument("--timeout", type=float, default=300, help="seconds per scan before giving up (default 300)")
+    ap.add_argument("--3g-limit", dest="limit_3g", type=float, default=20,
+                    help="cancel the 3G scan if nothing has come in after this many seconds (default 20; "
+                         "the modem itself waits 60 s; 0 = wait for the modem)")
     ap.add_argument("--port", help="modem AT port (default: find it)")
     args = ap.parse_args()
     if os.geteuid() != 0:
@@ -139,6 +177,7 @@ def main():
     if "+CFUN: 1" not in command(fd, "AT+CFUN?", 3):
         command(fd, "AT+CFUN=1", 15)
         time.sleep(3)
+    limits = {"3G": args.limit_3g or None}
     plan = []
     for tech, mode, label in FULL:
         if args.rat and tech.lower() not in args.rat:
@@ -155,11 +194,11 @@ def main():
         for rnd in range(1, args.rounds + 1):
             C.heading("Round %d of %d  (%.0f s into the run)" % (rnd, args.rounds, time.time() - t_start))
             for tech, mode, band, label in plan:
-                lines, total, err = timed_scan(fd, mode, band, args.timeout)
+                lines, total, err = timed_scan(fd, mode, band, args.timeout, limits.get(tech))
                 times.setdefault(label, []).append(total)
                 cells = [c for c in cells_from(lines) if c["tech"] == tech]
                 if err:
-                    why = ("band not supported by the modem" if "50" in err else
+                    why = ("band not supported by the modem" if "50" in err else err if "skipped" in err else
                            "nothing found (the modem gave up after %.0f s)" % total if total > 30 else err)
                     print("  %-28s %6.1f s   %s" % (label, total, C.c(why, "grey")), flush=True)
                     continue
