@@ -67,6 +67,23 @@ def signal(text):
             "sinr": None if snr == 255 else -20.2 + 0.2 * snr}
 
 
+def modem_operator(fd, cell_id, raw):
+    """Operator of the camped cell: asked from the modem (AT+COPS?, numeric), else looked up by Cell ID in the
+    modem's own band-scan results (modem_cells.csv), which carry each cell's operator. -> (name, how) or (None, "")"""
+    ML.ask(fd, "AT+COPS=3,2", 3, raw)
+    m = re.search(r'\+COPS:\s*\d+\s*,\s*\d+\s*,\s*"(\d{5,6})"', ML.ask(fd, "AT+COPS?", 3, raw))
+    if m:
+        return M.operator(m.group(1)), "modem"
+    try:
+        with open(M.OUT_CSV) as fh:
+            for r in csv.DictReader(fh):
+                if r.get("cell_id") and int(r["cell_id"]) == cell_id and r.get("plmn"):
+                    return M.operator(r["plmn"]), "modem scan"
+    except (OSError, ValueError):
+        pass
+    return None, ""
+
+
 def signal_text(s):
     if not s:
         return "signal not reported"
@@ -82,6 +99,7 @@ class ModemJob(threading.Thread):
         super().__init__(daemon=True)
         self.args = (fd, earfcn, pci, secs, raw)
         self.cell, self.sig, self.secs, self.at = None, None, 0.0, None
+        self.op, self.op_how = None, ""
 
     def run(self):
         fd, earfcn, pci, secs, raw = self.args
@@ -117,11 +135,12 @@ class ModemJob(threading.Thread):
             text2 = ML.ask(fd, "AT+CESQ", 3, raw)
             self.sig = signal(text2)
             text += " / " + text2
+        self.op, self.op_how = modem_operator(fd, c["cell_id"], raw)
         sig = signal_text(self.sig) if self.sig else "signal not reported (%s)" % " ".join(
             l.strip() for l in text.splitlines() if l.strip() and l.strip() != "OK")
-        say("modem", "camped after %.1f s: %s  eNB %d  sector %d  TAC %d  |  %s" % (
+        say("modem", "camped after %.1f s: %s  eNB %d  sector %d  TAC %d  %s  |  %s" % (
             self.secs, C.c("Cell ID %d" % c["cell_id"], "green+bold"), c["cell_id"] >> 8, c["cell_id"] & 255,
-            c["tac"], sig), "yellow")
+            c["tac"], ("%s (from %s)" % (self.op, self.op_how)) if self.op else "operator unknown", sig), "yellow")
 
 
 def run_sdr(earfcn, pci, extra, quiet):
@@ -188,7 +207,7 @@ def compare_block(label, job, row, rows, sdr_secs):
                 align={k: "right" for k in ("Cell ID", "eNB", "Sector", "TAC", "Time")})
     if mc:
         t.add([("modem", "yellow"), (mc["cell_id"], "green+bold"), mc["cell_id"] >> 8, mc["cell_id"] & 255,
-               mc["tac"], "-", signal_text(job.sig), "%.0f s" % job.secs])
+               mc["tac"], C.op_cell(job.op) if job.op else "-", signal_text(job.sig), "%.0f s" % job.secs])
     else:
         t.add([("modem", "yellow"), ("did not camp", "red"), "-", "-", "-", "-", "-", "%.0f s" % job.secs])
     if sid:

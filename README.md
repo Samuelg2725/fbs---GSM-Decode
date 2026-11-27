@@ -276,3 +276,11 @@ For each target the modem locks onto it while the SDR decodes it, both shown liv
 Cell ID, TAC, signal RSRP/RSRQ/SINR) and the SDR's normal output (search, decode, reasons for failures). Then a
 side-by-side block per target (same / different / only one of them) and a summary table at the end.
 `--quiet-sdr` hides the SDR's own lines. Results: ~/field/sync_check.csv.
+
+### How long the modem takes per technology and band: `modem_timing.py`
+
+    sudo python3 modem_timing.py               # 2G, 3G, 4G band by band, then everything at once
+
+Times each AT^NETSCAN (2G: GSM 900/1800, 3G: bands 1/8, 4G: bands 20/28/8/32/3/1/7/38/40) from the moment the
+command is sent, prints every cell as it arrives (operator, channel, BSIC/PSC/PCI, LAC/TAC, Cell ID, level, and
+when it came in), then a summary table with totals per technology. Results: ~/field/modem_timing.csv.
