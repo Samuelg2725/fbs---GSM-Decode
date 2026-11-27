@@ -278,6 +278,10 @@ static int cmd_sib1(int argc, char** argv)
   args.pdsch.sch.decoder_use_flooded              = false;
   args.pdsch.measure_evm                          = true;
   args.pdcch.measure_evm                          = true;
+  // srsRAN skips PDCCH candidates whose DMRS correlation or energy is low (default correlation 0.5): a weak cell's
+  // SIB1 control message is then never even tried. The DCI's 24-bit CRC (masked with SI-RNTI) does the checking.
+  args.pdcch_dmrs_corr_thr = getenv("NR_PDCCH_CORR_THR") ? (float)atof(getenv("NR_PDCCH_CORR_THR")) : 0.05f;
+  args.pdcch_dmrs_epre_thr = -200.0f;
   srsran_ue_dl_nr_t ue_dl                         = {};
   if (srsran_ue_dl_nr_init(&ue_dl, buffer, &args) < SRSRAN_SUCCESS ||
       srsran_ue_dl_nr_set_carrier(&ue_dl, &carrier) < SRSRAN_SUCCESS) {
@@ -328,6 +332,14 @@ static int cmd_sib1(int argc, char** argv)
   srsran_softbuffer_rx_t softbuffer = {};
   srsran_softbuffer_rx_init_guru(&softbuffer, SRSRAN_SCH_NR_MAX_NOF_CB_LDPC, SRSRAN_LDPC_MAX_LEN_ENCODED_CB);
   uint8_t* data = srsran_vec_u8_malloc(SRSRAN_SLOT_MAX_NOF_BITS_NR);
+
+  // SIB1 combining: SIB1 is repeated (every 20 ms or so, possibly in other redundancy versions); while it does not
+  // decode, the soft bits of each repeat with the same allocation are added in the soft buffer before decoding
+  // again (the LDPC rate matcher accumulates). NR_SIB1_NO_COMBINE=1 turns it off.
+  bool                   combine = getenv("NR_SIB1_NO_COMBINE") == NULL;
+  srsran_softbuffer_rx_t sb_rvd  = {};
+  srsran_softbuffer_rx_init_guru(&sb_rvd, SRSRAN_SCH_NR_MAX_NOF_CB_LDPC, SRSRAN_LDPC_MAX_LEN_ENCODED_CB);
+  uint32_t comb_key[5] = {}, comb_n = 0;
 
   int found = 0;
   for (size_t i = 0; i < slots.size(); i++) {
@@ -383,11 +395,33 @@ static int cmd_sib1(int argc, char** argv)
                pdsch_cfg.grant.tb[0].tbs);
         shown = true;
       }
-      srsran_softbuffer_rx_reset(&softbuffer);
-      pdsch_cfg.grant.tb[0].softbuffer.rx = &softbuffer;
+      uint32_t nrbs = 0;
+      for (uint32_t k = 0; k < SRSRAN_MAX_PRB_NR; k++) {
+        nrbs += pdsch_cfg.grant.prb_idx[k] ? 1 : 0;
+      }
+      uint32_t key[5] = {(uint32_t)pdsch_cfg.grant.tb[0].tbs, dci.mcs, nrbs, pdsch_cfg.grant.S, pdsch_cfg.grant.L};
+      if (attempt == 0) {
+        bool same = combine && dci.sii == 0 && comb_n > 0 && comb_n < 8 && memcmp(key, comb_key, sizeof(key)) == 0;
+        if (!same) {
+          srsran_softbuffer_rx_reset(&softbuffer);
+          memcpy(comb_key, key, sizeof(key));
+          comb_n = 0;
+        }
+        comb_n++;
+        pdsch_cfg.grant.tb[0].softbuffer.rx = &softbuffer;
+      } else {
+        srsran_softbuffer_rx_reset(&sb_rvd);
+        pdsch_cfg.grant.tb[0].softbuffer.rx = &sb_rvd;
+      }
       srsran_pdsch_res_nr_t res           = {};
       res.tb[0].payload                   = data;
       decoded = srsran_ue_dl_nr_decode_pdsch(&ue_dl, &slot, &pdsch_cfg, &res) == SRSRAN_SUCCESS && res.tb[0].crc;
+      if (decoded && attempt == 0 && comb_n > 1) {
+        printf("COMBINED slot=%u repeats=%u\n", slot.idx, comb_n);
+      }
+    }
+    if (decoded) {
+      comb_n = 0;
     }
     if (!decoded) {
       printf("PDSCH slot=%u crc=KO\n", slot.idx);
@@ -400,6 +434,7 @@ static int cmd_sib1(int argc, char** argv)
     fflush(stdout);
   }
   srsran_softbuffer_rx_free(&softbuffer);
+  srsran_softbuffer_rx_free(&sb_rvd);
   free(data);
   srsran_ue_dl_nr_free(&ue_dl);
   free(buffer[0]);

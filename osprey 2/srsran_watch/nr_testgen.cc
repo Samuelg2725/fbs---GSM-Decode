@@ -211,7 +211,7 @@ int main(int argc, char** argv)
   slot.idx               = slotn;
   srsran_gnb_dl_base_zero(&gnb);
   srsran_dci_dl_nr_t dci     = {};
-  dci.ctx.location.L         = 2; // aggregation level 4
+  dci.ctx.location.L         = getenv("NR_TESTGEN_AL") ? (uint32_t)atoi(getenv("NR_TESTGEN_AL")) : 2; // 2 = level 4
   dci.ctx.location.ncce      = 0;
   dci.ctx.ss_type            = srsran_search_space_type_common_0;
   dci.ctx.coreset_id         = 0;
