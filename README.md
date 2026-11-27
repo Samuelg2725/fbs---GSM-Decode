@@ -294,7 +294,7 @@ band-by-band scans. Results: ~/field/modem_timing.csv.
 
 ## 5G NR: `nr_decode.py`
 
-    python3 nr_decode.py                      # UK 5G bands n78 (3.3-3.8 GHz) and n28 (700 MHz)
+    python3 nr_decode.py                      # UK 5G bands n78 (3.3-3.8 GHz), n28 (700 MHz), n3 (1800 MHz)
     python3 nr_decode.py --dual               # both antennas
     python3 nr_decode.py --bands n78 n1 n3    # other bands: n78 n77 n40 n28 n20 n8 n3 n1 n7
     python3 nr_decode.py --freq-mhz 3549.12   # one SSB frequency

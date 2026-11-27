@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """5G NR cell identity decoder for the BladeRF.
 
-  python3 nr_decode.py                         # UK 5G bands n78 (3.3-3.8 GHz) and n28 (700 MHz)
+  python3 nr_decode.py                         # UK 5G bands n78 (3.3-3.8 GHz), n28 (700 MHz), n3 (1800 MHz)
   python3 nr_decode.py --bands n78             # one band (n78 n77 n28 n1 n3 n7 n8 n20 n40)
   python3 nr_decode.py --freq-mhz 3549.12      # one SSB frequency (or a few)
   python3 nr_decode.py --dual                  # both antennas (search and decode combined per cell)
@@ -58,7 +58,7 @@ BANDS = {
     "n1": dict(scs=15, case="A", lmax=4, gscn=(5279, 5419), tdd=False),
     "n7": dict(scs=15, case="A", lmax=4, gscn=(6554, 6718), tdd=False),
 }
-UK_DEFAULT = ["n78", "n28"]
+UK_DEFAULT = ["n78", "n28", "n3"]                 # n3: EE's 5G at 1800 MHz
 # TS 38.213 tables 13-1..13-4: CORESET 0 (resource blocks, symbols, offset in RBs) per {SSB, PDCCH} kHz and index
 CORESET0 = {
     (15, 15): [(24, 2, 0), (24, 2, 2), (24, 2, 4), (24, 3, 0), (24, 3, 2), (24, 3, 4), (48, 1, 12), (48, 1, 16),
@@ -683,7 +683,7 @@ def has_signal(x_list):
     return hi > 2.0 * lo
 
 
-def search_anyfreq(x_list, fc, b, args, secs=0.022, thr=0.12, max_cands=40):
+def search_anyfreq(x_list, fc, b, args, secs=0.022, thr=0.12, max_cands=40, keep=4000):
     """Sync search at ANY frequency, not only the raster: non-standalone cells (most UK 3.5 GHz 5G) may put their
     SS/PBCH block anywhere on the channel raster - phones are told where by 4G.
     Every `step` samples (less than a cyclic prefix, so one window always lies inside each symbol) the recording is
@@ -717,9 +717,17 @@ def search_anyfreq(x_list, fc, b, args, secs=0.022, thr=0.12, max_cands=40):
             num = num + c
             den = den + np.fft.ifft(np.fft.fft(np.abs(D), axis=1) * O[None, :], axis=1).real
         m = np.abs(num) ** 2 / (den[:, None, :] ** 2 + 1e-30)
-        for fr, nid2, k0 in zip(*np.nonzero(m > thr)):
-            hits.append((float(m[fr, nid2, k0]), int(x0 + fr), int(nid2), int(k0)))
+        flat = m.ravel()
+        sel = np.nonzero(flat > thr)[0]
+        if len(sel) > keep:                                  # busy recordings: only the strongest are worth refining
+            sel = sel[np.argpartition(flat[sel], -keep)[-keep:]]
+        fr, nid2, k0 = np.unravel_index(sel, m.shape)
+        hits += list(zip(flat[sel].tolist(), (x0 + fr).tolist(), nid2.tolist(), k0.tolist()))
+        if len(hits) > 4 * keep:
+            hits.sort(reverse=True)
+            del hits[keep:]
     hits.sort(reverse=True)
+    del hits[keep:]
     picked = []
     for metric, fr, nid2, k0 in hits:
         kc = (k0 + 64) % n                                      # SSB centre bin (PSS n=0 sits 64 below it)
