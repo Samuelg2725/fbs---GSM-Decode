@@ -180,6 +180,12 @@ once (setup step 3).
 
 ## Setup (once)
 
+**On a fresh Ubuntu 24.04 PC:** one script does everything below:
+
+    cd ~/fbs-upload && bash setup_ubuntu.sh
+
+**By hand (e.g. the Pi):**
+
 1. **BladeRF library** (libbladeRF 2.x and `bladeRF-cli`) installed in `/usr/local/lib`.
 2. **GNU Radio 3.10, gr-gsm, gr-osmosdr and gr-soapy** with the SoapySDR BladeRF module
    (`SoapySDRUtil --find` should list the BladeRF).
