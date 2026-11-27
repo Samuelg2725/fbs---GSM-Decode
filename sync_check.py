@@ -89,10 +89,9 @@ class ModemJob(threading.Thread):
         self.at = time.strftime("%H:%M:%S")
         target = "EARFCN %d" % earfcn + (" PCI %d" % pci if pci is not None else "")
         lock_cmd = "AT^CELLLOCK=1,3,0,%d" % earfcn if pci is None else "AT^CELLLOCK=1,3,1,%d,%d" % (earfcn, pci)
-        say("modem", "radio off (AT+CFUN=0), lock to %s (%s), radio on (AT+CFUN=1)..." % (target, lock_cmd), "yellow")
         ok = ML.lock(fd, earfcn, pci, raw)
-        say("modem", "%s in %.1f s - now searching for the cell" % (
-            "lock accepted, radio back on" if ok else C.c("the modem REFUSED the lock", "red"), time.time() - t0),
+        say("modem", "locked to %s in %.1f s (radio off, %s, radio on)%s" % (
+            target, time.time() - t0, lock_cmd, "" if ok else C.c(" - the modem REFUSED the lock", "red")),
             "yellow")
         last = None
         while time.time() - t0 < secs + 10 and self.cell is None:    # +10 s: the lock itself takes a few
@@ -100,7 +99,7 @@ class ModemJob(threading.Thread):
             self.cell = ML.camped(text)
             m = re.search(r"\+CEREG:\s*\d+\s*,\s*(\d+)", text)
             state = REG_STATE.get(int(m.group(1)), "state %s" % m.group(1)) if m else None
-            if state and state != last and self.cell is None:
+            if raw and state and state != last and self.cell is None:
                 say("modem", "registration status: %s (%.1f s)" % (state, time.time() - t0), "yellow")
                 last = state
             if self.cell is None:
@@ -111,10 +110,6 @@ class ModemJob(threading.Thread):
                 "yellow")
             return
         c = self.cell
-        say("modem", "camped after %.1f s: %s  (eNB %d, sector %d)  TAC %d" % (
-            self.secs, C.c("Cell ID %d" % c["cell_id"], "green+bold"), c["cell_id"] >> 8, c["cell_id"] & 255,
-            c["tac"]), "yellow")
-        say("modem", "(no SIM, so 'limited service': it camps and reads the cell, but cannot register)", "grey")
         time.sleep(1)                                    # let the first measurement come in
         text = ML.ask(fd, "AT^HCSQ?", 3, raw)
         self.sig = signal(text)
@@ -122,11 +117,11 @@ class ModemJob(threading.Thread):
             text2 = ML.ask(fd, "AT+CESQ", 3, raw)
             self.sig = signal(text2)
             text += " / " + text2
-        if self.sig:
-            say("modem", "signal: %s" % signal_text(self.sig), "yellow")
-        else:
-            say("modem", "signal not reported - the modem answered: %s" % " ".join(
-                l.strip() for l in text.splitlines() if l.strip() and l.strip() != "OK"), "yellow")
+        sig = signal_text(self.sig) if self.sig else "signal not reported (%s)" % " ".join(
+            l.strip() for l in text.splitlines() if l.strip() and l.strip() != "OK")
+        say("modem", "camped after %.1f s: %s  eNB %d  sector %d  TAC %d  |  %s" % (
+            self.secs, C.c("Cell ID %d" % c["cell_id"], "green+bold"), c["cell_id"] >> 8, c["cell_id"] & 255,
+            c["tac"], sig), "yellow")
 
 
 def run_sdr(earfcn, pci, extra, quiet):
@@ -145,13 +140,18 @@ def run_sdr(earfcn, pci, extra, quiet):
         p = subprocess.Popen(cmd, env=dict(os.environ, LD_LIBRARY_PATH="/usr/local/lib", STATUS_LINES="1"),
                              stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, bufsize=1, text=True, errors="replace")
+        tables = False
         for line in p.stdout:
             log.write(ANSI.sub("", line))
             line = line.rstrip("\n")
-            plain = ANSI.sub("", line)
-            if quiet or not plain.strip() or "sync_check_tmp.csv" in plain:
+            plain = ANSI.sub("", line).strip()
+            # its end tables and pcap line repeat what the comparison box shows: kept in the log only
+            if plain.startswith(("== LTE cells decoded", "== Not decoded", "== Cell list check")):
+                tables = True
+            if (quiet or tables or not plain or plain.startswith("==") or "sync_check_tmp.csv" in plain
+                    or "saved to" in plain):
                 continue
-            say("SDR", line, "cyan")
+            say("SDR", line.strip(), "cyan")
         p.wait()
     rows = []
     if os.path.exists(tmp):
@@ -224,6 +224,7 @@ def main():
     fd = open_port(port)
     command(fd, "ATE0", 2)
     C.info("modem on %s; SDR output also kept in %s" % (port, SDR_LOG))
+    C.info("the modem has no SIM: it camps on the cell and reads it ('limited service') but does not register")
     summary = C.Table(["Target", "Time", "Modem Cell ID", "Modem signal", "Modem s", "SDR Cell ID", "SDR result",
                        "SDR s", "Result"],
                       align={k: "right" for k in ("Modem Cell ID", "Modem s", "SDR Cell ID", "SDR s")})
