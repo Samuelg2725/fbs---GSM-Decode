@@ -267,3 +267,10 @@ its MIB checked (still there, same PCI, same frequency offset) and is printed as
 SIB1 is decoded again every 10 minutes (`--full-every MINUTES`), and at once if the MIB check fails or the
 frequency offset has jumped (a different transmitter on the same PCI). The time goes to the cells not yet decoded.
 `--always-decode` keeps the old behaviour (full decode every pass, to measure how reliably each cell decodes).
+
+### Modem and SDR on the same cell at the same time: `sync_check.py`
+
+    sudo python3 sync_check.py --cells 6300:21 6400:1 223:21 9360:236     # or --earfcn ...; add --dual etc.
+
+For each target the modem locks onto it while the SDR decodes it, then one line compares the two Cell IDs
+(same / different / only one of them), with how long each took. Results: ~/field/sync_check.csv.

@@ -127,6 +127,7 @@ UK_EARFCN = [
     1226, 1288, 1363, 1392, 1617, 1815,              # band 3  1800 MHz: O2, Vodafone, Three, EE
     76, 223, 347,                                    # band 1  2100 MHz
     2850, 3179, 3350,                                # band 7  2600 MHz
+    9360,                                            # band 28  700 MHz: Three
 ]
 
 

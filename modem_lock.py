@@ -109,7 +109,7 @@ def wait_camp(fd, label, secs, raw):
         cell = camped(text) or cell
         if cell:
             break
-        time.sleep(2)
+        time.sleep(1)
     C.clear_status()
     return cell
 
@@ -164,7 +164,8 @@ def main():
                 lock(fd, earfcn, pci, args.raw)
                 cell = wait_camp(fd, label, args.secs, args.raw)
             band = M.band_of(earfcn)
-            if cell and not args.no_netscan and band and band not in scans:
+            # the band scan only serves to find the PCI: not needed when the target names it
+            if cell and pci is None and not args.no_netscan and band and band not in scans:
                 scans[band] = M.parse(M.scan(fd, M.RAT["lte"], band, 300))
             match = None
             if cell:
