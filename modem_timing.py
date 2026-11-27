@@ -152,9 +152,10 @@ def main():
             for band, label in bands:
                 lines, total, err = timed_scan(fd, mode, band, args.timeout)
                 cells = [c for c in cells_from(lines) if c["tech"] == tech]
-                per_tech.setdefault(tech, [0.0, 0])
-                per_tech[tech][0] += total
-                per_tech[tech][1] += len(cells)
+                per_tech.setdefault(tech, [0.0, set()])
+                if band is not None or len(bands) == 1:       # the all-band 4G scan repeats the per-band ones
+                    per_tech[tech][0] += total
+                per_tech[tech][1] |= {describe(c)[2] for c in cells}
                 if err:
                     why = ("band not supported by the modem" if "50" in err else
                            "nothing found (the modem gave up after %.0f s)" % total if total > 30 else err)
@@ -191,7 +192,8 @@ def main():
     finally:
         os.close(fd)
     summary.show("Modem scan timings (band by band)")
-    C.info("Totals: " + ",  ".join("%s %.1f s, %d cells" % (t, v[0], v[1]) for t, v in per_tech.items())
+    C.info("Totals (band by band; each cell counted once): " + ",  ".join(
+        "%s %.1f s, %d cells" % (t, v[0], len(v[1])) for t, v in per_tech.items())
            + "   |   whole run %.1f s" % (time.time() - t_start))
     new = not os.path.exists(OUT)
     with open(OUT, "a") as fh:
