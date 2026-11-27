@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-"""Full 2G and 4G scan with the CALYX modem (ALA440), repeated for accuracy, with timings.
+"""How long the CALYX modem (ALA440) takes to scan each technology and band, and what it finds - with timings.
 
-  sudo python3 modem_timing.py                 # 2G and 4G, each a full scan, 3 rounds
-  sudo python3 modem_timing.py --rounds 5      # more rounds: weak cells that come and go are caught
-  sudo python3 modem_timing.py --rat 4g        # only one technology
-  sudo python3 modem_timing.py --per-band      # 4G also band by band (fast but the modem checks less)
+  sudo python3 modem_timing.py                 # 2G, then 4G band by band, then all-in-one (no 3G scan)
+  sudo python3 modem_timing.py --rat 4g        # only 4G (LTE) bands
+  sudo python3 modem_timing.py --no-all        # skip the final all-technologies scan
 
-The modem has no "accuracy" setting: each AT^NETSCAN is one snapshot, and a cell near the noise (about -100 dBm)
-is in some snapshots and not in others. So every technology is scanned in full (all its bands in one command,
-which found the most), and the whole set is repeated --rounds times. Every cell found in any round is kept,
-with how many rounds saw it. A cell seen in every round is solid; one seen once is weak or intermittent.
-
-Timings: each scan is timed from the moment the command is sent until the modem answers. The modem sends all
-its results at the end of a scan, so the time is per scan (per technology), not per cell; "first found" is the
-time into the whole run at which a cell first appeared. Results: ~/field/modem_timing.csv (one row per cell
-per round). Raw answers: ~/field/modem_scan_raw.txt.
+For each band it sends AT^NETSCAN=<technology>,<band> and records:
+  * the time from sending the command to the first cell, to each cell, and to the end of the scan
+  * every cell found: operator, channel (ARFCN / UARFCN / EARFCN), BSIC / PSC / PCI, LAC or TAC, Cell ID, level
+Each line's arrival time is measured as the modem sends it (so if the modem reports operators one by one, the
+timings show it; if it sends everything at the end, all cells show the same time).
+Then a summary table: band by band, seconds and cells found, and the totals per technology. Finally (unless
+--no-all) one AT^NETSCAN=3 scan of everything at once, for comparison.
+Results: ~/field/modem_timing.csv (one row per cell, with its timings). Raw answers: ~/field/modem_scan_raw.txt.
 """
 import argparse
 import os
@@ -30,12 +28,16 @@ import modem_scan as M                               # noqa: E402
 from modem_probe import open_port, command          # noqa: E402
 
 OUT = os.path.join(M.FIELD, "modem_timing.csv")
-# 3G is not scanned: UK 3G networks are switched off, and the modem only says so after waiting 60 s
-FULL = [("2G", 0, "2G (GSM 900 + 1800)"), ("4G", 2, "4G (LTE, all bands)")]
-LTE_BANDS = [(20, "4G band 20 (800)"), (28, "4G band 28 (700)"), (8, "4G band 8 (900)"),
-             (3, "4G band 3 (1800)"), (1, "4G band 1 (2100)"), (7, "4G band 7 (2600)"),
-             (38, "4G band 38 (2600 TDD)"), (40, "4G band 40 (2300 TDD)")]
-
+# (technology, NETSCAN mode, [(band number, label)])  - UK bands; the modem says if one is not supported
+PLAN = [
+    # this firmware refuses a band for 2G (error 50): 2G is scanned whole. 3G is not scanned: UK 3G is
+    # switched off and the modem only gives up after 60 s
+    ("2G", 0, [(None, "GSM (900 + 1800)")]),
+    ("4G", 2, [(20, "LTE 800 (band 20)"), (28, "LTE 700 (band 28)"), (8, "LTE 900 (band 8)"),
+               (32, "LTE 1500 (band 32)"), (3, "LTE 1800 (band 3)"), (1, "LTE 2100 (band 1)"),
+               (7, "LTE 2600 (band 7)"), (38, "LTE 2600 TDD (band 38)"), (40, "LTE 2300 TDD (band 40)"),
+               (None, "LTE, all bands in one scan")]),
+]
 CELL_RE = re.compile(r'^\s*\d+\s*,\s*"?(2G|3G|4G)"?\s*,(.*)$', re.I)
 PAIR_RE = re.compile(r"([A-Za-z][A-Za-z ]*?)\s*:\s*(-?[0-9A-Fa-fx]+)")
 OP_RE = re.compile(r'\^NETSCAN:\s*"([^"]*)"\s*,\s*"([^"]*)"\s*,\s*"([^"]*)"')
@@ -123,11 +125,10 @@ def describe(c):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Full 2G and 4G modem scan, repeated for accuracy, with timings.",
+    ap = argparse.ArgumentParser(description="Time the CALYX modem's scan of each technology and band.",
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--rat", choices=["2g", "4g"], nargs="+", help="only these technologies")
-    ap.add_argument("--rounds", type=int, default=3, help="full scans of each technology (default 3)")
-    ap.add_argument("--per-band", action="store_true", help="4G also band by band in each round")
+    ap.add_argument("--no-all", action="store_true", help="skip the final scan of everything at once")
     ap.add_argument("--timeout", type=float, default=300, help="seconds per scan before giving up (default 300)")
     ap.add_argument("--port", help="modem AT port (default: find it)")
     args = ap.parse_args()
@@ -140,81 +141,62 @@ def main():
     if "+CFUN: 1" not in command(fd, "AT+CFUN?", 3):
         command(fd, "AT+CFUN=1", 15)
         time.sleep(3)
-    plan = []
-    for tech, mode, label in FULL:
-        if args.rat and tech.lower() not in args.rat:
-            continue
-        plan.append((tech, mode, None, label))
-        if tech == "4G" and args.per_band:
-            plan += [("4G", 2, b, l) for b, l in LTE_BANDS]
-    C.info("modem on %s - %d round%s of: %s" % (port, args.rounds, "" if args.rounds == 1 else "s",
-                                               ", ".join(p[3] for p in plan)))
-    seen = {}                                            # (tech, identity) -> cell record
-    times = {}                                           # scan label -> [seconds per round]
-    rows, t_start, done_rounds = [], time.time(), 0
+    C.info("modem on %s - scanning band by band, timings from the moment each scan command is sent" % port)
+    summary = C.Table(["Technology", "Band", "Seconds", "First cell at", "Cells", "Operators", "Result"],
+                      align={"Seconds": "right", "First cell at": "right", "Cells": "right"})
+    rows, per_tech, t_start = [], {}, time.time()
+    plan = [p for p in PLAN if not args.rat or p[0].lower() in args.rat]
     try:
-        for rnd in range(1, args.rounds + 1):
-            C.heading("Round %d of %d  (%.0f s into the run)" % (rnd, args.rounds, time.time() - t_start))
-            for tech, mode, band, label in plan:
+        for tech, mode, bands in plan:
+            C.heading("%s scan" % tech)
+            for band, label in bands:
                 lines, total, err = timed_scan(fd, mode, band, args.timeout)
-                times.setdefault(label, []).append(total)
                 cells = [c for c in cells_from(lines) if c["tech"] == tech]
+                per_tech.setdefault(tech, [0.0, 0])
+                per_tech[tech][0] += total
+                per_tech[tech][1] += len(cells)
                 if err:
                     why = ("band not supported by the modem" if "50" in err else
                            "nothing found (the modem gave up after %.0f s)" % total if total > 30 else err)
-                    print("  %-28s %6.1f s   %s" % (label, total, C.c(why, "grey")), flush=True)
+                    print("  %-24s %6.1f s   %s" % (label, total, C.c(why, "grey")), flush=True)
+                    summary.add([tech, label, "%.1f" % total, "-", 0, "-", (why, "grey")])
                     continue
-                new, new_keys = 0, set()
+                print("  %-24s %6.1f s   %s" % (label, total, C.c("%d cell%s" % (len(cells), "" if len(cells) == 1
+                                                                                  else "s"),
+                                                                  "green" if cells else "yellow")), flush=True)
                 for c in cells:
                     op, chan, ident, level = describe(c)
-                    key = (tech, ident)
-                    rec = seen.get(key)
-                    if rec is None:
-                        new += 1
-                        new_keys.add(key)
-                        rec = seen[key] = {"tech": tech, "op": op, "ident": ident, "level": level, "rounds": set(),
-                                           "first": time.time() - t_start, "scan": label}
-                    rec["rounds"].add(rnd)
-                    rec["level"] = level
-                    rows.append([C.utc_iso(), rnd, tech, label, "%.1f" % total, op, chan, ident, level])
-                print("  %-28s %6.1f s   %s%s" % (
-                    label, total, C.c("%d cell%s" % (len(cells), "" if len(cells) == 1 else "s"),
-                                      "green" if cells else "yellow"),
-                    C.c("  (%d new)" % new, "cyan") if new and rnd > 1 else ""), flush=True)
-                for c in cells:
-                    op, chan, ident, level = describe(c)
-                    mark = C.c("NEW ", "cyan") if rnd > 1 and (tech, ident) in new_keys else "    "
-                    print("      %s%-9s %s  %s" % (mark, C.c(*C.op_cell(op)), ident, level), flush=True)
-            done_rounds = rnd
+                    print("      at %5.1f s  %-9s %s  %s" % (c["t"], C.c(*C.op_cell(op)), ident, level), flush=True)
+                    rows.append([C.utc_iso(), tech, label, "%.1f" % c["t"], "%.1f" % total, op, chan, ident, level])
+                ops = sorted({describe(c)[0] for c in cells})
+                summary.add([tech, label, "%.1f" % total, "%.1f" % min(c["t"] for c in cells) if cells else "-",
+                             len(cells), ", ".join(ops) or "-", ("found cells", "green") if cells else
+                             ("nothing found", "yellow")])
+        if not args.no_all:
+            C.heading("Everything at once (AT^NETSCAN=3, all technologies, all bands)")
+            lines, total, err = timed_scan(fd, 3, None, args.timeout)
+            cells = cells_from(lines)
+            print("  all technologies       %6.1f s   %s" % (total, err or "%d cells" % len(cells)), flush=True)
+            for c in cells:
+                op, chan, ident, level = describe(c)
+                print("      at %5.1f s  %s  %-9s %s  %s" % (c["t"], c["tech"], C.c(*C.op_cell(op)), ident, level),
+                      flush=True)
+            summary.add(["all", "everything at once", "%.1f" % total,
+                         "%.1f" % min(c["t"] for c in cells) if cells else "-", len(cells),
+                         ", ".join(sorted({describe(c)[0] for c in cells})) or "-",
+                         (err, "red") if err else ("found cells", "green") if cells else ("nothing found", "yellow")])
     except KeyboardInterrupt:
         print("")
         C.clear_status()
     finally:
         os.close(fd)
-    n = max(1, done_rounds)
-    t = C.Table(["Tech", "Operator", "Cell", "Last level", "Seen in", "First found"],
-                align={"First found": "right"})
-    for rec in sorted(seen.values(), key=lambda r: (r["tech"], r["op"], r["ident"])):
-        k = len(rec["rounds"])
-        t.add([rec["tech"], C.op_cell(rec["op"]), rec["ident"], rec["level"],
-               ("%d of %d rounds" % (k, n), "green" if k == n else ("yellow" if k > 1 else "red")),
-               "%.0f s" % rec["first"]])
-    t.show("Every cell the modem found (%d), all rounds together" % len(seen))
-    s = C.Table(["Scan", "Rounds", "Average s", "Fastest s", "Slowest s", "Cells (all rounds)"],
-                align={k: "right" for k in ("Rounds", "Average s", "Fastest s", "Slowest s", "Cells (all rounds)")})
-    for tech, mode, band, label in plan:
-        v = times.get(label, [])
-        if not v:
-            continue
-        cells = sum(1 for r in seen.values() if r["scan"] == label or (band is None and r["tech"] == tech))
-        s.add([label, len(v), "%.1f" % (sum(v) / len(v)), "%.1f" % min(v), "%.1f" % max(v), cells])
-    s.show("Scan timings")
-    C.info("whole run %.0f s; per round about %.0f s" % (time.time() - t_start,
-                                                          (time.time() - t_start) / n))
-    new_file = not os.path.exists(OUT)
+    summary.show("Modem scan timings (band by band)")
+    C.info("Totals: " + ",  ".join("%s %.1f s, %d cells" % (t, v[0], v[1]) for t, v in per_tech.items())
+           + "   |   whole run %.1f s" % (time.time() - t_start))
+    new = not os.path.exists(OUT)
     with open(OUT, "a") as fh:
-        if new_file:
-            fh.write("utc,round,technology,scan,scan_s,operator,channel,identity,level\n")
+        if new:
+            fh.write("utc,technology,band,cell_found_at_s,band_scan_s,operator,channel,identity,level\n")
         for r in rows:
             fh.write(",".join('"%s"' % str(x).replace('"', "'") for x in r) + "\n")
     M.give_back(OUT)
