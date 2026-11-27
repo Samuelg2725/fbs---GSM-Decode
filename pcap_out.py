@@ -7,7 +7,12 @@ decodes the message underneath (GSM RR System Information, LTE RRC MIB / SIB1 / 
 
   GSM: the messages gr-gsm decodes already carry a GSMTAP header - they are written as they are.
   LTE: the MIB (BCCH-BCH) and system information blocks (BCCH-DL-SCH) srsRAN decodes are given a GSMTAP
-       header of type LTE RRC with the EARFCN and PCI.
+       header of type LTE RRC. Reading an LTE packet in Wireshark:
+         time          when the message was on air (the recording's time + the cell's frame position in it;
+                       each new MIB 40 ms apart, SIB1 in subframe 5) - not when it was decoded
+         ARFCN         the EARFCN
+         frame number  the LTE system frame number (SFN, 0-1023) from the cell's MIB
+         source port   10000 + PCI (PCI 21 -> 10021, PCI 430 -> 10430), so the Info column shows the cell
 
 Open a file with:  wireshark ~/field/pcap/<file>.pcap   (or tshark -r <file> -V for text)
 """
@@ -41,9 +46,9 @@ class PcapWriter(object):
         self.count = 0
         self.lock = threading.Lock()
 
-    def _packet(self, gsmtap, ts=None):
+    def _packet(self, gsmtap, ts=None, sport=GSMTAP_PORT):
         ts = time.time() if ts is None else ts
-        udp = struct.pack(">HHHH", GSMTAP_PORT, GSMTAP_PORT, 8 + len(gsmtap), 0) + gsmtap
+        udp = struct.pack(">HHHH", sport, GSMTAP_PORT, 8 + len(gsmtap), 0) + gsmtap
         ip = struct.pack(">BBHHHBBH4s4s", 0x45, 0, 20 + len(udp), 0, 0x4000, 64, 17, 0,
                          bytes([127, 0, 0, 1]), bytes([127, 0, 0, 1]))
         ip = ip[:10] + struct.pack(">H", _ip_checksum(ip)) + ip[12:]
@@ -63,22 +68,32 @@ class PcapWriter(object):
             blob[13] = antenna & 0xff                   # GSMTAP antenna number
         self._packet(bytes(blob), ts)
 
-    def lte_rrc(self, subtype, payload, earfcn=0, pci=0, ts=None):
-        """An LTE RRC message: subtype LTE_RRC_BCCH_BCH (MIB) or LTE_RRC_BCCH_DL_SCH (SIBs)."""
+    def lte_rrc(self, subtype, payload, earfcn=0, pci=0, ts=None, sfn=None):
+        """An LTE RRC message: subtype LTE_RRC_BCCH_BCH (MIB) or LTE_RRC_BCCH_DL_SCH (SIBs).
+        ts: when it was on air; sfn: its system frame number (for a MIB it is read from the MIB itself)."""
         if not payload:
             return
+        if sfn is None and subtype == LTE_RRC_BCCH_BCH:
+            sfn = mib_sfn(payload)
         # GSMTAP v2 header (16 bytes): version, header length in 32-bit words, type, timeslot, ARFCN,
-        # signal dBm, SNR dB, frame number, sub type, antenna, sub slot, reserved. The PCI is put in the
-        # frame number field so it is visible in Wireshark's GSMTAP details.
+        # signal dBm, SNR dB, frame number, sub type, antenna, sub slot, reserved
         hdr = struct.pack(">BBBBHbbIBBBB", 2, 4, GSMTAP_TYPE_LTE_RRC, 0, int(earfcn or 0) & 0x3fff, 0, 0,
-                          int(pci or 0), subtype, 0, 0, 0)
-        self._packet(hdr + bytes(payload), ts)
+                          int(sfn or 0) & 0x3ff, subtype, 0, 0, 0)
+        self._packet(hdr + bytes(payload), ts, sport=10000 + int(pci or 0))
 
     def close(self):
         try:
             self.fh.close()
         except OSError:
             pass
+
+
+def mib_sfn(payload):
+    """System frame number in a MIB (3 bytes): bandwidth 3 bits, PHICH 3 bits, then the SFN's top 8 bits."""
+    if len(payload) < 3:
+        return None
+    v = int.from_bytes(bytes(payload[:3]), "big")
+    return ((v >> 10) & 0xff) * 4
 
 
 def add_args(ap):

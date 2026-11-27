@@ -761,9 +761,7 @@ def _decode_cell_once(samples, rate, hit, args, freq_mhz, aligned=None):
                 out["ports"], out["diag"] = ports, diag
                 out["mib_hex"] = next((h for kind, h in pdus if kind == "bch"), None)
                 out["sib1_hex"] = known.get("sib1_hex")
-                if PCAP[0] is not None and out["mib_hex"]:
-                    PCAP[0].lte_rrc(pcap_out.LTE_RRC_BCCH_BCH, bytes.fromhex(out["mib_hex"]),
-                                    earfcn=getattr(args, "_earfcn_now", 0), pci=pci)
+                write_pcap(args, pci, rate, out, pdus)
                 out["status"] = "decoded"
                 return out
             # MIB check failed: decode fully below (the cell may be weaker now, or a different one)
@@ -811,10 +809,7 @@ def _decode_cell_once(samples, rate, hit, args, freq_mhz, aligned=None):
     out["diag"] = diag
     out["mib_hex"] = next((h for kind, h in pdus if kind == "bch"), None)
     out["sib1_hex"] = next((h for kind, h in pdus if kind == "dlsch"), None) if out["ident"] else None
-    if PCAP[0] is not None:
-        for kind, h in pdus:
-            PCAP[0].lte_rrc(pcap_out.LTE_RRC_BCCH_BCH if kind == "bch" else pcap_out.LTE_RRC_BCCH_DL_SCH,
-                            bytes.fromhex(h), earfcn=getattr(args, "_earfcn_now", 0), pci=pci)
+    write_pcap(args, pci, rate, out, pdus)
     if out["ident"]:
         out["status"] = "decoded"
         KNOWN[(getattr(args, "_earfcn_now", None), pci)] = {
@@ -830,6 +825,31 @@ def _decode_cell_once(samples, rate, hit, args, freq_mhz, aligned=None):
     else:
         out["status"] = "MIB not decoded"
     return out
+
+
+def write_pcap(args, pci, rate, out, pdus):
+    """The cell's decoded MIBs and SIBs into the pcap, timestamped when they were on air: the recording's start
+    + the cell's frame position in it. A MIB changes every 4 frames (40 ms); SIB1 is in subframe 5 (+5 ms)."""
+    if PCAP[0] is None:
+        return
+    t0 = getattr(args, "_capture_t", None) or time.time()
+    if out.get("start") is not None:
+        t0 += out["start"] / rate
+    earfcn = getattr(args, "_earfcn_now", 0)
+    sfn0 = None
+    n_bch = n_sch = 0
+    for kind, h in pdus:
+        data = bytes.fromhex(h)
+        if kind == "bch":
+            sfn = pcap_out.mib_sfn(data)
+            sfn0 = sfn if sfn0 is None else sfn0
+            PCAP[0].lte_rrc(pcap_out.LTE_RRC_BCCH_BCH, data, earfcn=earfcn, pci=pci, ts=t0 + 0.040 * n_bch, sfn=sfn)
+            n_bch += 1
+        else:
+            sfn = None if sfn0 is None else (sfn0 + 2 * n_sch) & 0x3ff
+            PCAP[0].lte_rrc(pcap_out.LTE_RRC_BCCH_DL_SCH, data, earfcn=earfcn, pci=pci,
+                            ts=t0 + 0.005 + 0.020 * n_sch, sfn=sfn)
+            n_sch += 1
 
 
 def parse_ident(text, out):
@@ -899,9 +919,18 @@ def read_file(args):
 
 
 def record(args, freq_mhz, rate):
-    """Capture at the current gain (one or two antennas) -> (rx1, rx2 or None) or (None, None)."""
+    """Capture at the current gain (one or two antennas) -> (rx1, rx2 or None) or (None, None).
+    Sets args._capture_t: when the recording's first sample was on air (pcap timestamps)."""
     if getattr(args, "file", None):
+        pos = getattr(args, "_file_pos", int(args.start * args.file_rate))
+        size = 8 if (args.file.endswith(".cf32") or getattr(args, "_file_dtype", "") == "cf32_le") else 4
+        try:                                     # the recording ended when the file was last written
+            t_end = os.path.getmtime(args.file)
+            args._capture_t = t_end - os.path.getsize(args.file) / size / args.file_rate + pos / args.file_rate
+        except OSError:
+            args._capture_t = time.time()
         return read_file(args), None
+    args._capture_t = time.time()
     lif = args.low_if_mhz * 1e6
     if args.dual:
         pair = capture_dual(freq_mhz * 1e6, rate, args.secs, args.gain_now, lif,
