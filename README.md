@@ -272,5 +272,7 @@ frequency offset has jumped (a different transmitter on the same PCI). The time 
 
     sudo python3 sync_check.py --cells 6300:21 6400:1 223:21 9360:236     # or --earfcn ...; add --dual etc.
 
-For each target the modem locks onto it while the SDR decodes it, then one line compares the two Cell IDs
-(same / different / only one of them), with how long each took. Results: ~/field/sync_check.csv.
+For each target the modem locks onto it while the SDR decodes it, both shown live: the modem's steps (lock, camp,
+Cell ID, TAC, signal RSRP/RSRQ/SINR) and the SDR's normal output (search, decode, reasons for failures). Then a
+side-by-side block per target (same / different / only one of them) and a summary table at the end.
+`--quiet-sdr` hides the SDR's own lines. Results: ~/field/sync_check.csv.
