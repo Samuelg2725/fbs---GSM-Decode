@@ -32,10 +32,18 @@ def strip(text):
 
 
 _STATUS = [False]
+_LAST_LINE = [None]
 
 
 def status(text):
-    """Show a one-line progress message that the next printed line replaces (terminal only)."""
+    """Show a one-line progress message that the next printed line replaces (terminal only). With
+    STATUS_LINES=1 in the environment (output going to another program, e.g. sync_check.py) each message is
+    printed as an ordinary line instead, so the progress can still be followed."""
+    if os.environ.get("STATUS_LINES") == "1" and not sys.stdout.isatty():
+        if text != _LAST_LINE[0]:
+            _LAST_LINE[0] = text
+            print(c(text.strip(), "grey"), flush=True)
+        return
     if sys.stdout.isatty():
         sys.stdout.write("\r\x1b[K" + c(text, "grey"))
         sys.stdout.flush()

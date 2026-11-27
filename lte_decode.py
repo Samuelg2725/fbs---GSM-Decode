@@ -1199,7 +1199,11 @@ def _decode_capture(args, freq_mhz, rate, x1, x2):
                 if r["ident"] or args.show_failed_siblings:
                     results.append(r)
                     show(r)
-    if not args.no_cancel:
+    wanted = set(getattr(args, "_targets_now", []))
+    got = {r["pci"] for r in results if r["ident"]}
+    if getattr(args, "only", False) and wanted and wanted <= got:
+        C.info("  every cell asked for is decoded - interference cancellation skipped (--only)")
+    elif not args.no_cancel:
         results = _after_cancelling(args, freq_mhz, rate, x1, x2, results, tried, show)
     mark_synchronised(results, rate)
     for r in results:

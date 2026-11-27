@@ -39,14 +39,27 @@ ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 def say(who, text, colour):
     with PRINT:
-        print("  %s %s" % (C.c("%-5s|" % who, colour), text), flush=True)
+        print("  %s %s" % (C.c("%-5s|" % who, colour if colour != "grey" else "yellow"),
+                         C.c(text, "grey") if colour == "grey" else text), flush=True)
+
+
+CESQ_RE = re.compile(r"\+CESQ:\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)")
+REG_STATE = {0: "not registered, not searching", 1: "registered", 2: "searching", 3: "registration refused",
+             4: "unknown", 5: "registered (roaming)"}
 
 
 def signal(text):
-    """AT^HCSQ? LTE values -> {rssi, rsrq, rsrp, sinr} in dBm / dB (None where not known)."""
+    """AT^HCSQ? or AT+CESQ LTE values -> {rssi, rsrq, rsrp, sinr} in dBm / dB (None where not known)."""
     m = HCSQ_RE.search(text)
     if not m:
-        return None
+        m = CESQ_RE.search(text)                 # 3GPP: rxlev, ber, rscp, ecno, rsrq, rsrp
+        if not m:
+            return None
+        rsrq, rsrp = int(m.group(5)), int(m.group(6))
+        if rsrq == 255 and rsrp == 255:
+            return None
+        return {"rssi": None, "rsrq": None if rsrq == 255 else -20 + 0.5 * rsrq,
+                "rsrp": None if rsrp == 255 else rsrp - 141, "sinr": None}
     rxlev, rsrq, rsrp, snr = (int(v) for v in m.groups())
     return {"rssi": None if rxlev in (99, 255) else rxlev - 111,
             "rsrq": None if rsrq == 255 else -20 + 0.5 * rsrq,
@@ -75,11 +88,21 @@ class ModemJob(threading.Thread):
         t0 = time.time()
         self.at = time.strftime("%H:%M:%S")
         target = "EARFCN %d" % earfcn + (" PCI %d" % pci if pci is not None else "")
+        lock_cmd = "AT^CELLLOCK=1,3,0,%d" % earfcn if pci is None else "AT^CELLLOCK=1,3,1,%d,%d" % (earfcn, pci)
+        say("modem", "radio off (AT+CFUN=0), lock to %s (%s), radio on (AT+CFUN=1)..." % (target, lock_cmd), "yellow")
         ok = ML.lock(fd, earfcn, pci, raw)
-        say("modem", "locked to %s (radio off/on) in %.1f s%s" % (
-            target, time.time() - t0, "" if ok else " - " + C.c("the modem refused the lock", "red")), "yellow")
+        say("modem", "%s in %.1f s - now searching for the cell" % (
+            "lock accepted, radio back on" if ok else C.c("the modem REFUSED the lock", "red"), time.time() - t0),
+            "yellow")
+        last = None
         while time.time() - t0 < secs + 10 and self.cell is None:    # +10 s: the lock itself takes a few
-            self.cell = ML.camped(ML.ask(fd, "AT+CEREG?", 3, raw))
+            text = ML.ask(fd, "AT+CEREG?", 3, raw)
+            self.cell = ML.camped(text)
+            m = re.search(r"\+CEREG:\s*\d+\s*,\s*(\d+)", text)
+            state = REG_STATE.get(int(m.group(1)), "state %s" % m.group(1)) if m else None
+            if state and state != last and self.cell is None:
+                say("modem", "registration status: %s (%.1f s)" % (state, time.time() - t0), "yellow")
+                last = state
             if self.cell is None:
                 time.sleep(1)
         self.secs = time.time() - t0
@@ -91,9 +114,19 @@ class ModemJob(threading.Thread):
         say("modem", "camped after %.1f s: %s  (eNB %d, sector %d)  TAC %d" % (
             self.secs, C.c("Cell ID %d" % c["cell_id"], "green+bold"), c["cell_id"] >> 8, c["cell_id"] & 255,
             c["tac"]), "yellow")
+        say("modem", "(no SIM, so 'limited service': it camps and reads the cell, but cannot register)", "grey")
         time.sleep(1)                                    # let the first measurement come in
-        self.sig = signal(ML.ask(fd, "AT^HCSQ?", 3, raw))
-        say("modem", "signal: %s" % signal_text(self.sig), "yellow")
+        text = ML.ask(fd, "AT^HCSQ?", 3, raw)
+        self.sig = signal(text)
+        if not self.sig:
+            text2 = ML.ask(fd, "AT+CESQ", 3, raw)
+            self.sig = signal(text2)
+            text += " / " + text2
+        if self.sig:
+            say("modem", "signal: %s" % signal_text(self.sig), "yellow")
+        else:
+            say("modem", "signal not reported - the modem answered: %s" % " ".join(
+                l.strip() for l in text.splitlines() if l.strip() and l.strip() != "OK"), "yellow")
 
 
 def run_sdr(earfcn, pci, extra, quiet):
@@ -105,25 +138,20 @@ def run_sdr(earfcn, pci, extra, quiet):
     cmd = [sys.executable, "-u", os.path.join(HERE, "lte_decode.py")] + what + ["--csv", tmp] + extra
     user = os.environ.get("SUDO_USER")
     if user and user != "root":
-        cmd = ["sudo", "-u", user, "env", "LD_LIBRARY_PATH=/usr/local/lib"] + cmd
+        cmd = ["sudo", "-u", user, "env", "LD_LIBRARY_PATH=/usr/local/lib", "STATUS_LINES=1"] + cmd
     t0 = time.time()
     with open(SDR_LOG, "a") as log:
         log.write("\n=== %s %s\n" % (C.utc_iso(), " ".join(what)))
-        p = subprocess.Popen(cmd, env=dict(os.environ, LD_LIBRARY_PATH="/usr/local/lib"), stdout=subprocess.PIPE,
+        p = subprocess.Popen(cmd, env=dict(os.environ, LD_LIBRARY_PATH="/usr/local/lib", STATUS_LINES="1"),
+                             stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, bufsize=1, text=True, errors="replace")
-        skip_tables = False
         for line in p.stdout:
             log.write(ANSI.sub("", line))
             line = line.rstrip("\n")
             plain = ANSI.sub("", line)
-            if plain.startswith("== LTE cells decoded") or plain.startswith("== Not decoded"):
-                skip_tables = True                       # its end tables: the comparison below replaces them
-            if plain.startswith("=="):
-                if plain.startswith("== Pass") or "MHz   EARFCN" not in plain:
-                    continue
-            if quiet or skip_tables or not plain.strip() or plain.startswith(("+-", "|")):
+            if quiet or not plain.strip() or "sync_check_tmp.csv" in plain:
                 continue
-            say("SDR", line.strip(), "cyan")
+            say("SDR", line, "cyan")
         p.wait()
     rows = []
     if os.path.exists(tmp):
