@@ -30,11 +30,13 @@ from modem_probe import open_port, command          # noqa: E402
 OUT = os.path.join(M.FIELD, "modem_timing.csv")
 # (technology, NETSCAN mode, [(band number, label)])  - UK bands; the modem says if one is not supported
 PLAN = [
-    ("2G", 0, [(1, "GSM 900"), (2, "GSM 1800")]),
-    ("3G", 1, [(1, "UMTS 2100 (band 1)"), (8, "UMTS 900 (band 8)")]),
+    # this firmware refuses a band for 2G and 3G (error 50, or ERROR after 60 s): those are scanned whole
+    ("2G", 0, [(None, "GSM (900 + 1800)")]),
+    ("3G", 1, [(None, "UMTS (all bands)")]),
     ("4G", 2, [(20, "LTE 800 (band 20)"), (28, "LTE 700 (band 28)"), (8, "LTE 900 (band 8)"),
                (32, "LTE 1500 (band 32)"), (3, "LTE 1800 (band 3)"), (1, "LTE 2100 (band 1)"),
-               (7, "LTE 2600 (band 7)"), (38, "LTE 2600 TDD (band 38)"), (40, "LTE 2300 TDD (band 40)")]),
+               (7, "LTE 2600 (band 7)"), (38, "LTE 2600 TDD (band 38)"), (40, "LTE 2300 TDD (band 40)"),
+               (None, "LTE, all bands in one scan")]),
 ]
 CELL_RE = re.compile(r'^\s*\d+\s*,\s*"?(2G|3G|4G)"?\s*,(.*)$', re.I)
 PAIR_RE = re.compile(r"([A-Za-z][A-Za-z ]*?)\s*:\s*(-?[0-9A-Fa-fx]+)")
@@ -154,7 +156,8 @@ def main():
                 per_tech[tech][0] += total
                 per_tech[tech][1] += len(cells)
                 if err:
-                    why = "band not supported by the modem" if "50" in err else err
+                    why = ("band not supported by the modem" if "50" in err else
+                           "nothing found (the modem gave up after %.0f s)" % total if total > 30 else err)
                     print("  %-24s %6.1f s   %s" % (label, total, C.c(why, "grey")), flush=True)
                     summary.add([tech, label, "%.1f" % total, "-", 0, "-", (why, "grey")])
                     continue
