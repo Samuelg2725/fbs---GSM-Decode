@@ -1,7 +1,9 @@
 /*
  * nr_testgen - 5G NR test signal pieces made with srsRAN's own gNB encoders, to check nr_decode.py end to end.
  *
- *   nr_testgen OUT PCI SSB_SCS LMAX SFN KSSB CORESET0 SS0 TYPEA NRB DURATION SLOT NCI TAC MCC MNC
+ *   nr_testgen OUT PCI SSB_SCS LMAX SFN KSSB CORESET0 SS0 TYPEA NRB DURATION SLOT NCI TAC MCC MNC [RB0 NRB MASK]
+ *   (RB0 NRB MASK: SS/PBCH block resource blocks and symbol mask (hex) in the slot: the PDSCH goes around them,
+ *    as a gNB does)
  *
  * Writes:
  *   OUT_ssb.cf32   LMAX SS/PBCH blocks (4 x 240 subcarriers each, lowest subcarrier first) for SSB index 0..LMAX-1,
@@ -20,6 +22,7 @@ extern "C" {
 #include "srsran/phy/phch/ra_nr.h"
 #include "srsran/phy/sync/ssb.h"
 #include "srsran/phy/utils/debug.h"
+#include "srsran/phy/utils/re_pattern.h"
 #include "srsran/phy/utils/vector.h"
 }
 #include "srsran/asn1/rrc_nr.h"
@@ -223,12 +226,30 @@ int main(int argc, char** argv)
   dci.sii                    = 0;
   srsran_sch_hl_cfg_nr_t hl  = {};
   hl.typeA_pos               = typeA == 3 ? srsran_dmrs_sch_typeA_pos_3 : srsran_dmrs_sch_typeA_pos_2;
+  srsran_re_pattern_t ssb_rvd = {};
+  bool                has_rvd = argc >= 20;
+  if (has_rvd) {
+    srsran_re_pattern_t& p = ssb_rvd;
+    p.rb_begin            = (uint32_t)atoi(argv[17]);
+    p.rb_end              = SRSRAN_MIN(p.rb_begin + (uint32_t)atoi(argv[18]), nrb);
+    p.rb_stride           = 1;
+    uint32_t mask         = (uint32_t)strtoul(argv[19], NULL, 16);
+    for (uint32_t k = 0; k < SRSRAN_NRE; k++) {
+      p.sc[k] = true;
+    }
+    for (uint32_t l = 0; l < SRSRAN_NSYMB_PER_SLOT_NR; l++) {
+      p.symbol[l] = (mask >> l) & 1U;
+    }
+  }
   srsran_sch_cfg_nr_t pdsch_cfg = {};
   uint32_t            len_rb    = nrb / 2;
   bool                ok        = false;
   for (; len_rb <= nrb && !ok; len_rb++) {    // smallest allocation whose transport block holds the SIB1
     dci.freq_domain_assigment = srsran_ra_nr_type1_riv(nrb, 0, len_rb);
     pdsch_cfg                 = {};
+    if (has_rvd) { // SS/PBCH REs are not used by the PDSCH (also counted in the allocation)
+      srsran_re_pattern_merge(&pdsch_cfg.rvd_re, &ssb_rvd);
+    }
     if (srsran_ra_dl_dci_to_grant_nr(&carrier, &slot, &hl, &dci, &pdsch_cfg, &pdsch_cfg.grant) < SRSRAN_SUCCESS) {
       fprintf(stderr, "grant\n");
       return 1;

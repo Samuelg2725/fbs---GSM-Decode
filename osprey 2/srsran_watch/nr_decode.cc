@@ -341,11 +341,7 @@ static int cmd_sib1(int argc, char** argv)
       continue;
     }
     srsran_sch_cfg_nr_t pdsch_cfg = {};
-    if (srsran_ra_dl_dci_to_grant_nr(&carrier, &slot, &hl, &dci, &pdsch_cfg, &pdsch_cfg.grant) < SRSRAN_SUCCESS) {
-      printf("DCI slot=%u grant-error\n", slot.idx);
-      continue;
-    }
-    // SS/PBCH block REs are not used by the PDSCH (TS 38.214 5.1.4)
+    // SS/PBCH block REs are not used by the PDSCH (TS 38.214 5.1.4); set before the allocation is worked out
     if (slots[i].nrb > 0 && slots[i].mask != 0) {
       srsran_re_pattern_t p = {};
       p.rb_begin            = slots[i].rb0;
@@ -358,6 +354,10 @@ static int cmd_sib1(int argc, char** argv)
         p.symbol[l] = (slots[i].mask >> l) & 1U;
       }
       srsran_re_pattern_merge(&pdsch_cfg.rvd_re, &p);
+    }
+    if (srsran_ra_dl_dci_to_grant_nr(&carrier, &slot, &hl, &dci, &pdsch_cfg, &pdsch_cfg.grant) < SRSRAN_SUCCESS) {
+      printf("DCI slot=%u grant-error\n", slot.idx);
+      continue;
     }
     uint32_t nof_rb = 0;
     for (uint32_t k = 0; k < SRSRAN_MAX_PRB_NR; k++) {
