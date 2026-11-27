@@ -113,6 +113,10 @@ LAST_PEAK = [0.0]
 PCAP = [None]            # pcap_out.PcapWriter for the decoded MIB / SIB messages, or None
 BCH_HEX_RE = re.compile(r"BCCH-BCH hex ([0-9a-f]{6})")
 DLSCH_HEX_RE = re.compile(r"BCCH-DL-SCH hex ([0-9a-f]+)")
+# cells already identified in this run: (earfcn, pci) -> what SIB1 gave. In later passes these only get a MIB check
+# (is the cell still there, same PCI, same frequency offset) and keep their Cell ID - SIB1 is decoded again only
+# every --full-every minutes, or when the MIB check fails or the offset has jumped (another transmitter).
+KNOWN = {}
 SIB1DCI_RE = re.compile(r"SIB1dci cfi=(\d+) L=(\d+) ncce=(\d+) riv=(\d+) mode=(\d+) nprb1a=(\d+) ngap=(\d+) mcs=(\d+)")
 PPM = []                 # frequency error of the radio (offset / carrier) measured on decoded cells
 UK_BANDS = (20, 8, 3, 1, 7, 28, 32, 38, 40)
@@ -580,8 +584,9 @@ def clean_leftovers():
                % (n, freed / 1e6))
 
 
-def run_pdsch(path, pci, n_prb, n_sf, timeout, ports=2, extra=()):
-    """srsRAN pdsch_ue on an aligned capture file; stopped as soon as it prints the SIB1 identity line.
+def run_pdsch(path, pci, n_prb, n_sf, timeout, ports=2, extra=(), mib_only=False):
+    """srsRAN pdsch_ue on an aligned capture file; stopped as soon as it prints the SIB1 identity line
+    (mib_only: as soon as it has decoded the MIB).
     ports: the cell's number of transmit antennas (1, 2 or 4) - in file mode srsRAN only tries this one."""
     cmd = [str(pdsch_ue()), "-d", "-i", str(path), "-p", str(n_prb), "-c", str(pci), "-P", str(ports), "-Q",
            "-n", str(n_sf)] + list(extra)
@@ -590,8 +595,11 @@ def run_pdsch(path, pci, n_prb, n_sf, timeout, ports=2, extra=()):
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, preexec_fn=_srsran_child)
     buf = b""
     deadline = time.time() + timeout
+    mib_at = None
     try:
         while time.time() < deadline:
+            if mib_at is not None and time.time() - mib_at > 0.5:
+                break                            # MIB check: done (0.5 s grace for its hex line)
             ready, _, _ = select.select([p.stdout], [], [], 0.25)
             if not ready:
                 if p.poll() is not None:
@@ -601,8 +609,13 @@ def run_pdsch(path, pci, n_prb, n_sf, timeout, ports=2, extra=()):
             if not chunk:
                 break
             buf += chunk
-            if SIB1_RE.search(buf.decode(errors="replace")):
+            text = buf.decode(errors="replace")
+            if SIB1_RE.search(text):
                 break
+            if mib_only and "Decoded MIB" in text:
+                if BCH_HEX_RE.search(text):
+                    break
+                mib_at = mib_at or time.time()
     finally:
         if p.poll() is None:
             try:
@@ -717,6 +730,44 @@ def _decode_cell_once(samples, rate, hit, args, freq_mhz, aligned=None):
                     f.write(text)
             return text
 
+        known = KNOWN.get((getattr(args, "_earfcn_now", None), pci))
+        if (known and not getattr(args, "always_decode", False)
+                and time.time() - known["time"] < 60 * getattr(args, "full_every", 10)
+                and abs(out["offset"] - known["offset"]) < 500):
+            # already identified in this run: check the MIB only and keep the Cell ID
+            n_prb = known["mib"] if known.get("mib") and NATIVE_RATE[known["mib"]] <= rate * 1.01 else own
+            C.status("  PCI %d: known cell - checking its MIB..." % pci)
+            k = rate / NATIVE_RATE[n_prb]
+            src = path
+            if k > 1.01 and abs(k - round(k)) < 1e-6:
+                from scipy.signal import resample_poly
+                src = path.with_name(path.stem + "_%d.cf32" % n_prb)
+                resample_poly(aligned, 1, int(round(k))).astype(np.complex64).tofile(src)
+            try:
+                text = run_pdsch(src, pci, n_prb, n_sf, min(10, args.srsran_timeout), known.get("ports") or 2,
+                                 ("-R", "average"), mib_only=True)
+            finally:
+                if src != path:
+                    src.unlink(missing_ok=True)
+            C.clear_status()
+            if "Decoded MIB" in text or SIB1_RE.search(text):
+                for h in BCH_HEX_RE.findall(text):
+                    pdus.setdefault(("bch", h), None)
+                out.update(ident=known["ident"], mib=known.get("mib") or own, sib1_dci=known.get("sib1_dci"),
+                           confirmed=known["when"])
+                ports = known.get("ports") or 2
+                diag.update(diagnosis(text))
+                path.unlink(missing_ok=True)
+                out["ports"], out["diag"] = ports, diag
+                out["mib_hex"] = next((h for kind, h in pdus if kind == "bch"), None)
+                out["sib1_hex"] = known.get("sib1_hex")
+                if PCAP[0] is not None and out["mib_hex"]:
+                    PCAP[0].lte_rrc(pcap_out.LTE_RRC_BCCH_BCH, bytes.fromhex(out["mib_hex"]),
+                                    earfcn=getattr(args, "_earfcn_now", 0), pci=pci)
+                out["status"] = "decoded"
+                return out
+            # MIB check failed: decode fully below (the cell may be weaker now, or a different one)
+
         def got_mib(text):
             # srsRAN is stopped as soon as it prints the Cell ID, often before its "Decoded MIB" line comes out,
             # so a Cell ID counts as a decoded MIB too
@@ -766,6 +817,10 @@ def _decode_cell_once(samples, rate, hit, args, freq_mhz, aligned=None):
                             bytes.fromhex(h), earfcn=getattr(args, "_earfcn_now", 0), pci=pci)
     if out["ident"]:
         out["status"] = "decoded"
+        KNOWN[(getattr(args, "_earfcn_now", None), pci)] = {
+            "ident": out["ident"], "mib": out["mib"], "ports": ports, "sib1_hex": out["sib1_hex"],
+            "sib1_dci": out.get("sib1_dci"), "offset": out["offset"], "time": time.time(),
+            "when": time.strftime("%H:%M:%S")}
     elif out["mib"]:
         out["status"] = "MIB only (%s MHz), no SIB1" % BW_MHZ.get(out["mib"], "?")
         if diag.get("snr") is not None:
@@ -1031,8 +1086,10 @@ def _decode_capture(args, freq_mhz, rate, x1, x2):
         if r["ident"]:
             x = r["ident"]
             line = "  PCI %-3d %s  Cell ID %d (eNB %d, sector %d)  TAC %d  %s %s-%s" % (
-                r["pci"], C.c("decoded", "green"), x["cell_id"], x["enb"], x["sector"], x["tac"],
-                x["operator"] or "?", x["mcc"], x["mnc"])
+                r["pci"], C.c("still on air", "cyan") if r.get("confirmed") else C.c("decoded", "green"),
+                x["cell_id"], x["enb"], x["sector"], x["tac"], x["operator"] or "?", x["mcc"], x["mnc"])
+            if r.get("confirmed"):
+                line += C.c("  (MIB checked; Cell ID from SIB1 decoded at %s)" % r["confirmed"], "grey")
         else:
             line = "  PCI %-3d %s" % (r["pci"], C.c(r["status"], "yellow" if "MIB only" in r["status"] else "red"))
         note = ", " + r["note"] if r.get("note") else ""
@@ -1352,6 +1409,12 @@ def main():
     ap.add_argument("--no-cancel", action="store_true",
                     help="skip interference cancellation (removing decoded cells' reference signals to find weaker "
                          "cells underneath)")
+    ap.add_argument("--full-every", type=float, default=10,
+                    help="--loop: a cell already identified only gets a quick MIB check; its SIB1 is decoded again "
+                         "after this many minutes (default 10)")
+    ap.add_argument("--always-decode", action="store_true",
+                    help="--loop: decode SIB1 of every cell on every pass (the old behaviour, to measure how "
+                         "reliably each cell decodes)")
     ap.add_argument("--retries", type=int, default=2,
                     help="extra recordings for cells whose MIB decoded but not their Cell ID (default 2)")
     ap.add_argument("--srsran-timeout", type=int, default=30, help="seconds per srsRAN attempt (default 30)")

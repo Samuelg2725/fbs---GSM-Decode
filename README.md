@@ -253,3 +253,11 @@ The modem keeps scanning all LTE bands over and over while the SDR goes once thr
 (the UK list plus every EARFCN the modem reports). At the end, one table lists every cell either of them found,
 with both Cell IDs: both / modem only / SDR only / different ID. Only this run's results count.
 It is saved as ~/field/compare_<time>.csv.
+
+### Repeated passes (`--loop`): known cells get a quick check
+
+Pass 1 decodes every cell fully (MIB, then SIB1 for the Cell ID). From pass 2 a cell already identified only gets
+its MIB checked (still there, same PCI, same frequency offset) and is printed as `still on air` with its Cell ID.
+SIB1 is decoded again every 10 minutes (`--full-every MINUTES`), and at once if the MIB check fails or the
+frequency offset has jumped (a different transmitter on the same PCI). The time goes to the cells not yet decoded.
+`--always-decode` keeps the old behaviour (full decode every pass, to measure how reliably each cell decodes).
