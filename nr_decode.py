@@ -332,6 +332,8 @@ def search_at(x_list, fc, b, targets, args):
             continue
         band = Band(spectra, nx, off, b["scs"])
         sym = band.nfft + int(round(band.nfft * 144 / 2048))
+        period = int(round(0.020 * band.rate))               # SS/PBCH bursts repeat every 20 ms (initial access)
+        nper = len(band.spec[0]) // period
         for nid2, p_local, p_raw in correlate(band):
             # two measures, either can find a cell: against the signal level at that moment (no false peaks from
             # bursty TDD traffic) and against the recording's average (strong cells inside busy FDD carriers)
@@ -339,6 +341,16 @@ def search_at(x_list, fc, b, targets, args):
             for t, ratio in find_peaks(p_raw, args.pss_min, sym, max_peaks=8):
                 if all(abs(t - u) > sym for u, _ in peaks):
                     peaks.append((t, ratio))
+            if nper >= 2:
+                # weak cells: the bursts of every 20 ms added together stand out where a single burst does not
+                # (about +1.5 dB with 2 bursts, +5 dB with 9 in a 0.2 s recording)
+                fold = p_local[:nper * period].reshape(nper, period).mean(axis=0)
+                for t, ratio in find_peaks(fold, args.pss_min, sym, max_peaks=8):
+                    # the burst of this position with the strongest single-burst peak, for the MIB
+                    ts = [t + k * period for k in range(nper)]
+                    tb = max(ts, key=lambda u: p_local[u])
+                    if all(abs(tb - u) > sym for u, _ in peaks):
+                        peaks.append((tb, float(ratio)))
             for t, ratio in peaks:
                 found.append(dict(gscn=g, mhz=f / 1e6, band=band, nid2=nid2, t=t, ratio=ratio))
     if getattr(args, "debug", False):
